@@ -161,7 +161,7 @@ func (h *taskTypeHandler) considerWork(from string, ids []TaskID) (workAccepted 
 			FOR UPDATE SKIP LOCKED
 		)
 		UPDATE harmony_task t
-		SET owner_id = $1
+		SET owner_id = $1, update_time = CURRENT_TIMESTAMP
 		FROM candidates c
 		WHERE t.id = c.id
 		RETURNING t.id;`, h.TaskEngine.ownerID, tIDs, maxAcceptable)
