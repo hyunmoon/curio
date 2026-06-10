@@ -358,6 +358,23 @@ If this limit is exceeded, the system will apply backpressure, delaying new deal
 Updates will affect running instances.`,
 		},
 		{
+			Name: "MK20PipelineInsertBatch",
+			Type: "int",
+
+			Comment: `MK20PipelineInsertBatch limits how many MK20 DDO deals are moved from the waiting queue
+into the MK20 pipeline per insert loop. 0 means unlimited. (Default: 0)
+Updates will affect running instances.`,
+		},
+		{
+			Name: "MK20PipelineInsertMaxActive",
+			Type: "int",
+
+			Comment: `MK20PipelineInsertMaxActive limits how many incomplete MK20 pipeline entries may exist.
+When the number of incomplete rows in market_mk20_pipeline is at or above this value,
+new DDO deals remain in market_mk20_pipeline_waiting. 0 means unlimited. (Default: 0)
+Updates will affect running instances.`,
+		},
+		{
 			Name: "MaxQueueDealSector",
 			Type: "int",
 

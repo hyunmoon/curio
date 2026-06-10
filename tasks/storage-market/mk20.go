@@ -108,8 +108,54 @@ func (d *CurioStorageDealMarket) pipelineInsertLoop(ctx context.Context) {
 }
 
 func (d *CurioStorageDealMarket) insertDDODealInPipeline(ctx context.Context) {
+	batch := 0
+	if d.cfg.Ingest.MK20PipelineInsertBatch != nil {
+		batch = d.cfg.Ingest.MK20PipelineInsertBatch.Get()
+	}
+	if batch < 0 {
+		batch = 0
+	}
+
+	maxActive := 0
+	if d.cfg.Ingest.MK20PipelineInsertMaxActive != nil {
+		maxActive = d.cfg.Ingest.MK20PipelineInsertMaxActive.Get()
+	}
+	if maxActive < 0 {
+		maxActive = 0
+	}
+
+	if maxActive > 0 {
+		var active int
+		err := d.db.QueryRow(ctx, `
+			SELECT COUNT(*)
+			FROM market_mk20_pipeline
+			WHERE complete = false
+		`).Scan(&active)
+		if err != nil {
+			log.Errorf("counting active mk20 pipelines: %s", err)
+			return
+		}
+
+		available := maxActive - active
+		if available <= 0 {
+			log.Infof("mk20 pipeline insert paused: active=%d max=%d", active, maxActive)
+			return
+		}
+
+		if batch == 0 || batch > available {
+			batch = available
+		}
+	}
+
 	var deals []string
-	rows, err := d.db.Query(ctx, `SELECT id from market_mk20_pipeline_waiting`)
+
+	var rows *harmonydb.Query
+	var err error
+	if batch > 0 {
+		rows, err = d.db.Query(ctx, `SELECT id FROM market_mk20_pipeline_waiting ORDER BY id LIMIT $1`, batch)
+	} else {
+		rows, err = d.db.Query(ctx, `SELECT id FROM market_mk20_pipeline_waiting ORDER BY id`)
+	}
 	if err != nil {
 		log.Errorf("querying mk20 pipeline waiting: %s", err)
 		return
@@ -130,6 +176,7 @@ func (d *CurioStorageDealMarket) insertDDODealInPipeline(ctx context.Context) {
 		log.Errorf("iterating over mk20 pipeline waiting: %s", err)
 		return
 	}
+
 	var dealIDs []ulid.ULID
 	for _, dealID := range deals {
 		id, err := ulid.Parse(dealID)
@@ -142,6 +189,9 @@ func (d *CurioStorageDealMarket) insertDDODealInPipeline(ctx context.Context) {
 	if len(dealIDs) == 0 {
 		return
 	}
+
+	log.Infof("mk20 pipeline insert: releasing %d deal(s)", len(dealIDs))
+
 	for _, id := range dealIDs {
 		comm, err := d.db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (commit bool, err error) {
 			deal, err := mk20.DealFromTX(tx, id)

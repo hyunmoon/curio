@@ -61,9 +61,11 @@ func DefaultCurioConfig() *CurioConfig {
 			BatchSealSectorSize: "32GiB",
 		},
 		Ingest: CurioIngestConfig{
-			MaxMarketRunningPipelines: NewDynamic(64),
-			MaxQueueDownload:          NewDynamic(8),
-			MaxQueueCommP:             NewDynamic(8),
+			MaxMarketRunningPipelines:   NewDynamic(64),
+			MaxQueueDownload:            NewDynamic(8),
+			MaxQueueCommP:               NewDynamic(8),
+			MK20PipelineInsertBatch:     NewDynamic(0),
+			MK20PipelineInsertMaxActive: NewDynamic(0),
 
 			MaxQueueDealSector: NewDynamic(8), // default to 8 sectors open(or in process of opening) for deals
 			MaxQueueSDR:        NewDynamic(8), // default to 8 (will cause backpressure even if deal sectors are 0)
@@ -604,6 +606,17 @@ type CurioIngestConfig struct {
 	// If this limit is exceeded, the system will apply backpressure, delaying new deal processing.
 	// 0 means unlimited. (Default: 8)
 	MaxQueueCommP *Dynamic[int]
+
+	// MK20PipelineInsertBatch limits how many MK20 DDO deals are moved from the waiting queue
+	// into the MK20 pipeline per insert loop. 0 means unlimited. (Default: 0)
+	// Updates will affect running instances.
+	MK20PipelineInsertBatch *Dynamic[int]
+
+	// MK20PipelineInsertMaxActive limits how many incomplete MK20 pipeline entries may exist.
+	// When the number of incomplete rows in market_mk20_pipeline is at or above this value,
+	// new DDO deals remain in market_mk20_pipeline_waiting. 0 means unlimited. (Default: 0)
+	// Updates will affect running instances.
+	MK20PipelineInsertMaxActive *Dynamic[int]
 
 	// Maximum number of sectors that can be queued waiting for deals to start processing.
 	// 0 = unlimited
