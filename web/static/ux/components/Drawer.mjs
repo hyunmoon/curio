@@ -158,7 +158,8 @@ Drawer.styles = [
       border: 0;
       background-color: var(--color-fg);
       color: var(--color-text-primary);
-      overflow-y: auto;
+      overflow: auto;
+      box-sizing: border-box;
       z-index: 10;
 
       &[anchor="right"] {
@@ -166,7 +167,8 @@ Drawer.styles = [
         bottom: 0;
         right: 0;
         left: auto;
-        width: 40rem;
+        width: min(54rem, calc(100vw - 3rem));
+        min-width: min(36rem, calc(100vw - 3rem));
         min-height: 100vh;
         max-height: 100vh;
         box-shadow: -8px 0 20px 4px var(--color-shadow-main);

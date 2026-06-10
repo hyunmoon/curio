@@ -21,6 +21,7 @@ type TaskSummary struct {
 	SpID           string
 	SincePosted    time.Time `db:"since_posted"`
 	Owner, OwnerID *string
+	State          string
 
 	// db ignored
 	SincePostedStr string `db:"-"`
@@ -28,13 +29,45 @@ type TaskSummary struct {
 	Miner string
 }
 
-func (a *WebRPC) ClusterTaskSummary(ctx context.Context) ([]TaskSummary, error) {
+type ClusterTaskSummaryResponse struct {
+	Tasks        []TaskSummary
+	PendingTotal int64
+}
+
+func (a *WebRPC) ClusterTaskSummary(ctx context.Context) (*ClusterTaskSummaryResponse, error) {
+	var pendingTotal int64
+	if err := a.deps.DB.QueryRow(ctx, `SELECT COUNT(*) FROM harmony_task WHERE owner_id IS NULL`).Scan(&pendingTotal); err != nil {
+		return nil, err
+	}
+
 	var ts = []TaskSummary{}
-	err := a.deps.DB.Select(ctx, &ts, `SELECT 
-		t.id as id, t.name as name, t.update_time as since_posted, t.owner_id as owner_id, hm.host_and_port as owner
-	FROM harmony_task t LEFT JOIN harmony_machines hm ON hm.id = t.owner_id 
+	err := a.deps.DB.Select(ctx, &ts, `WITH running_tasks AS (
+		SELECT *
+		FROM harmony_task
+		WHERE owner_id IS NOT NULL
+	),
+	pending_tasks AS (
+		SELECT *
+		FROM harmony_task
+		WHERE owner_id IS NULL
+		ORDER BY posted_time ASC
+		LIMIT 500
+	),
+	selected_tasks AS (
+		SELECT * FROM running_tasks
+		UNION ALL
+		SELECT * FROM pending_tasks
+	)
+	SELECT
+		t.id as id,
+		t.name as name,
+		CASE WHEN t.owner_id IS NULL THEN t.posted_time ELSE t.update_time END as since_posted,
+		t.owner_id as owner_id,
+		hm.host_and_port as owner,
+		CASE WHEN t.owner_id IS NULL THEN 'queued' ELSE 'running' END as state
+	FROM selected_tasks t LEFT JOIN harmony_machines hm ON hm.id = t.owner_id
 	ORDER BY
-	    CASE WHEN t.owner_id IS NULL THEN 1 ELSE 0 END, t.update_time ASC`)
+	    CASE WHEN t.owner_id IS NULL THEN 1 ELSE 0 END, since_posted ASC`)
 	if err != nil {
 		return nil, err // Handle error
 	}
@@ -65,7 +98,7 @@ func (a *WebRPC) ClusterTaskSummary(ctx context.Context) ([]TaskSummary, error) 
 		}
 	}
 
-	return ts, nil
+	return &ClusterTaskSummaryResponse{Tasks: ts, PendingTotal: pendingTotal}, nil
 }
 
 type SpidGetter interface {

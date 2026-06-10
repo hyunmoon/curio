@@ -8,6 +8,8 @@ class ClusterTasks extends LitElement {
       data: { type: Array },
       showBackgroundTasks: { type: Boolean },
       coalesceEntries: { type: Boolean },
+      pendingRenderLimit: { type: Number },
+      pendingTotal: { type: Number },
     };
   }
 
@@ -38,7 +40,49 @@ class ClusterTasks extends LitElement {
       }
       th:nth-child(5),
       td:nth-child(5) {
+        width: 10ch;
+      }
+      th:nth-child(6),
+      td:nth-child(6) {
         min-width: 20ch;
+      }
+
+      .cluster-tasks-root {
+        max-width: calc(100vw - 4rem);
+        box-sizing: border-box;
+      }
+
+      .task-controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem 1.5rem;
+        align-items: center;
+        margin-bottom: 1rem;
+      }
+
+      .task-controls label {
+        display: inline-flex;
+        gap: 0.4rem;
+        align-items: center;
+        white-space: nowrap;
+      }
+
+      .pending-limit-input {
+        width: 5ch;
+      }
+
+      .task-summary {
+        margin: 0.75rem 0;
+        padding: 0.6rem 0.8rem;
+      }
+
+      .task-table-wrap {
+        max-width: 100%;
+        overflow-x: auto;
+      }
+
+      table {
+        min-width: 58rem;
       }
 
       /* Row used to coalesce runs of similar tasks */
@@ -54,10 +98,19 @@ class ClusterTasks extends LitElement {
   constructor() {
     super();
     this.data = [];
+    this.pendingTotal = 0;
     this.showBackgroundTasks = false;
-    this.coalesceEntries = true; // Default-enabled coalesce checkbox
+    this.coalesceEntries = false;
+    this.pendingRenderLimit = 30;
     pollRPC(async () => {
-      this.data = (await RPCCall('ClusterTaskSummary')) || [];
+      const summary = await RPCCall('ClusterTaskSummary');
+      if (Array.isArray(summary)) {
+        this.data = summary || [];
+        this.pendingTotal = this.data.filter((entry) => !entry.OwnerID).length;
+      } else {
+        this.data = summary && summary.Tasks ? summary.Tasks : [];
+        this.pendingTotal = summary && summary.PendingTotal ? summary.PendingTotal : 0;
+      }
     }, 1000);
   }
 
@@ -67,6 +120,11 @@ class ClusterTasks extends LitElement {
 
   toggleCoalesceEntries(e) {
     this.coalesceEntries = e.target.checked;
+  }
+
+  changePendingRenderLimit(e) {
+    const parsed = Number.parseInt(e.target.value, 10);
+    this.pendingRenderLimit = Number.isFinite(parsed) && parsed >= 0 ? parsed : 30;
   }
 
   /**
@@ -116,19 +174,22 @@ class ClusterTasks extends LitElement {
     return html`
       ${this.renderRow(firstEntry)}
       <tr class="similar-row">
-        <td colspan="5">${middleCount} similar tasks</td>
+        <td colspan="6">${middleCount} similar tasks</td>
       </tr>
       ${this.renderRow(lastEntry)}
     `;
   }
 
   renderRow(entry) {
+    const state = entry.State || (entry.OwnerID ? 'running' : 'queued');
+
     return html`
       <tr>
         <td>${entry.SpID ? entry.Miner : 'n/a'}</td>
         <td>${entry.Name}</td>
         <td><a href="/pages/task/id/?id=${entry.ID}">${entry.ID}</a></td>
         <td>${entry.SincePostedStr}</td>
+        <td>${state}</td>
         <td>
           ${entry.OwnerID
               ? html`<a href="/pages/node_info/?id=${entry.OwnerID}">${entry.Owner}</a>`
@@ -139,17 +200,26 @@ class ClusterTasks extends LitElement {
   }
 
   render() {
-    // First, filter out background tasks if needed
+    // First, filter out background tasks if needed.
     const filtered = this.data.filter(
         (entry) => this.showBackgroundTasks || !entry.Name.startsWith('bg:')
     );
 
-    let sortedOrOriginal = filtered;
+    // Rendering thousands of pending tasks can lock up the browser. Always show
+    // running tasks, but cap pending tasks to keep the page responsive.
+    const running = filtered.filter((entry) => entry.OwnerID);
+    const pending = filtered.filter((entry) => !entry.OwnerID);
+    const pendingShown = pending.slice(0, this.pendingRenderLimit);
+    const pendingHidden = Math.max(0, pending.length - pendingShown.length);
+    const pendingTotal = Math.max(this.pendingTotal || 0, pending.length);
+    const renderData = [...running, ...pendingShown];
+
+    let sortedOrOriginal = renderData;
 
     // In coalesced mode, we sort by [Name -> SpID -> OwnerID]
     // Otherwise, leave data in its default order (e.g., posted time).
     if (this.coalesceEntries) {
-      sortedOrOriginal = [...filtered].sort((a, b) => {
+      sortedOrOriginal = [...renderData].sort((a, b) => {
         const nameCmp = a.Name.localeCompare(b.Name);
         if (nameCmp !== 0) return nameCmp;
         // If SpID is numeric, do numeric sort, else compare as strings
@@ -183,40 +253,61 @@ class ClusterTasks extends LitElement {
         onload="document.body.style.visibility = 'initial'"
       />
 
-      <!-- Toggle for showing background tasks -->
-      <label>
-        <input
-          type="checkbox"
-          @change=${this.toggleShowBackgroundTasks}
-          ?checked=${this.showBackgroundTasks}
-        />
-        Show background tasks
-      </label>
+      <div class="cluster-tasks-root">
+        <div class="task-controls">
+          <label>
+            <input
+              type="checkbox"
+              @change=${this.toggleShowBackgroundTasks}
+              ?checked=${this.showBackgroundTasks}
+            />
+            Show background tasks
+          </label>
 
-      <!-- Toggle for coalescing entries -->
-      <label style="margin-left: 1em;">
-        <input
-          type="checkbox"
-          @change=${this.toggleCoalesceEntries}
-          ?checked=${this.coalesceEntries}
-        />
-        Coalesce Entries
-      </label>
+          <label>
+            <input
+              type="checkbox"
+              @change=${this.toggleCoalesceEntries}
+              ?checked=${this.coalesceEntries}
+            />
+            Coalesce Entries
+          </label>
 
-      <table class="table table-dark mt-3">
-        <thead>
-          <tr>
-            <th>SpID</th>
-            <th style="min-width: 128px">Task</th>
-            <th>ID</th>
-            <th>Posted</th>
-            <th>Owner</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${grouped.map((group) => this.renderTableRows(group))}
-        </tbody>
-      </table>
+          <label>
+            Pending:
+            <input
+              class="pending-limit-input"
+              type="number"
+              min="0"
+              step="10"
+              .value=${String(this.pendingRenderLimit)}
+              @change=${this.changePendingRenderLimit}
+            />
+          </label>
+        </div>
+
+        <div class="alert alert-info task-summary" role="alert">
+          Running: ${running.length} · Pending: ${pendingTotal > 0 ? html`${pendingShown.length}/${pendingTotal}` : '0'}
+        </div>
+
+        <div class="task-table-wrap">
+          <table class="table table-dark mt-3">
+            <thead>
+              <tr>
+                <th>SpID</th>
+                <th style="min-width: 128px">Task</th>
+                <th>ID</th>
+                <th>Age</th>
+                <th>State</th>
+                <th>Owner</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${grouped.map((group) => this.renderTableRows(group))}
+            </tbody>
+          </table>
+        </div>
+      </div>
     `;
   }
 }
