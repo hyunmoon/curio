@@ -115,7 +115,8 @@ func getSch(w http.ResponseWriter, r *http.Request) {
 	// Add comments to inline schemas in root Properties (like Ingest -> CurioIngestConfig)
 	// Map root property names to their corresponding Doc key
 	inlineSchemaMap := map[string]string{
-		"Ingest": "CurioIngestConfig",
+		"Ingest":     "CurioIngestConfig",
+		"Subsystems": "CurioSubsystemsConfig",
 	}
 	for propName, docKey := range inlineSchemaMap {
 		if prop, ok := sch.Properties.Get(propName); ok {

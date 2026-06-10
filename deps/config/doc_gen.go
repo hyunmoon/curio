@@ -637,6 +637,22 @@ In lotus-miner this was run as part of PreCommit1. (Default: false)`,
 also be bounded by resources available on the machine. (Default: 0 - unlimited)`,
 		},
 		{
+			Name: "SealSDRMinStartInterval",
+			Type: "time.Duration",
+
+			Comment: `SealSDRMinStartInterval is the minimum time between starting SDR tasks on this Curio instance.
+This can be used to smooth SDR starts on each node and reduce downstream storage pressure waves.
+0 disables this limit. (Default: "0s")`,
+		},
+		{
+			Name: "SealSDRStartJitter",
+			Type: "bool",
+
+			Comment: `SealSDRStartJitter spreads SDR starts across nodes by assigning each instance a stable phase offset.
+The offset is derived from CURIO_NODE_NAME when set, falling back to hostname.
+This helps avoid cluster-wide SDR start waves after idle periods or restarts. (Default: false)`,
+		},
+		{
 			Name: "SealSDRMinTasks",
 			Type: "int",
 

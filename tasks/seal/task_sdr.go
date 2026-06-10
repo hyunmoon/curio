@@ -3,6 +3,11 @@ package seal
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"os"
+	"sync"
+	"time"
 
 	"go.opencensus.io/stats"
 	"go.opencensus.io/tag"
@@ -51,17 +56,176 @@ type SDRTask struct {
 
 	max taskhelp.Limiter
 	min int
+
+	minStartInterval time.Duration
+	startJitter      bool
+	jitterKey        string
+	jitterOffset     time.Duration
+	jitterWaitUntil  time.Time
+
+	lastSDRStartLk  sync.Mutex
+	lastSDRStart    time.Time
+	lastSDRDelayLog time.Time
 }
 
-func NewSDRTask(api SDRAPI, db *harmonydb.DB, sp *SealPoller, sc *ffi2.SealCalls, maxSDR taskhelp.Limiter, minSDR int) *SDRTask {
-	return &SDRTask{
-		api: api,
-		db:  db,
-		sp:  sp,
-		sc:  sc,
-		max: maxSDR,
-		min: minSDR,
+func NewSDRTask(api SDRAPI, db *harmonydb.DB, sp *SealPoller, sc *ffi2.SealCalls, maxSDR taskhelp.Limiter, minSDR int, minStartInterval time.Duration, startJitter bool) *SDRTask {
+	jitterKey := os.Getenv("CURIO_NODE_NAME")
+	if startJitter && jitterKey == "" {
+		var err error
+		jitterKey, err = os.Hostname()
+		if err != nil {
+			log.Warnw("getting hostname for SDR start jitter", "error", err)
+		}
+		log.Warnw("CURIO_NODE_NAME is not set for SDR start jitter; falling back to hostname", "jitter_key", jitterKey)
 	}
+
+	var jitterOffset time.Duration
+	if startJitter && minStartInterval > 0 && jitterKey != "" {
+		sum := sha256.Sum256([]byte(jitterKey))
+		jitterOffset = time.Duration(binary.BigEndian.Uint64(sum[:8]) % uint64(minStartInterval.Nanoseconds()))
+		log.Infow("SDR start jitter configured", "jitter_key", jitterKey, "interval", minStartInterval, "offset", jitterOffset)
+	}
+
+	return &SDRTask{
+		api:              api,
+		db:               db,
+		sp:               sp,
+		sc:               sc,
+		max:              maxSDR,
+		min:              minSDR,
+		minStartInterval: minStartInterval,
+		startJitter:      startJitter,
+		jitterKey:        jitterKey,
+		jitterOffset:     jitterOffset,
+	}
+}
+
+// reserveSDRStartSlot reserves this node's next SDR start slot.
+// It must be called from CanAccept, before the harmony task is claimed.
+func (s *SDRTask) reserveSDRStartSlot(candidateCount int) bool {
+	if s.minStartInterval <= 0 {
+		return true
+	}
+
+	now := time.Now()
+	ready, nextStart, remaining, reason := s.sdrStartReady(now)
+	if !ready {
+		s.logSDRStartDelayed(reason, nextStart, remaining, candidateCount, 0, false)
+		log.Debugw("did not accept task", "name", "SDR", "reason", reason, "interval", s.minStartInterval, "next_start_at", nextStart, "remaining", remaining, "count", candidateCount)
+		return false
+	}
+
+	s.lastSDRStartLk.Lock()
+	defer s.lastSDRStartLk.Unlock()
+
+	now = time.Now()
+	ready, nextStart, remaining, reason = s.sdrStartReadyLocked(now)
+	if !ready {
+		s.logSDRStartDelayed(reason, nextStart, remaining, candidateCount, 0, false)
+		log.Debugw("did not accept task", "name", "SDR", "reason", reason, "interval", s.minStartInterval, "next_start_at", nextStart, "remaining", remaining, "count", candidateCount)
+		return false
+	}
+
+	s.lastSDRStart = now
+	s.jitterWaitUntil = time.Time{}
+
+	log.Infow("reserved SDR start slot", "candidate_count", candidateCount, "min_start_interval", s.minStartInterval, "next_start_at", now.Add(s.minStartInterval), "start_jitter", s.startJitter, "jitter_key", s.jitterKey, "jitter_offset", s.jitterOffset)
+
+	return true
+}
+
+func (s *SDRTask) sdrStartReady(now time.Time) (bool, time.Time, time.Duration, string) {
+	s.lastSDRStartLk.Lock()
+	defer s.lastSDRStartLk.Unlock()
+
+	return s.sdrStartReadyLocked(now)
+}
+
+func (s *SDRTask) sdrStartReadyLocked(now time.Time) (bool, time.Time, time.Duration, string) {
+	if s.minStartInterval <= 0 {
+		return true, time.Time{}, 0, ""
+	}
+
+	if !s.lastSDRStart.IsZero() {
+		nextStart := s.lastSDRStart.Add(s.minStartInterval)
+		if now.Before(nextStart) {
+			return false, nextStart, nextStart.Sub(now), "min start interval"
+		}
+	}
+
+	if s.startJitter && s.jitterKey != "" {
+		idleThreshold := 2 * s.minStartInterval
+		if s.jitterWaitUntil.IsZero() && (s.lastSDRStart.IsZero() || now.Sub(s.lastSDRStart) > idleThreshold) {
+			s.jitterWaitUntil = nextSDRJitterPhase(now, s.minStartInterval, s.jitterOffset)
+			log.Infow("SDR start jitter waiting for phase", "jitter_key", s.jitterKey, "interval", s.minStartInterval, "offset", s.jitterOffset, "next_start_at", s.jitterWaitUntil, "remaining", time.Until(s.jitterWaitUntil))
+		}
+
+		if !s.jitterWaitUntil.IsZero() && now.Before(s.jitterWaitUntil) {
+			return false, s.jitterWaitUntil, s.jitterWaitUntil.Sub(now), "start jitter phase"
+		}
+	}
+
+	return true, time.Time{}, 0, ""
+}
+
+func (s *SDRTask) logSDRStartDelayed(reason string, nextStart time.Time, remaining time.Duration, candidateCount int, taskID harmonytask.TaskID, includeTask bool) {
+	if s.minStartInterval <= 0 {
+		return
+	}
+
+	now := time.Now()
+
+	s.lastSDRStartLk.Lock()
+	if !s.lastSDRDelayLog.IsZero() && now.Sub(s.lastSDRDelayLog) < time.Minute {
+		s.lastSDRStartLk.Unlock()
+		return
+	}
+
+	s.lastSDRDelayLog = now
+	lastStart := s.lastSDRStart
+	jitterWaitUntil := s.jitterWaitUntil
+	s.lastSDRStartLk.Unlock()
+
+	fields := []interface{}{
+		"reason", reason,
+		"min_start_interval", s.minStartInterval,
+		"next_start_at", nextStart,
+		"remaining", remaining,
+		"candidate_count", candidateCount,
+		"last_sdr_start", lastStart,
+		"start_jitter", s.startJitter,
+		"jitter_key", s.jitterKey,
+		"jitter_offset", s.jitterOffset,
+		"jitter_wait_until", jitterWaitUntil,
+	}
+
+	if includeTask {
+		fields = append(fields, "task", taskID)
+	}
+
+	log.Infow("SDR start delayed", fields...)
+}
+
+func nextSDRJitterPhase(now time.Time, interval time.Duration, offset time.Duration) time.Time {
+	if interval <= 0 {
+		return now
+	}
+
+	intervalN := int64(interval)
+	offsetN := int64(offset)
+	nowN := now.UnixNano()
+
+	rem := (nowN - offsetN) % intervalN
+	if rem < 0 {
+		rem += intervalN
+	}
+
+	wait := intervalN - rem
+	if wait == intervalN {
+		wait = 0
+	}
+
+	return now.Add(time.Duration(wait))
 }
 
 func (s *SDRTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
@@ -178,6 +342,18 @@ func (s *SDRTask) CanAccept(ids []harmonytask.TaskID, _ *harmonytask.TaskEngine)
 	if s.min > len(ids) {
 		log.Debugw("did not accept task", "name", "SDR", "reason", "below min", "min", s.min, "count", len(ids))
 		return []harmonytask.TaskID{}, nil
+	}
+
+	if len(ids) == 0 || s.minStartInterval <= 0 {
+		return ids, nil
+	}
+
+	if !s.reserveSDRStartSlot(len(ids)) {
+		return []harmonytask.TaskID{}, nil
+	}
+
+	if len(ids) > 1 {
+		return ids[:1], nil
 	}
 
 	return ids, nil

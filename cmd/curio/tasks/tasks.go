@@ -490,7 +490,7 @@ func addSealingTasks(
 	if cfg.Subsystems.EnableSealSDR {
 		sdrMax := taskhelp.Max(cfg.Subsystems.SealSDRMaxTasks)
 
-		sdrTask := seal.NewSDRTask(full, db, sp, slr, sdrMax, cfg.Subsystems.SealSDRMinTasks)
+		sdrTask := seal.NewSDRTask(full, db, sp, slr, sdrMax, cfg.Subsystems.SealSDRMinTasks, cfg.Subsystems.SealSDRMinStartInterval, cfg.Subsystems.SealSDRStartJitter)
 		keyTask := unseal.NewTaskUnsealSDR(slr, db, sdrMax, full)
 
 		activeTasks = append(activeTasks, sdrTask, keyTask)

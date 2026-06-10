@@ -20,6 +20,8 @@ func DefaultCurioConfig() *CurioConfig {
 			IndexingMaxTasks:               8,
 			RemoteProofMaxUploads:          15,
 			ParkPieceMinFreeStoragePercent: 5,
+			SealSDRMinStartInterval:        0 * time.Second,
+			SealSDRStartJitter:             false,
 		},
 		Fees: CurioFees{
 			MaxPreCommitBatchGasFee: BatchFeeConfig{
@@ -273,6 +275,16 @@ type CurioSubsystemsConfig struct {
 	// The maximum amount of SDR tasks that can run simultaneously. Note that the maximum number of tasks will
 	// also be bounded by resources available on the machine. (Default: 0 - unlimited)
 	SealSDRMaxTasks int
+
+	// SealSDRMinStartInterval is the minimum time between starting SDR tasks on this Curio instance.
+	// This can be used to smooth SDR starts on each node and reduce downstream storage pressure waves.
+	// 0 disables this limit. (Default: "0s")
+	SealSDRMinStartInterval time.Duration
+
+	// SealSDRStartJitter spreads SDR starts across nodes by assigning each instance a stable phase offset.
+	// The offset is derived from CURIO_NODE_NAME when set, falling back to hostname.
+	// This helps avoid cluster-wide SDR start waves after idle periods or restarts. (Default: false)
+	SealSDRStartJitter bool
 
 	// The maximum amount of SDR tasks that need to be queued before the system will start accepting new tasks.
 	// The main purpose of this setting is to allow for enough tasks to accumulate for batch sealing. When batch sealing
