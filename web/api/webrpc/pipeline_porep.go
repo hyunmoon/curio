@@ -267,6 +267,14 @@ func (a *WebRPC) PipelinePorepSectors(ctx context.Context) ([]sectorListEntry, e
 												) AS missing_tasks
 											
 											FROM sectors_sdr_pipeline sp
+											WHERE sp.failed
+											   OR sp.after_sdr
+											   OR EXISTS (
+													SELECT 1
+													FROM harmony_task ht_started_sdr
+													WHERE ht_started_sdr.id = sp.task_id_sdr
+													  AND ht_started_sdr.owner_id > 0
+											   )
 											ORDER BY sp_id, sector_number;
 											`) // todo where constrain list
 	if err != nil {
