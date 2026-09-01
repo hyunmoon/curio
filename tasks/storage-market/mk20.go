@@ -620,6 +620,10 @@ func markAndLoadMK20Pieces(ctx context.Context, markDownloaded func(context.Cont
 		return err
 	}
 
+	return loadMK20Pieces(ctx, loadPieces)
+}
+
+func loadMK20Pieces(ctx context.Context, loadPieces func(context.Context) error) error {
 	return loadPieces(ctx)
 }
 

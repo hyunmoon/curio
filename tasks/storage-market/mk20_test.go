@@ -95,23 +95,18 @@ func TestMK20PiecePassProcessesFreshDownloadedState(t *testing.T) {
 	}
 }
 
-func TestSignalNextMK20MarksThenLoadsOnlyRequestedDeal(t *testing.T) {
+func TestSignalNextMK20LoadsOnlyRequestedDealWithoutMarkingDownloaded(t *testing.T) {
 	ctx := context.Background()
 	requestedID := "requested-deal"
 	stored := []MK20PipelinePiece{
-		{ID: requestedID, PieceCID: "requested-piece", Downloaded: false},
+		{ID: requestedID, PieceCID: "requested-piece", Downloaded: true, AfterCommp: true},
 		{ID: "other-deal", PieceCID: "other-piece", Downloaded: false},
 	}
-	markCalls := 0
 	var snapshot []MK20PipelinePiece
+	var operations []string
 
-	err := markAndLoadMK20Pieces(ctx, func(context.Context) error {
-		markCalls++
-		for i := range stored {
-			stored[i].Downloaded = true
-		}
-		return nil
-	}, func(context.Context) error {
+	err := loadMK20Pieces(ctx, func(context.Context) error {
+		operations = append(operations, "load")
 		for _, piece := range stored {
 			if piece.ID == requestedID {
 				snapshot = append(snapshot, piece)
@@ -123,8 +118,8 @@ func TestSignalNextMK20MarksThenLoadsOnlyRequestedDeal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if markCalls != 1 {
-		t.Fatalf("mark calls = %d, want 1", markCalls)
+	if !reflect.DeepEqual(operations, []string{"load"}) {
+		t.Fatalf("operations = %v, want [load]", operations)
 	}
 	var processed []MK20PipelinePiece
 	record := func(_ context.Context, piece MK20PipelinePiece) error {
@@ -145,6 +140,9 @@ func TestSignalNextMK20MarksThenLoadsOnlyRequestedDeal(t *testing.T) {
 	}
 	if !processed[0].Downloaded {
 		t.Fatal("requested deal processed with stale downloaded=false")
+	}
+	if !processed[0].AfterCommp {
+		t.Fatal("requested deal processed with stale after_commp=false")
 	}
 }
 
