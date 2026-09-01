@@ -2,9 +2,29 @@ package storage_market
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
+	"time"
 )
+
+func TestFullMK20PollRunsGlobalStagesInOrder(t *testing.T) {
+	ctx := context.Background()
+	var stages []string
+
+	stage := func(name string) mk20PollStage {
+		return func(context.Context) {
+			stages = append(stages, name)
+		}
+	}
+
+	runMK20PollStages(ctx, stage("pieces"), stage("aggregation"), stage("ingestion"))
+
+	want := []string{"pieces", "aggregation", "ingestion"}
+	if !reflect.DeepEqual(stages, want) {
+		t.Fatalf("stages = %v, want %v", stages, want)
+	}
+}
 
 func TestFullMK20PiecePassMarksDownloadedOnce(t *testing.T) {
 	ctx := context.Background()
@@ -102,35 +122,36 @@ func TestSignalNextMK20LoadsOnlyRequestedDealWithoutMarkingDownloaded(t *testing
 		{ID: requestedID, PieceCID: "requested-piece", Downloaded: true, AfterCommp: true},
 		{ID: "other-deal", PieceCID: "other-piece", Downloaded: false},
 	}
-	var snapshot []MK20PipelinePiece
 	var operations []string
+	var processed []MK20PipelinePiece
+	wakeCalls := 0
 
-	err := loadMK20Pieces(ctx, func(context.Context) error {
-		operations = append(operations, "load")
+	err := runSignalNextMK20(ctx, requestedID, func(_ context.Context, id string) ([]MK20PipelinePiece, error) {
+		operations = append(operations, "load:"+id)
+		var pieces []MK20PipelinePiece
 		for _, piece := range stored {
-			if piece.ID == requestedID {
-				snapshot = append(snapshot, piece)
+			if piece.ID == id {
+				pieces = append(pieces, piece)
 			}
 		}
+		return pieces, nil
+	}, func(_ context.Context, piece MK20PipelinePiece) error {
+		operations = append(operations, "process:"+piece.ID)
+		processed = append(processed, piece)
 		return nil
+	}, func(piece MK20PipelinePiece, err error) {
+		t.Fatalf("unexpected processing error for %s: %v", piece.ID, err)
+	}, func() {
+		operations = append(operations, "wake")
+		wakeCalls++
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if !reflect.DeepEqual(operations, []string{"load"}) {
-		t.Fatalf("operations = %v, want [load]", operations)
-	}
-	var processed []MK20PipelinePiece
-	record := func(_ context.Context, piece MK20PipelinePiece) error {
-		processed = append(processed, piece)
-		return nil
-	}
-	noOp := func(context.Context, MK20PipelinePiece) error { return nil }
-	for _, piece := range snapshot {
-		if err := processMk20PieceStages(ctx, piece, record, noOp, noOp); err != nil {
-			t.Fatal(err)
-		}
+	wantOperations := []string{"load:" + requestedID, "process:" + requestedID, "wake"}
+	if !reflect.DeepEqual(operations, wantOperations) {
+		t.Fatalf("operations = %v, want %v", operations, wantOperations)
 	}
 	if len(processed) != 1 {
 		t.Fatalf("processed %d pieces, want 1", len(processed))
@@ -143,6 +164,73 @@ func TestSignalNextMK20LoadsOnlyRequestedDealWithoutMarkingDownloaded(t *testing
 	}
 	if !processed[0].AfterCommp {
 		t.Fatal("requested deal processed with stale after_commp=false")
+	}
+	if wakeCalls != 1 {
+		t.Fatalf("wake calls = %d, want 1", wakeCalls)
+	}
+}
+
+func TestSignalNextMK20ContinuesAfterPieceErrorAndWakesOnce(t *testing.T) {
+	ctx := context.Background()
+	pieces := []MK20PipelinePiece{{ID: "deal", PieceCID: "piece-1"}, {ID: "deal", PieceCID: "piece-2"}}
+	var processed []string
+	var failed []string
+	wakeCalls := 0
+
+	err := runSignalNextMK20(ctx, "deal", func(context.Context, string) ([]MK20PipelinePiece, error) {
+		return pieces, nil
+	}, func(_ context.Context, piece MK20PipelinePiece) error {
+		processed = append(processed, piece.PieceCID)
+		if piece.PieceCID == "piece-1" {
+			return errors.New("test error")
+		}
+		return nil
+	}, func(piece MK20PipelinePiece, _ error) {
+		failed = append(failed, piece.PieceCID)
+	}, func() {
+		wakeCalls++
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(processed, []string{"piece-1", "piece-2"}) {
+		t.Fatalf("processed = %v", processed)
+	}
+	if !reflect.DeepEqual(failed, []string{"piece-1"}) {
+		t.Fatalf("failed = %v", failed)
+	}
+	if wakeCalls != 1 {
+		t.Fatalf("wake calls = %d, want 1", wakeCalls)
+	}
+}
+
+func TestWakeDealPollerCoalescesPendingWake(t *testing.T) {
+	d := &CurioStorageDealMarket{
+		wakePollReq:        make(chan struct{}),
+		wakePollLoopCtx:    context.Background(),
+		lastWakeDrivenPoll: time.Now().Add(time.Hour),
+	}
+
+	d.WakeDealPoller()
+	d.wakeMu.Lock()
+	firstTimer := d.wakePollTimer
+	d.wakeMu.Unlock()
+	if firstTimer == nil {
+		t.Fatal("first wake did not schedule a timer")
+	}
+
+	d.WakeDealPoller()
+	d.wakeMu.Lock()
+	secondTimer := d.wakePollTimer
+	if secondTimer != nil {
+		secondTimer.Stop()
+		d.wakePollTimer = nil
+	}
+	d.wakeMu.Unlock()
+
+	if secondTimer != firstTimer {
+		t.Fatal("second wake scheduled a different timer")
 	}
 }
 

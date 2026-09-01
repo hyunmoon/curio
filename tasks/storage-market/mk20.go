@@ -87,10 +87,15 @@ func (d *CurioStorageDealMarket) processMK20Deals(ctx context.Context) {
 			log.Errorf("panic occurred: %v\n%s", r, trace[:n])
 		}
 	}()
-	d.processMK20DealPieces(ctx)
-	//d.downloadMk20Deal(ctx)
-	d.processMK20DealAggregation(ctx)
-	d.processMK20DealIngestion(ctx)
+	runMK20PollStages(ctx, d.processMK20DealPieces, d.processMK20DealAggregation, d.processMK20DealIngestion)
+}
+
+type mk20PollStage func(context.Context)
+
+func runMK20PollStages(ctx context.Context, processPieces, processAggregation, processIngestion mk20PollStage) {
+	processPieces(ctx)
+	processAggregation(ctx)
+	processIngestion(ctx)
 }
 
 func (d *CurioStorageDealMarket) pipelineInsertLoop(ctx context.Context) {
