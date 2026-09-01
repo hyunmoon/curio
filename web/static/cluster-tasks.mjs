@@ -38,6 +38,10 @@ class ClusterTasks extends LitElement {
       }
       th:nth-child(5),
       td:nth-child(5) {
+        width: 10ch;
+      }
+      th:nth-child(6),
+      td:nth-child(6) {
         min-width: 20ch;
       }
 
@@ -116,7 +120,7 @@ class ClusterTasks extends LitElement {
     return html`
       ${this.renderRow(firstEntry)}
       <tr class="similar-row">
-        <td colspan="5">${middleCount} similar tasks</td>
+        <td colspan="6">${middleCount} similar tasks</td>
       </tr>
       ${this.renderRow(lastEntry)}
     `;
@@ -128,7 +132,8 @@ class ClusterTasks extends LitElement {
         <td>${entry.SpID ? entry.Miner : 'n/a'}</td>
         <td>${entry.Name}</td>
         <td><a href="/pages/task/id/?id=${entry.ID}">${entry.ID}</a></td>
-        <td>${entry.SincePostedStr}</td>
+        <td>${entry.State || (entry.OwnerID ? 'running' : 'pending')}</td>
+        <td>${entry.Age || entry.SincePostedStr}</td>
         <td>
           ${entry.OwnerID
               ? html`<a href="/pages/node_info/?id=${entry.OwnerID}">${entry.Owner}</a>`
@@ -204,7 +209,8 @@ class ClusterTasks extends LitElement {
             <th>SpID</th>
             <th style="min-width: 128px">Task</th>
             <th>ID</th>
-            <th>Posted</th>
+            <th>State</th>
+            <th>Age</th>
             <th>Owner</th>
           </tr>
         </thead>

@@ -389,7 +389,7 @@ func NewWithReg(
 			if h == nil || !h.considerWork(workSourceRecover, []task{{ID: TaskID(w.ID), UpdateTime: w.UpdateTime, PostedTime: w.PostedTime, Retries: w.Retries}}, eventEmitter{schedulerChannel: e.schedulerChannel}) {
 				// Task type no longer registered on this node (config change);
 				// release the claim so another node can pick it up.
-				_, err := db.Exec(e.cfg.ctx, `UPDATE harmony_task SET owner_id=NULL WHERE id=$1 AND owner_id=$2`, w.ID, e.cfg.ownerID)
+				_, err := db.Exec(e.cfg.ctx, `UPDATE harmony_task SET owner_id=NULL, work_start=NULL WHERE id=$1 AND owner_id=$2`, w.ID, e.cfg.ownerID)
 				if err != nil {
 					log.Errorw("Cannot remove self from owner field", "error", err)
 					continue

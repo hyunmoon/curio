@@ -173,7 +173,7 @@ func (h *taskTypeHandler) considerWork(from string, tasks []task, eventEmitter e
 			FOR UPDATE SKIP LOCKED
 		)
 		UPDATE harmony_task t
-		SET owner_id = $1
+		SET owner_id = $1, work_start = CURRENT_TIMESTAMP
 		FROM candidates c
 		WHERE t.id = c.id
 		RETURNING t.id;`, h.TaskEngine.cfg.ownerID, tIDs, maxAcceptable)
@@ -195,6 +195,20 @@ func (h *taskTypeHandler) considerWork(from string, tasks []task, eventEmitter e
 			})
 			h.accept.Add(toInt64s(remainder))
 			tIDs = tasksAccepted
+		}
+	}
+
+	if from == workSourceRecover {
+		n, err := h.TaskEngine.cfg.db.Exec(h.TaskEngine.cfg.ctx, `UPDATE harmony_task
+			SET work_start = CURRENT_TIMESTAMP
+			WHERE id = ANY($1) AND owner_id = $2`, tIDs, h.TaskEngine.cfg.ownerID)
+		if err != nil {
+			log.Errorw("Could not record recovered task start", "task_ids", tIDs, "error", err)
+			return false
+		}
+		if n != len(tIDs) {
+			log.Errorw("Could not record all recovered task starts", "task_ids", tIDs, "updated", n)
+			return false
 		}
 	}
 
@@ -221,7 +235,7 @@ func (h *taskTypeHandler) considerWork(from string, tasks []task, eventEmitter e
 		if len(failedTIDs) > 0 {
 			tIDs = goodTIDs
 			log.Errorw("did not accept task", "task_ids", failedTIDs, "reason", "storage claim failed", "name", h.Name)
-			_, err := h.TaskEngine.cfg.db.Exec(h.TaskEngine.cfg.ctx, `UPDATE harmony_task SET owner_id = NULL WHERE id = ANY($1)`, failedTIDs)
+			_, err := h.TaskEngine.cfg.db.Exec(h.TaskEngine.cfg.ctx, `UPDATE harmony_task SET owner_id = NULL, work_start = NULL WHERE id = ANY($1)`, failedTIDs)
 			if err != nil {
 				log.Errorw("Could not reset failed tasks", "error", err)
 			}
@@ -456,7 +470,7 @@ retryRecordCompletion:
 				result = "non-failing error: " + doErr.Error()
 			}
 		case preempted:
-			_, err = tx.Exec(`UPDATE harmony_task SET owner_id=NULL, update_time=CURRENT_TIMESTAMP WHERE id=$1`, tID)
+			_, err = tx.Exec(`UPDATE harmony_task SET owner_id=NULL, work_start=NULL, update_time=CURRENT_TIMESTAMP WHERE id=$1`, tID)
 			if err != nil {
 				return false, fmt.Errorf("could not release preempted task: %v %v", tID, err)
 			}
@@ -476,7 +490,7 @@ retryRecordCompletion:
 					return false, fmt.Errorf("could not delete failed job: %w", err)
 				}
 			} else {
-				_, err = tx.Exec(`UPDATE harmony_task SET owner_id=NULL, retries=$1, update_time=CURRENT_TIMESTAMP WHERE id=$2`, retries+1, tID)
+				_, err = tx.Exec(`UPDATE harmony_task SET owner_id=NULL, work_start=NULL, retries=$1, update_time=CURRENT_TIMESTAMP WHERE id=$2`, retries+1, tID)
 				if err != nil {
 					return false, fmt.Errorf("could not disown failed task: %v %v", tID, err)
 				}

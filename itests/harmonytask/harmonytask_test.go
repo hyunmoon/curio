@@ -1102,10 +1102,18 @@ func TestPreemptedTaskReclaimable(t *testing.T) {
 	db := getDB(t)
 
 	preempted := make(chan harmonytask.TaskID, 2)
+	var refuseAfterPreempt atomic.Bool
 	victim := newTestTaskWithOpts("ReclaimVictim", 2, resources.Resources{Cpu: 1, Ram: 1 << 20}, false)
+	victim.canAcceptFunc = func(ids []harmonytask.TaskID, _ *harmonytask.TaskEngine) ([]harmonytask.TaskID, error) {
+		if refuseAfterPreempt.Load() {
+			return nil, nil
+		}
+		return ids, nil
+	}
 	victim.doFunc = func(ctx context.Context, id harmonytask.TaskID, so func() bool) (bool, error) {
 		select {
 		case <-ctx.Done():
+			refuseAfterPreempt.Store(true)
 			preempted <- id
 			return false, ctx.Err()
 		case <-time.After(3 * time.Second):
@@ -1135,9 +1143,11 @@ func TestPreemptedTaskReclaimable(t *testing.T) {
 		t.Skip("no preemption occurred - machine may have spare capacity")
 	}
 
-	// Wait for victim to be released (owner_id=NULL) and re-claimed, then complete.
-	// The task may be re-claimed quickly, so we either see owner_id=NULL briefly or
-	// the row disappears (completed). Either way, victim.doneCh signals success.
+	// Refuse the immediate re-claim long enough to observe the persisted release.
+	waitForTaskReleased(t, db, vID, taskTimeout)
+	refuseAfterPreempt.Store(false)
+
+	// The next scheduler pass can now re-claim and complete the victim.
 	waitForTask(t, victim.doneCh, taskTimeout)
 
 	// Verify the preempted task eventually completed (in history)

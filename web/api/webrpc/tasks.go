@@ -2,6 +2,7 @@ package webrpc
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strconv"
 	"time"
@@ -16,39 +17,79 @@ import (
 )
 
 type TaskSummary struct {
-	ID             int64
-	Name           string
-	SpID           string
-	SincePosted    time.Time `db:"since_posted"`
-	Owner, OwnerID *string
+	ID    int64
+	Name  string
+	SpID  string
+	State string
+	Age   string
 
-	// db ignored
-	SincePostedStr string `db:"-"`
+	Owner, OwnerID *string
 
 	Miner string
 }
 
+type taskSummaryRow struct {
+	ID         int64
+	Name       string
+	PostedTime time.Time    `db:"posted_time"`
+	WorkStart  sql.NullTime `db:"work_start"`
+	Owner      *string
+	OwnerID    *string `db:"owner_id"`
+}
+
+func (r taskSummaryRow) summary(now time.Time) (TaskSummary, error) {
+	state := "pending"
+	ageStart := r.PostedTime
+	if r.OwnerID != nil {
+		if !r.WorkStart.Valid {
+			return TaskSummary{}, fmt.Errorf("running task %d has no work_start", r.ID)
+		}
+		state = "running"
+		ageStart = r.WorkStart.Time
+	}
+
+	age := now.Sub(ageStart)
+	if age < 0 {
+		age = 0
+	}
+
+	return TaskSummary{
+		ID:      r.ID,
+		Name:    r.Name,
+		State:   state,
+		Age:     age.Truncate(time.Second).String(),
+		Owner:   r.Owner,
+		OwnerID: r.OwnerID,
+	}, nil
+}
+
 func (a *WebRPC) ClusterTaskSummary(ctx context.Context) ([]TaskSummary, error) {
-	var ts = []TaskSummary{}
-	err := a.Deps.DB.Select(ctx, &ts, `SELECT 
-		t.id as id, t.name as name, t.update_time as since_posted, t.owner_id as owner_id, hm.host_and_port as owner
+	var rows []taskSummaryRow
+	err := a.Deps.DB.Select(ctx, &rows, `SELECT
+		t.id as id, t.name as name, t.posted_time, t.work_start, t.owner_id as owner_id, hm.host_and_port as owner
 	FROM harmony_task t LEFT JOIN harmony_machines hm ON hm.id = t.owner_id 
 	ORDER BY
-	    CASE WHEN t.owner_id IS NULL THEN 1 ELSE 0 END, t.update_time ASC`)
+	    CASE WHEN t.owner_id IS NULL THEN 1 ELSE 0 END,
+	    CASE WHEN t.owner_id IS NULL THEN t.posted_time ELSE t.work_start END ASC`)
 	if err != nil {
 		return nil, err // Handle error
 	}
 
+	ts := make([]TaskSummary, 0, len(rows))
+	now := time.Now()
 	// Populate MinerID
-	for i := range ts {
-		ts[i].SincePostedStr = time.Since(ts[i].SincePosted).Truncate(time.Second).String()
-
-		if v, ok := a.TaskSPIDs[ts[i].Name]; ok {
-			ts[i].SpID = v.GetSpid(a.Deps.DB, ts[i].ID)
+	for _, row := range rows {
+		task, err := row.summary(now)
+		if err != nil {
+			return nil, err
 		}
 
-		if ts[i].SpID != "" {
-			spid, err := strconv.ParseInt(ts[i].SpID, 10, 64)
+		if v, ok := a.TaskSPIDs[task.Name]; ok {
+			task.SpID = v.GetSpid(a.Deps.DB, task.ID)
+		}
+
+		if task.SpID != "" {
+			spid, err := strconv.ParseInt(task.SpID, 10, 64)
 			if err != nil {
 				return nil, err
 			}
@@ -58,11 +99,13 @@ func (a *WebRPC) ClusterTaskSummary(ctx context.Context) ([]TaskSummary, error) 
 				if err != nil {
 					return nil, err
 				}
-				ts[i].Miner = maddr.String()
+				task.Miner = maddr.String()
 			} else {
-				ts[i].Miner = ""
+				task.Miner = ""
 			}
 		}
+
+		ts = append(ts, task)
 	}
 
 	return ts, nil
