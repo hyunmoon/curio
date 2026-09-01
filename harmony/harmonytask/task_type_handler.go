@@ -161,7 +161,7 @@ func (h *taskTypeHandler) considerWork(from string, ids []TaskID) (workAccepted 
 			FOR UPDATE SKIP LOCKED
 		)
 		UPDATE harmony_task t
-		SET owner_id = $1
+		SET owner_id = $1, work_start = CURRENT_TIMESTAMP
 		FROM candidates c
 		WHERE t.id = c.id
 		RETURNING t.id;`, h.TaskEngine.ownerID, tIDs, maxAcceptable)
@@ -178,6 +178,20 @@ func (h *taskTypeHandler) considerWork(from string, ids []TaskID) (workAccepted 
 		}
 		if len(tasksAccepted) != len(tIDs) {
 			tIDs = tasksAccepted // update tIDs to the accepted tasks
+		}
+	}
+
+	if from == WorkSourceRecover {
+		n, err := h.TaskEngine.db.Exec(h.TaskEngine.ctx, `UPDATE harmony_task
+			SET work_start = CURRENT_TIMESTAMP
+			WHERE id = ANY($1) AND owner_id = $2`, tIDs, h.TaskEngine.ownerID)
+		if err != nil {
+			log.Errorw("Could not record recovered task start", "task_ids", tIDs, "error", err)
+			return false
+		}
+		if n != len(tIDs) {
+			log.Errorw("Could not record all recovered task starts", "task_ids", tIDs, "updated", n)
+			return false
 		}
 	}
 
@@ -206,7 +220,7 @@ func (h *taskTypeHandler) considerWork(from string, ids []TaskID) (workAccepted 
 			tIDs = goodTIDs // releaseStorage will match this now.
 			log.Errorw("did not accept task", "task_ids", failedTIDs, "reason", "storage claim failed", "name", h.Name)
 			// This is not a task failure, so just reset the owner_id.
-			_, err := h.TaskEngine.db.Exec(h.TaskEngine.ctx, `UPDATE harmony_task SET owner_id = NULL WHERE id = ANY($1)`, failedTIDs)
+			_, err := h.TaskEngine.db.Exec(h.TaskEngine.ctx, `UPDATE harmony_task SET owner_id = NULL, work_start = NULL WHERE id = ANY($1)`, failedTIDs)
 			if err != nil {
 				log.Errorw("Could not reset failed tasks", "error", err)
 			}
@@ -364,7 +378,7 @@ retryRecordCompletion:
 				}
 				// Note: Extra Info is left laying around for later review & clean-up
 			} else {
-				_, err := tx.Exec(`UPDATE harmony_task SET owner_id=NULL, retries=$1, update_time=CURRENT_TIMESTAMP  WHERE id=$2`, retries+1, tID)
+				_, err := tx.Exec(`UPDATE harmony_task SET owner_id=NULL, work_start=NULL, retries=$1, update_time=CURRENT_TIMESTAMP WHERE id=$2`, retries+1, tID)
 				if err != nil {
 					return false, fmt.Errorf("could not disown failed task: %v %v", tID, err)
 				}
