@@ -35,9 +35,7 @@ func NewDeleteDataSetTask(db *harmonydb.DB, ethClient ethchain.EthClient, sender
 	}
 }
 
-func (t *DeleteDataSetTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-	ctx := context.Background()
-
+func (t *DeleteDataSetTask) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
 	var dataSetId int64
 	err = t.db.QueryRow(ctx, `SELECT id FROM pdp_delete_data_set WHERE delete_data_set_task_id = $1`, taskID).Scan(&dataSetId)
 	if err != nil {
@@ -150,8 +148,9 @@ func (t *DeleteDataSetTask) CanAccept(ids []harmonytask.TaskID, engine *harmonyt
 
 func (t *DeleteDataSetTask) TypeDetails() harmonytask.TaskTypeDetails {
 	return harmonytask.TaskTypeDetails{
-		Max:  taskhelp.Max(15),
-		Name: tasknames.PDPv0_DelDataSet,
+		Name:      tasknames.PDPv0_DelDataSet,
+		MayFollow: []string{tasknames.PDPv0_Prove, tasknames.PDPv0_ProvPeriod},
+		Max:       taskhelp.Max(15),
 		Cost: resources.Resources{
 			Cpu: 0,
 			Gpu: 0,
@@ -165,65 +164,55 @@ func (t *DeleteDataSetTask) TypeDetails() harmonytask.TaskTypeDetails {
 }
 
 func (t *DeleteDataSetTask) schedule(ctx context.Context, addTaskFunc harmonytask.AddTaskFunc) error {
-	var stop bool
-
-	for !stop {
+	for {
+		stop := true
 		addTaskFunc(func(taskID harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
-			stop = true
-
 			current, err := t.ethClient.BlockNumber(ctx)
 			if err != nil {
 				return false, xerrors.Errorf("failed to get current block number: %w", err)
 			}
 
-			var pendings []struct {
-				ID               int64 `db:"id"`
-				TerminationEpoch int64 `db:"service_termination_epoch"`
-			}
-
-			err = tx.Select(&pendings, `SELECT id,
-       												service_termination_epoch
-											FROM pdp_delete_data_set
-											WHERE delete_data_set_task_id IS NULL
-											  AND after_delete_data_set = FALSE
-											  AND service_termination_epoch IS NOT NULL
-											  AND service_termination_epoch <= $1
-											  AND deletion_allowed = TRUE`, current)
-
-			if err != nil {
-				return false, xerrors.Errorf("failed to select pending data sets: %w", err)
-			}
-
-			if len(pendings) == 0 {
-				log.Debugw("no pending data sets to terminate")
-				return false, nil
-			}
-
-			pending := pendings[0]
-
-			n, err := tx.Exec(`UPDATE pdp_delete_data_set
-									SET delete_data_set_task_id = $1
-									WHERE id = $2
-									  AND delete_data_set_task_id IS NULL
-									  AND after_delete_data_set = FALSE
-									  AND after_terminate_service = TRUE
-									  AND deletion_allowed = TRUE`, taskID, pending.ID)
-
+			n, err := tx.Exec(`WITH pending AS (
+					SELECT id
+					FROM pdp_delete_data_set
+					WHERE delete_data_set_task_id IS NULL
+					  AND after_delete_data_set = FALSE
+					  AND after_terminate_service = TRUE
+					  AND service_termination_epoch IS NOT NULL
+					  AND service_termination_epoch <= $2
+					  AND deletion_allowed = TRUE
+					LIMIT 1
+				)
+				UPDATE pdp_delete_data_set p
+				SET delete_data_set_task_id = $1
+				FROM pending
+				WHERE p.id = pending.id
+				  AND p.delete_data_set_task_id IS NULL
+				  AND p.after_delete_data_set = FALSE
+				  AND p.after_terminate_service = TRUE
+				  AND p.service_termination_epoch IS NOT NULL
+				  AND p.service_termination_epoch <= $2
+				  AND p.deletion_allowed = TRUE`, taskID, current)
 			if err != nil {
 				return false, xerrors.Errorf("failed to update pdp_delete_data_set: %w", err)
 			}
-
+			if n == 0 {
+				log.Debugw("no pending data sets to terminate")
+				return false, nil
+			}
 			if n != 1 {
 				return false, xerrors.Errorf("updated %d rows", n)
 			}
 
-			log.Debugw("scheduled terminate data set task", "dataSetId", pending.ID)
+			log.Debugw("scheduled terminate data set task")
 
 			stop = false
 			return true, nil
 		})
+		if stop {
+			return nil
+		}
 	}
-	return nil
 }
 
 func (t *DeleteDataSetTask) Adder(taskFunc harmonytask.AddTaskFunc) {}

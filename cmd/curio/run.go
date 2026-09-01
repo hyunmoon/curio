@@ -79,6 +79,9 @@ var runCmd = &cli.Command{
 				}
 			}
 		}()
+		// Close the app level shutdown handler
+		cmdShutdownChan <- struct{}{}
+
 		if !cctx.Bool("enable-gpu-proving") {
 			err := os.Setenv("BELLMAN_NO_GPU", "true")
 			if err != nil {
@@ -97,16 +100,26 @@ var runCmd = &cli.Command{
 			}
 		}
 
-		ctx := context.Background()
+		var ctx context.Context
 		shutdownChan := make(chan struct{})
+		var ctxclose func()
 		{
-			var ctxclose func()
-			ctx, ctxclose = context.WithCancel(ctx)
+			ctx, ctxclose = context.WithCancel(context.Background())
 			go func() {
 				<-shutdownChan
 				ctxclose()
 			}()
 		}
+		defer ctxclose()
+		// Close the app level shutdown handler
+		cmdShutdownChan <- struct{}{}
+		finishCh := shutdown.MonitorShutdown(shutdownChan, shutdown.ShutdownHandler{
+			Component: "curio",
+			StopFunc: func(context.Context) error {
+				ctxclose()
+				return nil
+			},
+		})
 
 		// Set the metric to one so it is published to the exporter
 		stats.Record(ctx, metrics.LotusInfo.M(1))
@@ -133,15 +146,19 @@ var runCmd = &cli.Command{
 		if err != nil {
 			return xerrors.Errorf("starting tasks: %w", err)
 		}
-		defer taskEngine.GracefullyTerminate()
+		dependencies.TaskEngine = taskEngine
+		if taskEngine != nil {
+			defer taskEngine.GracefullyTerminate()
+		}
 
 		err = rpc.ListenAndServe(ctx, dependencies, shutdownChan) // Monitor for shutdown.
 		if err != nil {
+			if ctx.Err() != nil {
+				<-finishCh
+				return nil
+			}
 			return err
 		}
-
-		finishCh := shutdown.MonitorShutdown(shutdownChan) //node.ShutdownHandler{Component: "rpc server", StopFunc: rpcStopper},
-		//node.ShutdownHandler{Component: "curio", StopFunc: stop},
 
 		<-finishCh
 		return nil
@@ -154,11 +171,13 @@ var layersFlag = &cli.StringSliceFlag{
 }
 
 var webCmd = &cli.Command{
-	Name: "web",
+	Name:    "web",
+	Aliases: []string{"gui"},
 
 	Usage: translations.T("Start Curio web interface"),
 	Description: translations.T(`Start an instance of Curio web interface. 
-	This creates the 'web' layer if it does not exist, then calls run with that layer.`),
+	This creates the 'web' layer if it does not exist, then calls run with that layer.
+	In --db-readonly / CURIO_DB_READONLY mode, no config layer is written; the GUI is enabled in-memory.`),
 	Flags: []cli.Flag{
 		&cli.StringFlag{
 			Name:  "gui-listen",
@@ -176,6 +195,18 @@ var webCmd = &cli.Command{
 		db, err := deps.MakeDB(cctx)
 		if err != nil {
 			return err
+		}
+
+		if db.ReadOnly() {
+			// Do not persist a web layer; force GUI via gui-listen so deps enables it in-memory.
+			listen := cctx.String("gui-listen")
+			if listen == "" {
+				listen = "0.0.0.0:4701"
+			}
+			if err := cctx.Set("gui-listen", listen); err != nil {
+				return err
+			}
+			return runCmd.Action(cctx)
 		}
 
 		webtxt, err := getConfig(db, "web")

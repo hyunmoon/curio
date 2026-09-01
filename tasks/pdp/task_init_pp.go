@@ -8,6 +8,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/core/types"
+	logging "github.com/ipfs/go-log/v2"
 	"github.com/yugabyte/pgx/v5"
 	"golang.org/x/xerrors"
 
@@ -23,6 +24,8 @@ import (
 
 	chainTypes "github.com/filecoin-project/lotus/chain/types"
 )
+
+var log = logging.Logger("pdp")
 
 type InitProvingPeriodTask struct {
 	db        *harmonydb.DB
@@ -92,8 +95,7 @@ func NewInitProvingPeriodTask(db *harmonydb.DB, ethClient ethchain.EthClient, fi
 	return ipp
 }
 
-func (ipp *InitProvingPeriodTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-	ctx := context.Background()
+func (ipp *InitProvingPeriodTask) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
 
 	// Select the data set where challenge_request_task_id = taskID
 	var dataSetID int64
@@ -253,6 +255,9 @@ func (ipp *InitProvingPeriodTask) CanAccept(ids []harmonytask.TaskID, engine *ha
 func (ipp *InitProvingPeriodTask) TypeDetails() harmonytask.TaskTypeDetails {
 	return harmonytask.TaskTypeDetails{
 		Name: tasknames.PDPInitPP,
+		// End of data onboarding (piece aggregation); InitPP needs on-chain leaves before
+		// the first challenge request. Proving pipeline continues: PDPInitPP → PDPProve.
+		MayFollow: []string{tasknames.AggregatePDPDeal},
 		Cost: resources.Resources{
 			Cpu: 0,
 			Gpu: 0,

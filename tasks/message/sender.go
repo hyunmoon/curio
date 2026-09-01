@@ -10,7 +10,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log/v2"
-	"go.uber.org/multierr"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
@@ -21,6 +20,7 @@ import (
 	"github.com/filecoin-project/curio/harmony/resources"
 	"github.com/filecoin-project/curio/harmony/taskhelp"
 	"github.com/filecoin-project/curio/lib/promise"
+	"github.com/filecoin-project/curio/tasks/tasknames"
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/chain/types"
@@ -81,8 +81,7 @@ type SendTask struct {
 	db *harmonydb.DB
 }
 
-func (s *SendTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-	ctx := context.TODO()
+func (s *SendTask) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
 
 	// get message from db
 
@@ -121,18 +120,16 @@ func (s *SendTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done b
 			return false, xerrors.Errorf("lost ownership of task")
 		}
 
-		// try to acquire lock
 		cn, err := s.db.Exec(ctx, `
-			INSERT INTO message_send_locks (from_key, task_id, claimed_at) 
-			VALUES ($1, $2, CURRENT_TIMESTAMP) ON CONFLICT (from_key) DO UPDATE 
-			SET task_id = EXCLUDED.task_id, claimed_at = CURRENT_TIMESTAMP 
-			WHERE message_send_locks.task_id = $2;`, dbMsg.FromKey, taskID)
+			INSERT INTO message_send_locks (from_key, task_id, claimed_at)
+			VALUES ($1, $2, CURRENT_TIMESTAMP)
+			ON CONFLICT (from_key) DO UPDATE
+			SET task_id = EXCLUDED.task_id, claimed_at = CURRENT_TIMESTAMP
+			WHERE message_send_locks.task_id = $2`, dbMsg.FromKey, taskID)
 		if err != nil {
 			return false, xerrors.Errorf("acquiring send lock: %w", err)
 		}
-
 		if cn == 1 {
-			// we got the lock
 			break
 		}
 
@@ -141,16 +138,41 @@ func (s *SendTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done b
 		time.Sleep(SendLockedWait)
 	}
 
+	var sendSuccess, recordResults bool
+	var sendError string
+
 	// defer release db send lock
 	defer func() {
-		_, err2 := s.db.Exec(ctx, `
-			DELETE from message_send_locks WHERE from_key = $1 AND task_id = $2`, dbMsg.FromKey, taskID)
-		if err2 != nil {
-			log.Errorw("releasing send lock", "task_id", taskID, "from", dbMsg.FromKey, "error", err2)
+		comm, rerr := s.db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (commit bool, err error) {
+			if recordResults {
+				n, err1 := tx.Exec(`UPDATE message_sends SET
+							 send_success = $1,
+							 send_error = $2,
+							 send_time = CURRENT_TIMESTAMP
+						 WHERE send_task_id = $3`, sendSuccess, sendError, taskID)
+				if err1 != nil {
+					return false, xerrors.Errorf("recording send results: %w", err1)
+				}
+				if n != 1 {
+					return false, xerrors.Errorf("expected to modify 1 record but modified %d", n)
+				}
+			}
 
-			// make sure harmony retries this task so that we eventually release this lock
+			_, err2 := tx.Exec(`
+				DELETE FROM message_send_locks
+				WHERE from_key = $1 AND task_id = $2`, dbMsg.FromKey, taskID)
+			if err2 != nil {
+				return false, xerrors.Errorf("releasing send lock for task_id %d, from %s: %w", taskID, dbMsg.FromKey, err2)
+			}
+			return true, nil
+		}, harmonydb.OptionRetry())
+		if rerr != nil {
 			done = false
-			err = multierr.Append(err, xerrors.Errorf("releasing send lock: %w", err2))
+			err = xerrors.Errorf("recording task status and releasing locks for taskId %d: %w", taskID, rerr)
+		}
+		if !comm {
+			done = false
+			err = xerrors.Errorf("recording task status and releasing locks for taskId %d: failed to commit the database transaction", taskID)
 		}
 	}()
 
@@ -225,18 +247,12 @@ func (s *SendTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done b
 	_, err = s.api.MpoolPush(ctx, sigMsg)
 
 	// persist send result
-	var sendSuccess = err == nil
-	var sendError string
+	sendSuccess = err == nil
 	if err != nil {
 		sendError = err.Error()
 	}
 
-	_, err = s.db.Exec(ctx, `
-		UPDATE message_sends SET send_success = $1, send_error = $2, send_time = CURRENT_TIMESTAMP 
-		WHERE send_task_id = $3`, sendSuccess, sendError, taskID)
-	if err != nil {
-		return false, xerrors.Errorf("updating db record: %w", err)
-	}
+	recordResults = true
 
 	return true, nil
 }
@@ -258,14 +274,14 @@ func (s *SendTask) CanAccept(ids []harmonytask.TaskID, engine *harmonytask.TaskE
 func (s *SendTask) TypeDetails() harmonytask.TaskTypeDetails {
 	return harmonytask.TaskTypeDetails{
 		Max:  taskhelp.Max(1024),
-		Name: "SendMessage",
+		Name: tasknames.SendMessage,
 		Cost: resources.Resources{
 			Cpu: 0,
 			Gpu: 0,
 			Ram: 1 << 20,
 		},
-		MaxFailures: 1000,
-		Follows:     nil,
+		Uninterruptible: true,
+		MaxFailures:     1000,
 		RetryWait: func(retries int) time.Duration {
 			return min(time.Second*time.Duration(retries), time.Second*10)
 		},
@@ -370,6 +386,12 @@ func (s *Sender) Send(ctx context.Context, msg *types.Message, mss *api.MessageS
 
 	// push the task
 	taskAdder := s.sendTask.sendTF.Val(ctx)
+	if taskAdder == nil {
+		if err := ctx.Err(); err != nil {
+			return cid.Undef, err
+		}
+		return cid.Undef, xerrors.Errorf("message send task adder is not available")
+	}
 
 	unsBytes := new(bytes.Buffer)
 	err = msg.MarshalCBOR(unsBytes)

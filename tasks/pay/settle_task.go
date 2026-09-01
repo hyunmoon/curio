@@ -9,12 +9,14 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 	"golang.org/x/xerrors"
 
+	"github.com/filecoin-project/curio/alertmanager/curioalerting"
 	"github.com/filecoin-project/curio/harmony/harmonydb"
 	"github.com/filecoin-project/curio/harmony/harmonytask"
 	"github.com/filecoin-project/curio/harmony/resources"
 	"github.com/filecoin-project/curio/lib/ethchain"
 	"github.com/filecoin-project/curio/lib/filecoinpayment"
 	"github.com/filecoin-project/curio/pdp/contract"
+	"github.com/filecoin-project/curio/pdp/contract/FWSS"
 	"github.com/filecoin-project/curio/tasks/message"
 	"github.com/filecoin-project/curio/tasks/tasknames"
 )
@@ -25,19 +27,19 @@ type SettleTask struct {
 	db        *harmonydb.DB
 	ethClient ethchain.EthClient
 	sender    *message.SenderETH
+	al        curioalerting.AlertingInterface
 }
 
-func NewSettleTask(db *harmonydb.DB, ethClient ethchain.EthClient, sender *message.SenderETH) *SettleTask {
+func NewSettleTask(db *harmonydb.DB, ethClient ethchain.EthClient, sender *message.SenderETH, al curioalerting.AlertingInterface) *SettleTask {
 	return &SettleTask{
 		db:        db,
 		ethClient: ethClient,
 		sender:    sender,
+		al:        al,
 	}
 }
 
-func (s *SettleTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-	ctx := context.Background()
-
+func (s *SettleTask) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
 	var sender string
 	err = s.db.QueryRow(ctx, `SELECT address FROM eth_keys WHERE role = 'pdp' ORDER BY address ASC`).Scan(&sender)
 	if err != nil {
@@ -79,8 +81,14 @@ func (s *SettleTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done
 	payee := provider.Info.Payee
 
 	serviceAddr := contract.ContractAddresses().AllowedPublicRecordKeepers.FWSService
+	resolver, err := FWSS.SettleTargetResolver(ctx, s.ethClient)
+	if err != nil {
+		return false, fmt.Errorf("failed to create FWSS settle target resolver: %w", err)
+	}
 
-	err = filecoinpayment.SettleLockupPeriod(ctx, s.db, s.ethClient, s.sender, opAddr, []common.Address{payee}, []common.Address{serviceAddr})
+	err = filecoinpayment.SettleLockupPeriod(ctx, s.db, s.ethClient, s.sender, opAddr, []common.Address{payee}, map[common.Address]filecoinpayment.SettleTargetResolver{
+		serviceAddr: resolver,
+	}, s.al, alertType, alertName)
 	if err != nil {
 		return false, fmt.Errorf("failed to settle lockup period: %w", err)
 	}
@@ -93,7 +101,8 @@ func (s *SettleTask) CanAccept(ids []harmonytask.TaskID, engine *harmonytask.Tas
 
 func (s *SettleTask) TypeDetails() harmonytask.TaskTypeDetails {
 	return harmonytask.TaskTypeDetails{
-		Name: tasknames.Settle,
+		Name:      tasknames.Settle,
+		MayFollow: []string{tasknames.SendTransaction},
 		Cost: resources.Resources{
 			Cpu: 0,
 			Gpu: 0,

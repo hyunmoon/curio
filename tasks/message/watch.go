@@ -3,6 +3,7 @@ package message
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"sync/atomic"
 
 	"github.com/ipfs/go-cid"
@@ -37,6 +38,15 @@ type MessageWatcher struct {
 
 	updateCh chan struct{}
 	bestTs   atomic.Pointer[types.TipSetKey]
+
+	// onLanded is invoked (without arguments, in the watcher's goroutine) once
+	// per update() call that successfully recorded one or more messages as
+	// landed on chain. It is intended for waking pollers (seal/deal) that may
+	// be waiting on a message_waits row to be filled in.
+	// Guarded by onLandedMu: the run() goroutine is already live while
+	// startup wiring calls AddOnLanded.
+	onLandedMu sync.Mutex
+	onLanded   []func()
 }
 
 func NewMessageWatcher(db *harmonydb.DB, ht *harmonytask.TaskEngine, pcs *chainsched.CurioChainSched, api MessageWaiterApi) (*MessageWatcher, error) {
@@ -53,6 +63,24 @@ func NewMessageWatcher(db *harmonydb.DB, ht *harmonytask.TaskEngine, pcs *chains
 		return nil, err
 	}
 	return mw, nil
+}
+
+// AddOnLanded registers a callback that fires after an update() pass landed at
+// least one tracked message on chain. Use this to wake pollers (seal poller,
+// deal market poller) that gate progress on after_*_msg_success or on the
+// publish message reaching finality.
+//
+// Callbacks are invoked asynchronously. Debouncing may be necessary.
+//
+// Callbacks registered after a message has already landed only fire on
+// subsequent landings.
+func (mw *MessageWatcher) AddOnLanded(fn func()) {
+	if fn == nil {
+		return
+	}
+	mw.onLandedMu.Lock()
+	mw.onLanded = append(mw.onLanded, fn)
+	mw.onLandedMu.Unlock()
 }
 
 func (mw *MessageWatcher) run() {
@@ -143,6 +171,7 @@ func (mw *MessageWatcher) update() {
 	}
 
 	// check if any of the messages we have assigned to us are now on chain, and have been for MinConfidence epochs
+	var landed int
 	for _, msg := range msgs {
 		if msg.Nonce > toCheck[msg.FromAddr] {
 			continue // definitely not on chain yet
@@ -189,6 +218,22 @@ func (mw *MessageWatcher) update() {
 		if err != nil {
 			log.Errorf("failed to update message wait: %+v", err)
 			continue
+		}
+		landed++
+	}
+
+	// Wake registered pollers when at least one message has landed; pollers
+	// like the seal poller (after_precommit_msg_success / after_commit_msg_success)
+	// and the deal market poller (publish msg landing for FindDeal) gate the
+	// pipeline on these rows being filled in, and would otherwise wait up to a
+	// full poller interval before noticing.
+	if landed > 0 {
+		mw.onLandedMu.Lock()
+		callbacks := make([]func(), len(mw.onLanded))
+		copy(callbacks, mw.onLanded)
+		mw.onLandedMu.Unlock()
+		for _, fn := range callbacks {
+			go fn() //nolint:safetylint // local copy of onLanded under onLandedMu
 		}
 	}
 }

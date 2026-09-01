@@ -28,14 +28,16 @@ import (
 	"github.com/filecoin-project/curio/build"
 	"github.com/filecoin-project/curio/deps/config"
 	"github.com/filecoin-project/curio/harmony/harmonydb"
+	"github.com/filecoin-project/curio/lib/apiconn"
 	"github.com/filecoin-project/curio/lib/lists"
+	pdpwallet "github.com/filecoin-project/curio/pdp/wallet"
 	"github.com/filecoin-project/curio/tasks/tasknames"
 
 	"github.com/filecoin-project/lotus/blockstore"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/types"
-	cliutil "github.com/filecoin-project/lotus/cli/util"
+	"github.com/filecoin-project/lotus/chain/types/ethtypes"
 )
 
 type AlertNow struct {
@@ -138,14 +140,53 @@ func balanceCheck(al *alerts) {
 		balance, err := al.api.WalletBalance(al.ctx, addr)
 		if err != nil {
 			al.alertMap[Name].err = err
+			return
 		}
 
 		if abi.TokenAmount(al.cfg.MinimumWalletBalance).GreaterThanEqual(balance) {
 			fmt.Fprintf(&ret, "Balance for wallet %s (%s) is below %s. ", addr, keyAddr, al.cfg.MinimumWalletBalance.Short())
 		}
 	}
+
+	pdpBalanceCheck(al, &ret)
+
 	if ret.String() != "" {
 		al.alertMap[Name].alertString = ret.String()
+	}
+}
+
+// pdpBalanceCheck checks the PDP wallet (used to pay gas for PDP on-chain
+// transactions) against the same MinimumWalletBalance threshold as the other
+// wallets.
+func pdpBalanceCheck(al *alerts, ret *strings.Builder) {
+	status, err := pdpwallet.PDPKeyStatus(al.ctx, al.db)
+	if err != nil {
+		fmt.Fprintf(ret, "Could not check PDP wallet: %s. ", err)
+		return
+	}
+	if !status.Configured {
+		return
+	}
+
+	ea, err := ethtypes.ParseEthAddress(status.Address)
+	if err != nil {
+		fmt.Fprintf(ret, "Could not parse PDP wallet address %s: %s. ", status.Address, err)
+		return
+	}
+	filAddr, err := ea.ToFilecoinAddress()
+	if err != nil {
+		fmt.Fprintf(ret, "Could not derive fil address for PDP wallet %s: %s. ", status.Address, err)
+		return
+	}
+
+	balance, err := al.api.WalletBalance(al.ctx, filAddr)
+	if err != nil {
+		fmt.Fprintf(ret, "Could not get balance for PDP wallet %s: %s. ", filAddr, err)
+		return
+	}
+
+	if abi.TokenAmount(al.cfg.MinimumWalletBalance).GreaterThanEqual(balance) {
+		fmt.Fprintf(ret, "Balance for PDP wallet %s (%s) is below %s. ", status.Address, filAddr, al.cfg.MinimumWalletBalance.Short())
 	}
 }
 
@@ -173,23 +214,19 @@ var pdpTasks = []string{
 	tasknames.PDPDelDataSet,
 	tasknames.PDPInitPP,
 	tasknames.PDPProvingPeriod,
-	tasknames.PDPNotify,
 	tasknames.PDPCommP,
 	tasknames.PDPSaveCache,
 	tasknames.AggregatePDPDeal,
 	// PDP v0
 	tasknames.PDPv0_Prove,
-	tasknames.PDPv0_PullPiece,
-	tasknames.PDPv0_SaveCache,
 	tasknames.PDPv0_InitPP,
 	tasknames.PDPv0_ProvPeriod,
-	tasknames.PDPv0_Notify,
 }
 
 // taskFailureCheckWith is the parameterized core shared by taskFailureCheck
-// and pdpTaskFailureCheck. It queries harmony_task_history for failures over
-// the given interval, alerts on any failure in sensitiveTasks, and alerts on
-// >5 failures for all other tasks or machines.
+// and pdpTaskFailureCheck. It alerts on final task failures over the given
+// interval: any final failure in sensitiveTasks, and >5 final failures for all
+// other tasks or machines.
 func taskFailureCheckWith(al *alerts, name AlertName, interval time.Duration, sensitiveTasks []string) {
 	al.alertMap[name] = &alertOut{}
 
@@ -202,12 +239,26 @@ func taskFailureCheckWith(al *alerts, name AlertName, interval time.Duration, se
 	var taskFailures []taskFailure
 
 	err := al.db.Select(al.ctx, &taskFailures, `
+								WITH per_task AS (
+									SELECT
+										h.name,
+										h.task_id,
+										BOOL_OR(h.result) AS succeeded,
+										(ARRAY_AGG(h.completed_by_host_and_port ORDER BY h.work_end DESC, h.id DESC))[1] AS completed_by_host_and_port
+									FROM harmony_task_history h
+									WHERE h.work_end >= NOW() - $1::interval
+									GROUP BY h.name, h.task_id
+								)
 								SELECT completed_by_host_and_port, name, COUNT(*) AS failed_count
-								FROM harmony_task_history
-								WHERE result = FALSE
-								  AND work_end >= NOW() - $1::interval
-								GROUP BY completed_by_host_and_port, name
-								ORDER BY completed_by_host_and_port, name;`, fmt.Sprintf("%f Minutes", interval.Minutes()))
+								FROM per_task p
+								WHERE NOT p.succeeded
+								  AND NOT EXISTS (
+									  SELECT 1
+									  FROM harmony_task ht
+									  WHERE ht.id = p.task_id
+								  )
+									GROUP BY completed_by_host_and_port, name
+								ORDER BY completed_by_host_and_port, name`, fmt.Sprintf("%f Minutes", interval.Minutes()))
 	if err != nil {
 		al.alertMap[name].err = xerrors.Errorf("getting failed task count: %w", err)
 		return
@@ -309,9 +360,9 @@ func permanentStorageCheck(al *alerts) {
 
 		sectorMap[key] = false
 
-		for _, strg := range storages {
-			if space <= strg.Available {
-				strg.Available -= space
+		for i := range storages {
+			if space <= storages[i].Available {
+				storages[i].Available -= space
 				sectorMap[key] = true
 				break
 			}
@@ -321,7 +372,7 @@ func permanentStorageCheck(al *alerts) {
 	missingSpace := big.NewInt(0)
 	for sec, accounted := range sectorMap {
 		if !accounted {
-			big.Add(missingSpace, big.NewInt(sec.size))
+			missingSpace = big.Add(missingSpace, big.NewInt(sec.size))
 		}
 	}
 
@@ -335,117 +386,12 @@ func permanentStorageCheck(al *alerts) {
 // The function iterates over layers, storing decoded configuration and verifying address existence in addrMap.
 // It ends by setting unique addresses and miner slices in the alerts struct which others can reuse. This must be called before other alerts funcs.
 func (al *alerts) getAddresses() error {
-	// MachineDetails represents the structure of data received from the SQL query.
-	type machineDetail struct {
-		ID          int
-		HostAndPort string
-		Layers      string
-	}
-	var machineDetails []machineDetail
-
-	// Get all layers in use
-	err := al.db.Select(al.ctx, &machineDetails, `
-				SELECT m.id, m.host_and_port, d.layers
-				FROM harmony_machines m
-				LEFT JOIN harmony_machine_details d ON m.id = d.machine_id;`)
+	wallets, miners, err := config.GetAddressesFromConfig(al.ctx, al.db, al.api)
 	if err != nil {
-		return xerrors.Errorf("getting config layers for all machines: %w", err)
+		return err
 	}
 
-	// UniqueLayers takes an array of MachineDetails and returns a slice of unique layers.
-
-	layerMap := make(map[string]bool)
-	var uniqueLayers []string
-
-	// Get unique layers in use
-	for _, machine := range machineDetails {
-		// Split the Layers field into individual layers
-		layers := strings.SplitSeq(machine.Layers, ",")
-		for layer := range layers {
-			layer = strings.TrimSpace(layer)
-			if _, exists := layerMap[layer]; !exists && layer != "" {
-				layerMap[layer] = true
-				uniqueLayers = append(uniqueLayers, layer)
-			}
-		}
-	}
-
-	addrMap := make(map[string]struct{})
-	minerMap := make(map[string]struct{})
-
-	if len(uniqueLayers) > 0 {
-		type minimalAddressInfo struct {
-			Addresses []config.CurioAddresses `toml:"Addresses"`
-		}
-
-		err = config.ForEachConfig[minimalAddressInfo](al.ctx, al.db, func(name string, info minimalAddressInfo) error {
-			if !slices.Contains(uniqueLayers, name) {
-				return nil
-			}
-
-			for i := range info.Addresses {
-				prec := info.Addresses[i].PreCommitControl
-				com := info.Addresses[i].CommitControl
-				term := info.Addresses[i].TerminateControl
-				miners := info.Addresses[i].MinerAddresses
-				for j := range prec {
-					if prec[j] != "" {
-						addrMap[prec[j]] = struct{}{}
-					}
-				}
-				for j := range com {
-					if com[j] != "" {
-						addrMap[com[j]] = struct{}{}
-					}
-				}
-				for j := range term {
-					if term[j] != "" {
-						addrMap[term[j]] = struct{}{}
-					}
-				}
-				for j := range miners {
-					if miners[j] != "" {
-						minerMap[miners[j]] = struct{}{}
-					}
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-	}
-
-	var wallets, minerAddrs []address.Address
-
-	// Get control and wallet addresses from chain
-	for m := range minerMap {
-		maddr, err := address.NewFromString(m)
-		if err != nil {
-			return err
-		}
-		info, err := al.api.StateMinerInfo(al.ctx, maddr, types.EmptyTSK)
-		if err != nil {
-			return err
-		}
-		minerAddrs = append(minerAddrs, maddr)
-		addrMap[info.Worker.String()] = struct{}{}
-		for _, w := range info.ControlAddresses {
-			if _, ok := addrMap[w.String()]; !ok {
-				addrMap[w.String()] = struct{}{}
-			}
-		}
-	}
-
-	for w := range addrMap {
-		waddr, err := address.NewFromString(w)
-		if err != nil {
-			return err
-		}
-		wallets = append(wallets, waddr)
-	}
-
-	al.minerAddrs = minerAddrs
+	al.minerAddrs = miners
 	al.walletAddrs = wallets
 
 	return nil
@@ -897,7 +843,7 @@ func chainSyncCheck(al *alerts) {
 
 	// For each unique API (chain), check if in sync
 	for _, info := range lists.UniqNoAlloc(rpcInfos) {
-		ai := cliutil.ParseApiInfo(info)
+		ai := apiconn.Parse(info)
 		if dedup[ai.Addr] {
 			continue
 		}
@@ -1080,14 +1026,16 @@ func ipniSyncCheck(al *alerts) {
 	Name := Name_IPNISync
 	al.alertMap[Name] = &alertOut{}
 
-	var summary []struct {
-		SpId   int64  `db:"sp_id"`
-		PeerID string `db:"peer_id"`
-		Head   string `db:"head"`
+	type ipniSummary struct {
+		SpId   int64          `db:"sp_id"`
+		PeerID string         `db:"peer_id"`
+		Head   sql.NullString `db:"head"`
 		Miner  string
 	}
 
-	err := al.db.Select(al.ctx, &summary, `SELECT 
+	var summaries []ipniSummary
+
+	err := al.db.Select(al.ctx, &summaries, `SELECT 
 												ipp.sp_id,
 												ipp.peer_id,
 												ih.head
@@ -1096,6 +1044,13 @@ func ipniSyncCheck(al *alerts) {
 	if err != nil {
 		al.alertMap[Name].err = xerrors.Errorf("failed to fetch the provider details from DB: %w", err)
 		return
+	}
+
+	var summary []ipniSummary
+	for i := range summaries {
+		if summaries[i].Head.Valid {
+			summary = append(summary, summaries[i])
+		}
 	}
 
 	for i := range summary {
@@ -1162,7 +1117,7 @@ func ipniSyncCheck(al *alerts) {
 				al.alertMap[Name].err = xerrors.Errorf("Failed to unmarshal IPNI service response: %w", err)
 				return
 			}
-			if parsed.LastAdvertisement.Slash == d.Head {
+			if parsed.LastAdvertisement.Slash == d.Head.String {
 				continue
 			}
 
@@ -1181,5 +1136,43 @@ func ipniSyncCheck(al *alerts) {
 				continue
 			}
 		}
+	}
+}
+
+func pdpKeyConfiguredCheck(al *alerts) {
+	Name := Name_PDPKeyConfigured
+	al.alertMap[Name] = &alertOut{}
+
+	pdpEnabled := false
+	err := config.ForEachConfig[struct {
+		Subsystems struct {
+			EnablePDP bool
+		}
+	}](al.ctx, al.db, func(_ string, cfg struct {
+		Subsystems struct {
+			EnablePDP bool
+		}
+	}) error {
+		if cfg.Subsystems.EnablePDP {
+			pdpEnabled = true
+		}
+		return nil
+	})
+	if err != nil {
+		al.alertMap[Name].err = xerrors.Errorf("checking PDP config: %w", err)
+		return
+	}
+	if !pdpEnabled {
+		return
+	}
+
+	var exists bool
+	err = al.db.QueryRow(al.ctx, `SELECT EXISTS(SELECT 1 FROM eth_keys WHERE role = 'pdp')`).Scan(&exists)
+	if err != nil {
+		al.alertMap[Name].err = xerrors.Errorf("checking PDP wallet: %w", err)
+		return
+	}
+	if !exists {
+		al.alertMap[Name].alertString = "PDP wallet not configured. Create or assign a key on the PDP page."
 	}
 }

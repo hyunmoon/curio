@@ -35,6 +35,9 @@ type ParkPieceTask struct {
 
 	TF promise.Promise[harmonytask.AddTaskFunc]
 
+	// wake coalesces wake signals for pollPieceTasks (buffered 1).
+	wake chan struct{}
+
 	max                   int
 	minFreeStoragePercent float64
 
@@ -51,8 +54,8 @@ func NewParkPieceTask(db *harmonydb.DB, sc *ffi2.SealCalls, remote *paths.Remote
 	return newPieceTask(db, sc, remote, max, maxInPark, false, p2Active, minFreeStoragePercent)
 }
 
-func NewStorePieceTask(db *harmonydb.DB, sc *ffi2.SealCalls, remote *paths.Remote, max int) (*ParkPieceTask, error) {
-	return newPieceTask(db, sc, remote, max, 0, true, nil, 10)
+func NewStorePieceTask(db *harmonydb.DB, sc *ffi2.SealCalls, remote *paths.Remote, max int, minFreeStoragePercent float64) (*ParkPieceTask, error) {
+	return newPieceTask(db, sc, remote, max, 0, true, nil, minFreeStoragePercent)
 }
 
 func newPieceTask(db *harmonydb.DB, sc *ffi2.SealCalls, remote *paths.Remote, max int, maxInPark int, longTerm bool, p2Active func() bool, minFreeStoragePercent float64) (*ParkPieceTask, error) {
@@ -60,6 +63,7 @@ func newPieceTask(db *harmonydb.DB, sc *ffi2.SealCalls, remote *paths.Remote, ma
 		db:                    db,
 		sc:                    sc,
 		remote:                remote,
+		wake:                  make(chan struct{}, 1),
 		max:                   max,
 		maxInPark:             maxInPark,
 		longTerm:              longTerm,
@@ -73,8 +77,28 @@ func newPieceTask(db *harmonydb.DB, sc *ffi2.SealCalls, remote *paths.Remote, ma
 	return pt, nil
 }
 
+// WakePoll nudges pollPieceTasks to run soon (e.g. after new rows are inserted).
+func (p *ParkPieceTask) WakePoll() {
+	if p == nil || p.wake == nil {
+		return
+	}
+	select {
+	case p.wake <- struct{}{}:
+	default:
+	}
+}
+
 func (p *ParkPieceTask) pollPieceTasks(ctx context.Context) {
+	ticker := time.NewTicker(PieceParkPollInterval)
+	defer ticker.Stop()
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.wake:
+		case <-ticker.C:
+		}
+
 		// Select parked pieces with no task_id and matching longTerm flag
 		var pieceIDs []struct {
 			ID storiface.PieceNumber `db:"id"`
@@ -90,12 +114,10 @@ func (p *ParkPieceTask) pollPieceTasks(ctx context.Context) {
         `, p.longTerm)
 		if err != nil {
 			log.Errorf("failed to get parked pieces: %s", err)
-			time.Sleep(PieceParkPollInterval)
 			continue
 		}
 
 		if len(pieceIDs) == 0 {
-			time.Sleep(PieceParkPollInterval)
 			continue
 		}
 
@@ -118,8 +140,7 @@ func (p *ParkPieceTask) pollPieceTasks(ctx context.Context) {
 	}
 }
 
-func (p *ParkPieceTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-	ctx := context.Background()
+func (p *ParkPieceTask) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
 
 	// Fetch piece data
 	var piecesData []struct {

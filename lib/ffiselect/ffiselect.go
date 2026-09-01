@@ -20,7 +20,7 @@ import (
 	"github.com/filecoin-project/go-state-types/proof"
 
 	"github.com/filecoin-project/curio/build"
-	"github.com/filecoin-project/curio/harmony/resources"
+	"github.com/filecoin-project/curio/harmony/resources/ffigpu"
 	"github.com/filecoin-project/curio/lib/storiface"
 )
 
@@ -58,7 +58,7 @@ func newDeviceOrdinalManager(getGPUDevices func() ([]string, error)) *deviceOrdi
 
 		gpuSlots := make([]byte, len(devices))
 		for i := range gpuSlots {
-			gpuSlots[i] = byte(resources.GpuOverprovisionFactor)
+			gpuSlots[i] = byte(ffigpu.GpuOverprovisionFactor)
 		}
 
 		// No GPUs? allow 1 slot
@@ -74,8 +74,8 @@ func newDeviceOrdinalManager(getGPUDevices func() ([]string, error)) *deviceOrdi
 					logger.Errorf("release of invalid GPU ordinal %d (have %d GPUs), ignoring", ordinal, len(gpuSlots))
 					continue
 				}
-				if gpuSlots[ordinal] >= byte(resources.GpuOverprovisionFactor) {
-					logger.Errorf("double-release of GPU ordinal %d (slot already at capacity %d), ignoring", ordinal, resources.GpuOverprovisionFactor)
+				if gpuSlots[ordinal] >= byte(ffigpu.GpuOverprovisionFactor) {
+					logger.Errorf("double-release of GPU ordinal %d (slot already at capacity %d), ignoring", ordinal, ffigpu.GpuOverprovisionFactor)
 					continue
 				}
 				if len(waitList) > 0 { // unblock the delayed requests
@@ -187,12 +187,26 @@ func call(ctx context.Context, body []byte) (io.ReadCloser, error) {
 	cmd.ExtraFiles = []*os.File{outFile}
 
 	cmd.Stdin = bytes.NewReader(body)
-	err = cmd.Run()
+
+	localDoneChan := make(chan struct{})
+	err = cmd.Start()
+	if err == nil {
+		go func() {
+			select {
+			case <-localDoneChan:
+				return
+			case <-ctx.Done():
+				_ = cmd.Process.Kill()
+			}
+		}()
+	}
+	err = cmd.Wait()
 	if err != nil {
 		_ = outFile.Close()
 		_ = os.Remove(outFile.Name())
 		return nil, err
 	}
+	close(localDoneChan)
 
 	// seek to start
 	if _, err := outFile.Seek(0, io.SeekStart); err != nil {

@@ -9,9 +9,8 @@ import (
 	"github.com/filecoin-project/go-jsonrpc"
 
 	"github.com/filecoin-project/curio/api"
-	"github.com/filecoin-project/curio/deps/config"
-
-	cliutil "github.com/filecoin-project/lotus/cli/util"
+	"github.com/filecoin-project/curio/deps"
+	"github.com/filecoin-project/curio/lib/apiconn"
 )
 
 type NetSummaryResponse struct {
@@ -57,17 +56,7 @@ type nodeNetSample struct {
 }
 
 func (a *WebRPC) NetSummary(ctx context.Context) (NetSummaryResponse, error) {
-	type minimalApiInfo struct {
-		Apis struct {
-			ChainApiInfo []string
-		}
-	}
-
-	var rpcInfos []string
-	err := config.ForEachConfig[minimalApiInfo](ctx, a.deps.DB, func(_ string, info minimalApiInfo) error {
-		rpcInfos = append(rpcInfos, info.Apis.ChainApiInfo...)
-		return nil
-	})
+	endpoints, err := deps.CollectChainRPCEndpoints(ctx, a.Deps.DB)
 	if err != nil {
 		return NetSummaryResponse{}, err
 	}
@@ -76,20 +65,22 @@ func (a *WebRPC) NetSummary(ctx context.Context) (NetSummaryResponse, error) {
 		s  nodeNetSample
 		ok bool
 	}
-	resCh := make(chan sampleRes, len(rpcInfos))
+	resCh := make(chan sampleRes, len(endpoints))
 
 	dedup := map[string]struct{}{}
 	var wg sync.WaitGroup
 
-	for _, info := range rpcInfos {
-		ai := cliutil.ParseApiInfo(info)
+	for _, endpoint := range endpoints {
+		ai := apiconn.Parse(endpoint.ApiInfo)
 		if _, ok := dedup[ai.Addr]; ok {
 			continue
 		}
 		dedup[ai.Addr] = struct{}{}
 
+		nodeLabel := ai.Addr
+
 		wg.Add(1)
-		go func(ai cliutil.APIInfo) {
+		go func(ai apiconn.Info, nodeLabel string) {
 			defer wg.Done()
 
 			addr, err := ai.DialArgs("v1")
@@ -131,7 +122,7 @@ func (a *WebRPC) NetSummary(ctx context.Context) (NetSummaryResponse, error) {
 			}
 
 			resCh <- sampleRes{ok: true, s: nodeNetSample{
-				node:         ai.Addr,
+				node:         nodeLabel,
 				epoch:        int64(head.Height()),
 				peerCount:    len(peers),
 				totalIn:      int64(bw.TotalIn),
@@ -141,7 +132,7 @@ func (a *WebRPC) NetSummary(ctx context.Context) (NetSummaryResponse, error) {
 				reachability: nat.Reachability.String(),
 				publicAddrs:  nat.PublicAddrs,
 			}}
-		}(ai)
+		}(ai, nodeLabel)
 	}
 
 	wg.Wait()

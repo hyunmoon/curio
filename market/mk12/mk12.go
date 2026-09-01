@@ -34,6 +34,7 @@ import (
 
 	"github.com/filecoin-project/curio/deps/config"
 	"github.com/filecoin-project/curio/harmony/harmonydb"
+	"github.com/filecoin-project/curio/lib/lazy"
 	"github.com/filecoin-project/curio/lib/multictladdr"
 	"github.com/filecoin-project/curio/lib/parkpiece"
 	"github.com/filecoin-project/curio/lib/paths"
@@ -42,7 +43,6 @@ import (
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/chain/types"
-	"github.com/filecoin-project/lotus/lib/lazy"
 	"github.com/filecoin-project/lotus/storage/ctladdr"
 )
 
@@ -71,6 +71,11 @@ type MK12 struct {
 	as           *multictladdr.MultiAddressSelector
 	cidGravity   map[address.Address]string
 	backpressure *backpressure.CachedBackPressure
+
+	// OnDealInserted is called after a deal is successfully committed to the
+	// pipeline table. Wire this to CurioStorageDealMarket.WakeDealPoller so
+	// the poller picks up the new deal without waiting for the idle timer.
+	OnDealInserted func()
 }
 
 type validationError struct {
@@ -637,6 +642,10 @@ func (m *MK12) processDeal(ctx context.Context, deal *ProviderDealState) (*Provi
 		return &ProviderDealRejectionInfo{
 			Reason: "store deal: could not commit the transaction",
 		}, nil
+	}
+
+	if m.OnDealInserted != nil {
+		m.OnDealInserted()
 	}
 
 	return &ProviderDealRejectionInfo{

@@ -142,6 +142,7 @@ func (d *CurioStorageDealMarket) insertDDODealInPipeline(ctx context.Context) {
 	if len(dealIDs) == 0 {
 		return
 	}
+	var inserted bool
 	for _, id := range dealIDs {
 		comm, err := d.db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (commit bool, err error) {
 			deal, err := mk20.DealFromTX(tx, id)
@@ -166,6 +167,10 @@ func (d *CurioStorageDealMarket) insertDDODealInPipeline(ctx context.Context) {
 			log.Errorf("inserting deal in pipeline: commit failed")
 			continue
 		}
+		inserted = true
+	}
+	if inserted {
+		d.WakeDealPoller()
 	}
 }
 
@@ -197,8 +202,9 @@ func (d *CurioStorageDealMarket) insertDealInPipelineForUpload(ctx context.Conte
 		return
 	}
 
+	var inserted bool
 	for _, id := range dealIDs {
-		_, err = d.db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (commit bool, err error) {
+		comm, err := d.db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (commit bool, err error) {
 			deal, err := mk20.DealFromTX(tx, id)
 			if err != nil {
 				return false, xerrors.Errorf("getting deal from db: %w", err)
@@ -333,6 +339,12 @@ func (d *CurioStorageDealMarket) insertDealInPipelineForUpload(ctx context.Conte
 			log.Errorf("inserting upload deal in pipeline: %s", err)
 			continue
 		}
+		if comm {
+			inserted = true
+		}
+	}
+	if inserted {
+		d.WakeDealPoller()
 	}
 }
 
@@ -1070,7 +1082,14 @@ func (d *CurioStorageDealMarket) processMK20DealIngestion(ctx context.Context) {
 				log.Errorw("allocation expired", "deal", deal.ID, "error", err)
 				continue
 			}
-			end = start + alloc.TermMin
+			if abi.ChainEpoch(deal.Duration) < alloc.TermMin || abi.ChainEpoch(deal.Duration) > alloc.TermMax {
+				log.Errorw("deal duration outside allocation bounds",
+					"deal", deal.ID,
+					"duration", deal.Duration,
+					"term_min", alloc.TermMin,
+					"term_max", alloc.TermMax)
+				continue
+			}
 			vak = &miner.VerifiedAllocationKey{
 				Client: abi.ActorID(allocClientID),
 				ID:     verifreg13.AllocationId(*mk20Deal.Products.DDOV1.AllocationId),

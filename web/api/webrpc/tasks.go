@@ -65,7 +65,7 @@ func (r taskSummaryRow) summary(now time.Time) (TaskSummary, error) {
 
 func (a *WebRPC) ClusterTaskSummary(ctx context.Context) ([]TaskSummary, error) {
 	var rows []taskSummaryRow
-	err := a.deps.DB.Select(ctx, &rows, `SELECT
+	err := a.Deps.DB.Select(ctx, &rows, `SELECT
 		t.id as id, t.name as name, t.posted_time, t.work_start, t.owner_id as owner_id, hm.host_and_port as owner
 	FROM harmony_task t LEFT JOIN harmony_machines hm ON hm.id = t.owner_id 
 	ORDER BY
@@ -77,7 +77,6 @@ func (a *WebRPC) ClusterTaskSummary(ctx context.Context) ([]TaskSummary, error) 
 
 	ts := make([]TaskSummary, 0, len(rows))
 	now := time.Now()
-
 	// Populate MinerID
 	for _, row := range rows {
 		task, err := row.summary(now)
@@ -85,8 +84,8 @@ func (a *WebRPC) ClusterTaskSummary(ctx context.Context) ([]TaskSummary, error) 
 			return nil, err
 		}
 
-		if v, ok := a.taskSPIDs[task.Name]; ok {
-			task.SpID = v.GetSpid(a.deps.DB, task.ID)
+		if v, ok := a.TaskSPIDs[task.Name]; ok {
+			task.SpID = v.GetSpid(a.Deps.DB, task.ID)
 		}
 
 		if task.SpID != "" {
@@ -144,7 +143,7 @@ func (a *WebRPC) GetTaskStatus(ctx context.Context, taskID int64) (*TaskStatus, 
 	var ownerID NullInt64
 	var name string
 	var postedTime time.Time
-	err := a.deps.DB.QueryRow(ctx, `
+	err := a.Deps.DB.QueryRow(ctx, `
         SELECT owner_id, name, posted_time FROM harmony_task WHERE id = $1
     `, taskID).Scan(&ownerID, &name, &postedTime)
 
@@ -166,7 +165,7 @@ func (a *WebRPC) GetTaskStatus(ctx context.Context, taskID int64) (*TaskStatus, 
 
 	// Not found in harmony_task, check harmony_task_history
 	var result bool
-	err = a.deps.DB.QueryRow(ctx, `
+	err = a.Deps.DB.QueryRow(ctx, `
         SELECT result, name, posted FROM harmony_task_history WHERE task_id = $1 ORDER BY id DESC LIMIT 1
     `, taskID).Scan(&result, &name, &postedTime)
 
@@ -190,7 +189,7 @@ func (a *WebRPC) GetTaskStatus(ctx context.Context, taskID int64) (*TaskStatus, 
 func (a *WebRPC) RestartFailedTask(ctx context.Context, taskID int64) error {
 	// Check if task is present in harmony_task
 	var exists bool
-	err := a.deps.DB.QueryRow(ctx, `
+	err := a.Deps.DB.QueryRow(ctx, `
         SELECT 1 FROM harmony_task WHERE id = $1
     `, taskID).Scan(&exists)
 
@@ -205,7 +204,7 @@ func (a *WebRPC) RestartFailedTask(ctx context.Context, taskID int64) error {
 	var name string
 	var postedTime time.Time
 	var result bool
-	err = a.deps.DB.QueryRow(ctx, `
+	err = a.Deps.DB.QueryRow(ctx, `
         SELECT name, posted, result FROM harmony_task_history WHERE task_id = $1 ORDER BY id DESC LIMIT 1
     `, taskID).Scan(&name, &postedTime, &result)
 
@@ -219,15 +218,9 @@ func (a *WebRPC) RestartFailedTask(ctx context.Context, taskID int64) error {
 		return fmt.Errorf("task was successful, cannot restart")
 	}
 
-	// Insert into harmony_task
-	_, err = a.deps.DB.Exec(ctx, `
-        INSERT INTO harmony_task (id, initiated_by, update_time, posted_time, owner_id, added_by, previous_task, name)
-        VALUES ($1, NULL, NOW(), $2, NULL, $3, NULL, $4)
-    `, taskID, postedTime, a.deps.MachineID, name)
-
-	if err != nil {
-		return fmt.Errorf("failed to insert into harmony_task: %w", err)
+	if a.Deps.TaskEngine == nil {
+		return fmt.Errorf("task engine not available")
 	}
 
-	return nil
+	return a.Deps.TaskEngine.RestartTaskByID(harmonytask.TaskID(taskID), name, postedTime)
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/filecoin-project/curio/lib/cachedreader"
 	"github.com/filecoin-project/curio/lib/passcall"
 	"github.com/filecoin-project/curio/market/indexstore"
+	"github.com/filecoin-project/curio/tasks/tasknames"
 )
 
 type PDPIndexingV0Task struct {
@@ -44,9 +45,7 @@ func NewPDPV0IndexingTask(db *harmonydb.DB, indexStore *indexstore.IndexStore, c
 	}
 }
 
-func (P *PDPIndexingV0Task) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-	ctx := context.Background()
-
+func (P *PDPIndexingV0Task) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
 	var tasks []struct {
 		ID        int64               `db:"id"`
 		PieceCID  string              `db:"piece_cid"`
@@ -128,14 +127,20 @@ func (P *PDPIndexingV0Task) Do(taskID harmonytask.TaskID, stillOwned func() bool
 	addFail := make(chan struct{})
 	var interrupted bool
 
+	aggRecs := make(chan indexstore.Record, chanSize)
 	eg.Go(func() error {
 		defer close(addFail)
-		return P.indexStore.AddIndex(ctx, pcid, recs)
+		return P.indexStore.AddIndex(ctx, pcid2, recs)
 	})
-	blocks, interrupted, err = IndexCAR(reader, 4<<20, recs, addFail)
+	eg.Go(func() error {
+		return P.indexStore.InsertAggregateIndex(ctx, pcid2, aggRecs)
+	})
+
+	blocks, interrupted, err = IndexPDPv0(pcid2, reader, task.PieceSize, recs, aggRecs, addFail)
 	if err != nil {
 		// Indexing itself failed, stop early
 		close(recs) // still safe to close, AddIndex will exit on channel close
+		close(aggRecs)
 		// wait for AddIndex goroutine to finish cleanly
 		_ = eg.Wait()
 		return false, xerrors.Errorf("indexing failed: %w", err)
@@ -143,11 +148,12 @@ func (P *PDPIndexingV0Task) Do(taskID harmonytask.TaskID, stillOwned func() bool
 
 	// Close the channel
 	close(recs)
+	close(aggRecs)
 
 	// Wait till AddIndex is finished
 	err = eg.Wait()
 	if err != nil {
-		return false, xerrors.Errorf("adding index to DB (interrupted %t): %w", interrupted, err)
+		return false, xerrors.Errorf("adding indexes to DB (interrupted %t): %w", interrupted, err)
 	}
 
 	log.Infof("Indexing piece %d took %0.3f seconds", task.ID, time.Since(startTime).Seconds())
@@ -192,7 +198,8 @@ func (P *PDPIndexingV0Task) TypeDetails() harmonytask.TaskTypeDetails {
 	const indexingTaskRAM = 128 << 20 // 128 MiB
 
 	return harmonytask.TaskTypeDetails{
-		Name: "PDPv0_Indexing",
+		Name:      tasknames.PDPv0_Indexing,
+		MayFollow: []string{tasknames.PDPv0_PullPiece, tasknames.PDPv0_Prove},
 		Cost: resources.Resources{
 			Cpu: 0, // I/O bound (storage read, CQL write), not CPU bound
 			Ram: indexingTaskRAM,
@@ -207,45 +214,41 @@ func (P *PDPIndexingV0Task) TypeDetails() harmonytask.TaskTypeDetails {
 
 func (P *PDPIndexingV0Task) schedule(_ context.Context, taskFunc harmonytask.AddTaskFunc) error {
 	// schedule submits
-	var stop bool
-	for !stop {
+	for {
+		stop := true
 		taskFunc(func(id harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
-			stop = true // assume we're done until we find a task to schedule
-
-			var pendings []struct {
-				ID int64 `db:"id"`
-			}
-
-			err := tx.Select(&pendings, `SELECT id FROM pdp_piecerefs 
-            										WHERE indexing_task_id IS NULL
-            										AND needs_indexing = TRUE
-													ORDER BY created_at ASC LIMIT 1;`)
-			if err != nil {
-				return false, xerrors.Errorf("getting PDP pending indexing tasks: %w", err)
-			}
-
-			if len(pendings) == 0 {
-				log.Debug("No pending PDP indexing tasks found")
-				return false, nil
-			}
-
-			pending := pendings[0]
-			n, err := tx.Exec(`UPDATE pdp_piecerefs SET indexing_task_id = $1
-                             WHERE indexing_task_id IS NULL AND id = $2`, id, pending.ID)
+			n, err := tx.Exec(`WITH pending AS (
+					SELECT id
+					FROM pdp_piecerefs
+					WHERE indexing_task_id IS NULL
+					  AND needs_indexing = TRUE
+					ORDER BY created_at ASC
+					LIMIT 1
+				)
+				UPDATE pdp_piecerefs p
+				SET indexing_task_id = $1
+				FROM pending
+				WHERE p.id = pending.id
+				  AND p.indexing_task_id IS NULL
+				  AND p.needs_indexing = TRUE`, id)
 			if err != nil {
 				return false, xerrors.Errorf("updating PDP indexing task id: %w", err)
 			}
 			if n == 0 {
-				return false, nil // Another task already claimed this piece
+				log.Debug("No pending PDP indexing tasks found")
+				return false, nil
 			}
-			log.Debugf("PDP indexing task scheduled for pending indexing task %d", pending.ID)
+			if n != 1 {
+				return false, xerrors.Errorf("updated %d rows assigning PDP indexing task", n)
+			}
 
 			stop = false
 			return true, nil
 		})
+		if stop {
+			return nil
+		}
 	}
-
-	return nil
 }
 
 func (P *PDPIndexingV0Task) Adder(taskFunc harmonytask.AddTaskFunc) {}

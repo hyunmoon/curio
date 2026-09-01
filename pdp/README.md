@@ -22,7 +22,8 @@ All endpoints are rooted at `/pdp`.
 | POST | `/pdp/data-sets/create-and-add` | Create a data set and add pieces atomically |
 | GET | `/pdp/data-sets/created/{txHash}` | Check data set creation status |
 | GET | `/pdp/data-sets/{dataSetId}` | Get data set details |
-| DELETE | `/pdp/data-sets/{dataSetId}` | Delete a data set *(not yet implemented)* |
+| POST | `/pdp/data-sets/{dataSetId}/terminate` | Terminate data set |
+| GET | `/pdp/data-sets/{dataSetId}/terminate` | Get data set termination status |
 | POST | `/pdp/data-sets/{dataSetId}/pieces` | Add pieces to a data set |
 | GET | `/pdp/data-sets/{dataSetId}/pieces/added/{txHash}` | Get piece addition status |
 | GET | `/pdp/data-sets/{dataSetId}/pieces/{pieceId}` | Get piece details |
@@ -56,14 +57,12 @@ All endpoints are rooted at `/pdp`.
 
 ```json
 {
-  "pieceCid": "<CommP-v2-CID>",
-  "notify": "<optional-notification-URL>"
+  "pieceCid": "<CommP-v2-CID>"
 }
 ```
 
 - **Fields:**
     - `pieceCid`: The Piece CID in CommP **v2** format (CIDv1 with `fil-commitment-unsealed` codec and raw size encoded). This uniquely identifies the piece and encodes size information.
-    - `notify`: *(Optional)* A URL to be notified when the piece has been processed successfully.
 
 #### Responses
 
@@ -161,24 +160,33 @@ All endpoints are rooted at `/pdp`.
   "pieceCid": "<piece-CID-v2>",
   "status": "<status>",
   "indexed": <boolean>,
+  "indexedAt": "<RFC3339-timestamp-or-omitted>",
+  "adCreated": <boolean>,
+  "adCreatedAt": "<RFC3339-timestamp-or-omitted>",
+  "adCid": "<ad-CID-or-omitted>",
   "advertised": <boolean>,
-  "retrieved": <boolean>,
-  "retrievedAt": "<RFC3339-timestamp-or-omitted>"
+  "advertisedAt": "<RFC3339-timestamp-or-omitted>",
+  "synced": <boolean>,
+  "syncedAt": "<RFC3339-timestamp-or-omitted>"
 }
 ```
 
 - **Fields:**
     - `pieceCid`: The Piece CID in v2 format.
     - `status`: Overall status string. One of:
-        - `"pending"` – Not yet indexed.
-        - `"indexing"` – CAR indexing task is in progress.
+        - `"pending"` – Not yet locally indexed.
+        - `"indexing"` – Local CAR indexing task is in progress.
         - `"creating_ad"` – IPNI advertisement is being created.
-        - `"announced"` – Advertisement published to IPNI network.
-        - `"retrieved"` – Piece has been retrieved by a client.
-    - `indexed`: Whether the piece has been indexed and is ready for IPNI.
-    - `advertised`: Whether an IPNI advertisement has been published.
-    - `retrieved`: Whether the piece has been retrieved by a client.
-    - `retrievedAt`: Timestamp of last retrieval (omitted if never retrieved).
+        - `"announced"` – The advertisement row exists, the terminal status. Not a guarantee it's been broadcast (see `advertised`) or indexed externally (see `synced`).
+    - `indexed`: Whether the piece has been indexed locally and is ready for IPNI.
+    - `indexedAt`: Timestamp when local CAR indexing completed (omitted if not yet indexed).
+    - `adCreated`: Whether an IPNI advertisement has been created for this piece.
+    - `adCreatedAt`: Timestamp the advertisement was created (omitted if not yet created).
+    - `adCid`: This piece's advertisement CID, once created. Callers who want to double-check independently can query an IPNI instance directly (e.g., `GET https://cid.contact/sync/status/ad/{adCid}`).
+    - `advertised`: Whether the provider has sent an HTTP announce covering this ad.
+    - `advertisedAt`: `adCreatedAt` plus the announce publish interval - a fixed estimate, not the provider's raw last-announce time, so it doesn't drift on later calls as the provider announces newer ads.
+    - `synced`: Whether an IPNI instance has confirmed it fully processed this ad, per an in-memory (not persisted) cache checked on demand. A cache miss triggers a background check against the configured IPNI instance and returns `false` for this call - a later call for the same piece will see the result once that check completes. `true` is a confirmed signal - callers can act on it right away. `false` is inconclusive rather than proof the ad isn't indexed: it can also show up on the first call after a Curio restart (cache cleared) or if a later call catches an IPNI instance resync, without the ad actually losing its indexed state - poll again if that matters for your workflow.
+    - `syncedAt`: When `synced` becomes true, this stores the IPNI instance's reported processing time.
 
 #### Errors
 
@@ -196,7 +204,7 @@ The streaming upload API provides a way to upload large pieces in a streaming fa
 2. Stream the data via `PUT`.
 3. Finalize the upload with the pieceCid to link and validate.
 
-> **Note:** Each streaming upload chunk is limited to **1 GiB** (unpadded). The server computes the CommP on-the-fly.
+> **Note:** Each streaming upload is limited to **1,065,353,216 raw bytes** (1 GiB padded). The server writes it once directly to piece storage while computing CommP on-the-fly.
 
 #### 3.1. Create Streaming Upload Session
 
@@ -235,6 +243,7 @@ The streaming upload API provides a way to upload large pieces in a streaming fa
 - `400 Bad Request`: Invalid UUID.
 - `401 Unauthorized`: Missing or invalid JWT token.
 - `404 Not Found`: Upload session not found.
+- `409 Conflict`: The upload session or calculated piece is already being written.
 - `413 Payload Too Large`: Data exceeds size limit.
 
 ---
@@ -250,8 +259,7 @@ The streaming upload API provides a way to upload large pieces in a streaming fa
 
 ```json
 {
-  "pieceCid": "<CommP-v2-CID>",
-  "notify": "<optional-notification-URL>"
+  "pieceCid": "<CommP-v2-CID>"
 }
 ```
 
@@ -264,50 +272,13 @@ The streaming upload API provides a way to upload large pieces in a streaming fa
 - `400 Bad Request`: Invalid pieceCid, size mismatch, or CID does not match the uploaded data.
 - `401 Unauthorized`: Missing or invalid JWT token.
 - `404 Not Found`: Upload session not found.
+- `409 Conflict`: The PUT has not completed final storage yet.
 
 ---
 
-### 4. Notifications
+### 4. Upload Completion
 
-When you initiate an upload with the `notify` field specified, the PDP Service will send a notification to the provided URL once the piece has been successfully processed and stored.
-
-#### 4.1. Notification Request
-
-- **Method:** `POST`
-- **URL:** The `notify` URL provided during the upload initiation (`POST /pdp/piece`).
-- **Headers:**
-    - `Content-Type`: `application/json`
-- **Request Body:**
-
-```json
-{
-  "id": "<upload-ID>",
-  "service": "<service-name>",
-  "pieceCID": "<piece-CID or null>",
-  "notify_url": "<original-notify-URL>",
-  "check_hash_codec": "<hash-function-name>",
-  "check_hash": "<byte-array-of-hash>"
-}
-```
-
-- **Fields:**
-    - `id`: The upload ID.
-    - `service`: The service name.
-    - `pieceCID`: The Piece CID of the stored piece (may be `null` if not applicable).
-    - `notify_url`: The original notification URL provided.
-    - `check_hash_codec`: The hash function used (e.g., `"sha2-256-trunc254-padded"`).
-    - `check_hash`: The byte array of the original hash provided in the upload initiation.
-
-#### 4.2. Expected Response from Your Server
-
-- **Status Code:** `200 OK` to acknowledge receipt.
-- **Response Body:** (Optional) Can be empty or contain a message.
-
-#### 4.3. Notes
-
-- The PDP Service may retry the notification if it fails.
-- Ensure that your server is accessible from the PDP Service and can handle incoming POST requests.
-- The notification does not include the piece data; it confirms that the piece has been successfully stored.
+Uploads complete synchronously. A `204 No Content` response from the known-CID PUT means the piece is stored and registered for PDP. For streaming uploads, the PUT stores the piece and a `200 OK` response from finalize registers it for PDP. The service does not send upload callback requests.
 
 ---
 
@@ -407,17 +378,19 @@ When you initiate an upload with the `notify` field specified, the PDP Service w
   "service": "<service-name>",
   "txStatus": "<transaction-status>",
   "ok": <null-or-boolean>,
-  "dataSetId": <data-set-id-or-omitted>
+  "dataSetId": <data-set-id-or-omitted>,
+  "confirmedTxHash": "<included-transaction-hash-or-omitted>"
 }
 ```
 
 - **Fields:**
-    - `createMessageHash`: The transaction hash used to create the data set.
+    - `createMessageHash`: The original transaction hash used to create the data set (Location / wait key). May differ from the hash that lands on chain if Curio replaces the send by fee.
     - `dataSetCreated`: Whether the data set has been created (`true` or `false`).
     - `service`: The service name.
     - `txStatus`: The transaction status (`"pending"`, `"confirmed"`, etc.).
     - `ok`: `true` if the transaction was successful, `false` if it failed, or `null` if pending.
     - `dataSetId`: The ID of the created data set (only present when `dataSetCreated` is `true`).
+    - `confirmedTxHash`: The hash included on chain (present once confirmed). Equals `createMessageHash` unless replace-by-fee produced a different transaction. For explorers and receipt lookups use `confirmedTxHash ?? createMessageHash`.
 
 #### Errors
 
@@ -472,21 +445,89 @@ When you initiate an upload with the `notify` field specified, the PDP Service w
 
 ---
 
-### 9. Delete a Data Set *(Not yet implemented)*
+### 9. Terminate a Data Set
 
-- **Endpoint:** `DELETE /pdp/data-sets/{dataSetId}`
-- **Description:** Remove the specified data set entirely.
+- **Endpoint:** `POST /pdp/data-sets/{dataSetId}/terminate`
+- **Description:** Terminate the specified data set and schedule for complete removal
 - **Authentication:** Requires a valid JWT token in the `Authorization` header.
 - **URL Parameters:**
     - `dataSetId`: The ID of the data set.
+- **Request Body:**
+
+```json
+{
+  "extraData": "<hex-data>"
+}
+```
+- **Fields:**
+    - `extraData`: hex data carrying a client signature authorizing the data set termination
+
+
+#### Constraints and Requirements
+- **Client Authorization:** A signature in the extra data must be from the data set payer as recorded in the filecoin warm storage services contract.  The signature must be over the correct data authorizing termination.
+
 
 #### Response
 
-- **Status Code:** `501 Not Implemented`
+- **Status Code:** `202 ACCEPTED`
+
+#### Errors
+- `400 Bad Request`: Invalid request body, missing fields, invalid extraData format, missing or empty extra data
+- `401 Unauthorized`: Missing or invalid JWT token.
+- `404 Not Found`: Data set not found
+- `409 Conflict`: Termination already in progress or complete
+  - **Response Body:**
+    ```json
+    {
+      "code": <0-or-1>,
+      "message": <string>,
+      "serviceTerminationEpoch": <chain-epoch>
+    }
+    ```
+  - **Fields:** 
+    - `code`: 0|1, 0 for termination already and completed and 1 for termination queued 
+    - `message`: message describing the code in more detail
+    - `serviceTerminationEpoch`: The epoch the service was terminated at
+
+- `500 Internal Server Error`: Failed to process the request.
 
 ---
 
-### 10. Add Pieces to a Data Set
+### 10. Check Data Set Termination Status
+
+- **Endpoint:** `GET /pdp/data-sets/{dataSetId}/terminate`
+- **Description:** Return the status of the ongoing dataset termination process
+- **Authentication:** Requires a valid JWT token in the `Authorization` header.
+- **URL Parameters:**
+    - `dataSetId`: The ID of the data set.
+  
+#### Response
+- **Status Code:** `200 OK`
+- **Response Body:**
+
+```json
+{
+  "terminationTxHash": "<transaction-hash-or-empty-string>",
+  "confirmedTxHash": "<included-transaction-hash-or-omitted>",
+  "fwssTerminated": <true-or-omitted>,
+  "serviceTerminationEpoch": <epoch-number-or-omitted>
+}
+```
+- **Fields:** 
+  - `terminationTxHash`: original termination transaction hash (wait key). Empty if unsent. May differ from the hash that lands on chain if Curio replaces the send by fee.
+  - `confirmedTxHash`: The hash included on chain (present once confirmed). Equals `terminationTxHash` unless replace-by-fee produced a different transaction. For explorers and receipt lookups use `confirmedTxHash ?? terminationTxHash`.
+  - `fwssTerminated`: true when service termination complete, otherwise omitted
+  - `serviceTerminationEpoch`: epoch of termination if termination complete, otherwise omitted
+
+#### Errors
+
+- `400 Bad Request`: Missing or invalid data set ID
+- `401 Unauthorized`: Missing or invalid JWT token.
+- `404 Not Found`: Termination for data set not found
+- `500 Internal Server Error`: Failed to process the request.
+---
+
+### 11. Add Pieces to a Data Set
 
 - **Endpoint:** `POST /pdp/data-sets/{dataSetId}/pieces`
 - **Description:** Add pieces to a data set by submitting an on-chain transaction.
@@ -548,7 +589,7 @@ When you initiate an upload with the `notify` field specified, the PDP Service w
 
 ---
 
-### 11. Get Piece Addition Status
+### 12. Get Piece Addition Status
 
 - **Endpoint:** `GET /pdp/data-sets/{dataSetId}/pieces/added/{txHash}`
 - **Description:** Retrieve the status of a piece addition transaction.
@@ -570,18 +611,20 @@ When you initiate an upload with the `notify` field specified, the PDP Service w
   "pieceCount": <number-of-unique-pieces>,
   "addMessageOk": <null-or-boolean>,
   "piecesAdded": <boolean>,
-  "confirmedPieceIds": [<pieceId>, ...]
+  "confirmedPieceIds": [<pieceId>, ...],
+  "confirmedTxHash": "<included-transaction-hash-or-omitted>"
 }
 ```
 
 - **Fields:**
-    - `txHash`: The transaction hash.
+    - `txHash`: The original transaction hash (Location / wait key). May differ from the hash that lands on chain if Curio replaces the send by fee.
     - `txStatus`: The transaction status (`"pending"`, `"confirmed"`, etc.).
     - `dataSetId`: The ID of the data set.
     - `pieceCount`: Number of unique pieces in this transaction.
     - `addMessageOk`: `true` if on-chain transaction succeeded, `false` if failed, `null` if pending.
     - `piecesAdded`: Whether the pieces have been fully processed and recorded.
     - `confirmedPieceIds`: Array of assigned piece IDs (only present when confirmed and successful).
+    - `confirmedTxHash`: The hash included on chain (present once confirmed). Equals `txHash` unless replace-by-fee produced a different transaction. For explorers and receipt lookups use `confirmedTxHash ?? txHash`.
 
 #### Errors
 
@@ -591,7 +634,7 @@ When you initiate an upload with the `notify` field specified, the PDP Service w
 
 ---
 
-### 12. Get Piece Details
+### 13. Get Piece Details
 
 - **Endpoint:** `GET /pdp/data-sets/{dataSetId}/pieces/{pieceId}`
 - **Description:** Retrieve the details of a specific piece in a data set, including its sub-pieces.
@@ -633,24 +676,30 @@ When you initiate an upload with the `notify` field specified, the PDP Service w
 
 ---
 
-### 13. Delete a Piece from a Data Set
+### 14. Delete a Piece from a Data Set
 
 - **Endpoint:** `DELETE /pdp/data-sets/{dataSetId}/pieces/{pieceId}`
 - **Description:** Schedule a piece for deletion from a data set by submitting an on-chain `schedulePieceDeletions` transaction to the PDPVerifier contract. Deletion is asynchronous.
 - **Authentication:** Requires a valid JWT token in the `Authorization` header.
 - **URL Parameters:**
     - `dataSetId`: The ID of the data set.
-    - `pieceId`: The ID of the piece.
+    - `pieceId`: The ID of the piece. Used when no `pieceIds` array is supplied in the request body (see below).
 - **Request Body:** *(Optional)*
 
 ```json
 {
-  "extraData": "<optional-hex-encoded-extra-data>"
+  "extraData": "<optional-hex-encoded-extra-data>",
+  "pieceIds": [0, 1, 2]
 }
 ```
 
 - **Fields:**
     - `extraData`: *(Optional)* Hex-encoded additional data for the contract call (max 256 bytes decoded).
+    - `pieceIds`: *(Optional)* Array of piece IDs to delete in a single batched, on-chain `schedulePieceDeletions` call. When this array is present and non-empty, it **overrides** the `pieceId` from the URL — every ID in the array is scheduled for deletion and the URL `pieceId` is ignored. When the array is omitted or empty, only the URL `pieceId` is deleted. Duplicate IDs are removed before processing. A maximum of 200 piece IDs may be supplied per call.
+
+> **Note:** All requested pieces must belong to the data set. If any one of them is not found, the entire request fails with `404 Not Found` and no deletion is scheduled.
+
+> **Note:** If the data set already has 200 or more removals queued on-chain, the request is rejected with `429 Too Many Requests`. This check looks only at the existing queue, not the incoming batch, so an accepted request may push the queue above 200. The queue drains at the next proving period; retrying before then will not succeed.
 
 #### Response
 
@@ -668,14 +717,15 @@ When you initiate an upload with the `notify` field specified, the PDP Service w
 
 #### Errors
 
-- `400 Bad Request`: Invalid request or `extraData` exceeds size limit.
+- `400 Bad Request`: Invalid request, `extraData` exceeds size limit, a piece ID is out of range, or `pieceIds` exceeds the maximum batch size of 200.
 - `401 Unauthorized`: Missing or invalid JWT token.
-- `404 Not Found`: Data set or piece not found.
+- `404 Not Found`: Data set not found, or one or more of the requested pieces not found ("One or more piece not found").
+- `429 Too Many Requests`: The data set already has 200 or more scheduled removals queued on-chain; retry after the next proving period flushes the queue.
 - `500 Internal Server Error`: Failed to send on-chain transaction.
 
 ---
 
-### 14. Pull Piece from Another SP
+### 15. Pull Piece from Another SP
 
 - **Endpoint:** `POST /pdp/piece/pull`
 - **Description:** Request that the PDP service pull a piece from another storage provider or a remote URL. If pieces are successfully downloaded, they can later be added to a dataset via the contract. This request is idempotent when calling with the same `extraData`, `dataSetId`, and `recordKeeper`.
@@ -934,8 +984,7 @@ Error responses typically include an error message in the response body.
    Content-Type: application/json
 
    {
-     "pieceCid": "<CommP-v2-CID>",
-     "notify": "https://example.com/notify"
+     "pieceCid": "<CommP-v2-CID>"
    }
    ```
 
@@ -976,31 +1025,6 @@ Error responses typically include an error message in the response body.
 
    ```http
    HTTP/1.1 204 No Content
-   ```
-
-3. **Receive Notification (if `notify` was provided):**
-
-   **Server's Notification Request:**
-
-   ```http
-   POST /notify HTTP/1.1
-   Host: example.com
-   Content-Type: application/json
-
-   {
-     "id": "<upload-ID>",
-     "service": "<service-name>",
-     "pieceCID": "<piece-CID>",
-     "notify_url": "https://example.com/notify",
-     "check_hash_codec": "sha2-256-trunc254-padded",
-     "check_hash": "<b64-byte-array-of-hash>"
-   }
-   ```
-
-   **Your Response:**
-
-   ```http
-   HTTP/1.1 200 OK
    ```
 
 ### Uploading a Piece (Streaming)
@@ -1139,6 +1163,19 @@ Authorization: Bearer <JWT-token>
 Content-Type: application/json
 
 {}
+```
+
+To delete several pieces from the data set in a single batched transaction, supply a `pieceIds` array in the body (which overrides the `pieceId` in the URL):
+
+```http
+DELETE /pdp/data-sets/{dataSetId}/pieces/{pieceId} HTTP/1.1
+Host: example.com
+Authorization: Bearer <JWT-token>
+Content-Type: application/json
+
+{
+  "pieceIds": [0, 1, 2]
+}
 ```
 
 **Response:**

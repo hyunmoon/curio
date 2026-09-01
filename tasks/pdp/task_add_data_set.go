@@ -38,8 +38,8 @@ func NewPDPTaskAddDataSet(db *harmonydb.DB, sender *message.SenderETH, ethClient
 	}
 }
 
-func (p *PDPTaskAddDataSet) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-	ctx := context.Background()
+func (p *PDPTaskAddDataSet) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
+
 	var pcreates []struct {
 		RecordKeeper string `db:"record_keeper"`
 		ExtraData    []byte `db:"extra_data"`
@@ -156,35 +156,39 @@ func (p *PDPTaskAddDataSet) TypeDetails() harmonytask.TaskTypeDetails {
 }
 
 func (p *PDPTaskAddDataSet) schedule(ctx context.Context, taskFunc harmonytask.AddTaskFunc) error {
-	var stop bool
-	for !stop {
+	for {
+		stop := true
 		taskFunc(func(id harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
-			stop = true // assume we're done until we find a task to schedule
-
-			var did string
-			err := tx.QueryRow(`SELECT id FROM pdp_data_set_create WHERE task_id IS NULL AND tx_hash IS NULL LIMIT 1`).Scan(&did)
-			if err != nil {
-				if errors.Is(err, pgx.ErrNoRows) {
-					return false, nil
-				}
-				return false, xerrors.Errorf("failed to query pdp_data_set_create: %w", err)
-			}
-			if did == "" {
-				return false, xerrors.Errorf("no valid id found for taskID")
-			}
-
-			_, err = tx.Exec(`UPDATE pdp_data_set_create SET task_id = $1 WHERE id = $2 AND tx_hash IS NULL`, id, did)
+			n, err := tx.Exec(`WITH pending AS (
+					SELECT id
+					FROM pdp_data_set_create
+					WHERE task_id IS NULL
+					  AND tx_hash IS NULL
+					LIMIT 1
+				)
+				UPDATE pdp_data_set_create p
+				SET task_id = $1
+				FROM pending
+				WHERE p.id = pending.id
+				  AND p.task_id IS NULL
+				  AND p.tx_hash IS NULL`, id)
 			if err != nil {
 				return false, xerrors.Errorf("failed to update pdp_data_set_create: %w", err)
+			}
+			if n == 0 {
+				return false, nil
+			}
+			if n != 1 {
+				return false, xerrors.Errorf("updated %d rows assigning pdp data set create task", n)
 			}
 
 			stop = false // we found a task to schedule, keep going
 			return true, nil
 		})
-
+		if stop {
+			return nil
+		}
 	}
-
-	return nil
 }
 
 // getSenderAddress retrieves the sender address from the database where role = 'pdp' limit 1

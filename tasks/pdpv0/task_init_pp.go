@@ -9,14 +9,15 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/core/types"
+	logging "github.com/ipfs/go-log/v2"
 	"github.com/yugabyte/pgx/v5"
 	"golang.org/x/xerrors"
 
+	"github.com/filecoin-project/curio/alertmanager/curioalerting"
 	"github.com/filecoin-project/curio/harmony/harmonydb"
 	"github.com/filecoin-project/curio/harmony/harmonytask"
 	"github.com/filecoin-project/curio/harmony/resources"
 	"github.com/filecoin-project/curio/harmony/taskhelp"
-	"github.com/filecoin-project/curio/lib/chainsched"
 	"github.com/filecoin-project/curio/lib/ethchain"
 	"github.com/filecoin-project/curio/lib/promise"
 	"github.com/filecoin-project/curio/pdp/contract"
@@ -26,12 +27,18 @@ import (
 	chainTypes "github.com/filecoin-project/lotus/chain/types"
 )
 
+var log = logging.Logger("pdpv0")
+
+const alertNameInitPP = "InitProvingPeriod"
+
 type InitProvingPeriodTask struct {
 	db        *harmonydb.DB
 	ethClient ethchain.EthClient
 	sender    *message.SenderETH
 
 	fil NextProvingPeriodTaskChainApi
+
+	al curioalerting.AlertingInterface
 
 	addFunc promise.Promise[harmonytask.AddTaskFunc]
 }
@@ -40,17 +47,18 @@ type InitProvingPeriodTaskChainApi interface {
 	ChainHead(context.Context) (*chainTypes.TipSet, error)
 }
 
-func NewInitProvingPeriodTask(db *harmonydb.DB, ethClient ethchain.EthClient, fil NextProvingPeriodTaskChainApi, chainSched *chainsched.CurioChainSched, sender *message.SenderETH) *InitProvingPeriodTask {
+func NewInitProvingPeriodTask(db *harmonydb.DB, ethClient ethchain.EthClient, fil NextProvingPeriodTaskChainApi, w *Watcher, sender *message.SenderETH) *InitProvingPeriodTask {
 	ipp := &InitProvingPeriodTask{
 		db:        db,
 		ethClient: ethClient,
 		sender:    sender,
 		fil:       fil,
+		al:        w.al,
 	}
 
-	_ = chainSched.AddHandler(func(ctx context.Context, revert, apply *chainTypes.TipSet) error {
+	_ = w.AddWatcher(func(ctx context.Context, db *harmonydb.DB, ethClient ethchain.EthClient, al curioalerting.AlertingInterface, revert, apply *chainTypes.TipSet) {
 		if apply == nil {
-			return nil
+			return
 		}
 
 		// Now query the db for data sets needing nextProvingPeriod inital call
@@ -58,17 +66,20 @@ func NewInitProvingPeriodTask(db *harmonydb.DB, ethClient ethchain.EthClient, fi
 			DataSetId int64 `db:"id"`
 		}
 
-		currentHeight := apply.Height()
 		err := db.Select(ctx, &toCallInit, `
                 SELECT id
                 FROM pdp_data_sets
                 WHERE challenge_request_task_id IS NULL
                   AND init_ready AND prove_at_epoch IS NULL
                   AND unrecoverable_proving_failure_epoch IS NULL
-                  AND (next_prove_attempt_at IS NULL OR next_prove_attempt_at <= $1)
-            `, currentHeight)
+	            `)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return xerrors.Errorf("failed to select data sets needing nextProvingPeriod: %w", err)
+			_ = al.EmitEvent(ctx, curioalerting.AlertEvent{
+				System:    alertType,
+				Subsystem: alertNameInitPP,
+				Message:   fmt.Sprintf("failed to select data sets needing initProvingPeriod: %s", err),
+			})
+			return
 		}
 
 		for _, ps := range toCallInit {
@@ -90,16 +101,12 @@ func NewInitProvingPeriodTask(db *harmonydb.DB, ethClient ethchain.EthClient, fi
 				return true, nil
 			})
 		}
-
-		return nil
-	})
+	}, WatcherOrderProving)
 
 	return ipp
 }
 
-func (ipp *InitProvingPeriodTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-	ctx := context.Background()
-
+func (ipp *InitProvingPeriodTask) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
 	// Select the data set where challenge_request_task_id = taskID
 	var dataSetId int64
 
@@ -215,7 +222,7 @@ func (ipp *InitProvingPeriodTask) Do(taskID harmonytask.TaskID, stillOwned func(
 	if sendErr != nil {
 		currentHeight := int64(ts.Height())
 		comm, err := ipp.db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (commit bool, err error) {
-			handleErr := HandleProvingSendError(tx, dataSetId, currentHeight, sendErr)
+			handleErr := handleNextProvingPeriodSendError(ctx, tx, provingSchedule, ipp.al, alertNameInitPP, dataSetId, currentHeight, sendErr)
 			if handleErr != nil {
 				return false, xerrors.Errorf("failed to handle proving send error: %w", handleErr)
 			}
@@ -276,6 +283,10 @@ func (ipp *InitProvingPeriodTask) CanAccept(ids []harmonytask.TaskID, engine *ha
 func (ipp *InitProvingPeriodTask) TypeDetails() harmonytask.TaskTypeDetails {
 	return harmonytask.TaskTypeDetails{
 		Name: tasknames.PDPv0_InitPP,
+		// Handoff from data onboarding (PDPv0_PullPiece → PDPv0_SaveCache).
+		// InitPP checks on-chain leaf count before the first challenge request; proving
+		// continues PDPv0_InitPP → PDPv0_Prove.
+		MayFollow: []string{tasknames.PDPv0_SaveCache},
 		Cost: resources.Resources{
 			Cpu: 0,
 			Gpu: 0,

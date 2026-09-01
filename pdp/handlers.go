@@ -8,9 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net/http"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -19,17 +19,18 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/ipfs/go-cid"
 	"github.com/yugabyte/pgx/v5"
 
 	"github.com/filecoin-project/curio/alertmanager"
 	"github.com/filecoin-project/curio/api"
 	"github.com/filecoin-project/curio/harmony/harmonydb"
 	"github.com/filecoin-project/curio/lib/ethchain"
-	"github.com/filecoin-project/curio/lib/paths"
+	"github.com/filecoin-project/curio/lib/piecestore"
 	ipni_provider "github.com/filecoin-project/curio/market/ipni/ipni-provider"
 	"github.com/filecoin-project/curio/pdp/contract"
+	pdpwallet "github.com/filecoin-project/curio/pdp/wallet"
 	"github.com/filecoin-project/curio/tasks/indexing"
-	"github.com/filecoin-project/curio/tasks/message"
 
 	types2 "github.com/filecoin-project/lotus/chain/types"
 )
@@ -47,6 +48,10 @@ func httpServerError(w http.ResponseWriter, statusCode int, msg string, err erro
 // PDPRoutePath is the base path for PDP routes
 const PDPRoutePath = "/pdp"
 
+// PingOKBody is the exact success body for GET /pdp/ping.
+// Reachability probes match this to confirm they hit Curio PDP, not a proxy.
+const PingOKBody = "curio-pdp"
+
 const (
 	// MaxCreateDataSetExtraDataSize defines the limit for extraData size in CreateDataSet calls (4KB).
 	MaxCreateDataSetExtraDataSize = 4096
@@ -55,17 +60,25 @@ const (
 	// call to reject early rather than revert on-chain.
 	MaxAddPiecesBatchSize = 40
 
-	// MaxDeletePieceExtraDataSize defines the limit for extraData size in DeletePiece calls (256B).
-	MaxDeletePieceExtraDataSize = 256
+	// MaxDeletePieceExtraDataSize defines the limit for extraData size in DeletePiece calls (1KiB).
+	MaxDeletePieceExtraDataSize = 1024
+
+	MaxDeletePiecesBatchSize = contract.ConservativeEnqueuedRemovalsLimit
 )
+
+// ETHTxSender enqueues (and eventually sends) an Ethereum transaction.
+// *message.SenderETH implements this; tests may substitute an instant mock.
+type ETHTxSender interface {
+	Send(ctx context.Context, fromAddress common.Address, tx *types.Transaction, reason string) (common.Hash, error)
+}
 
 // PDPService represents the service for managing data sets and pieces
 type PDPService struct {
 	Auth
 	db      *harmonydb.DB
-	storage paths.StashStore
+	pieceIO piecestore.PieceIO
 
-	sender    *message.SenderETH
+	sender    ETHTxSender
 	ethClient ethchain.EthClient
 	filClient PDPServiceNodeApi
 
@@ -74,6 +87,8 @@ type PDPService struct {
 	pullHandler *PullHandler
 
 	ipp *ipni_provider.Provider
+
+	ipOffenseThrottle *IPOffenseThrottle
 }
 
 type PDPServiceNodeApi interface {
@@ -84,10 +99,10 @@ type PDPServiceNodeApi interface {
 func NewPDPService(
 	ctx context.Context,
 	db *harmonydb.DB,
-	stor paths.StashStore,
+	pieceIO piecestore.PieceIO,
 	ec ethchain.EthClient,
 	fc PDPServiceNodeApi,
-	sn *message.SenderETH,
+	sn ETHTxSender,
 	alertTask *alertmanager.AlertTask,
 	ipp *ipni_provider.Provider) *PDPService {
 	auth := &NullAuth{}
@@ -97,7 +112,7 @@ func NewPDPService(
 	p := &PDPService{
 		Auth:    auth,
 		db:      db,
-		storage: stor,
+		pieceIO: pieceIO,
 
 		sender:    sn,
 		ethClient: ec,
@@ -105,11 +120,14 @@ func NewPDPService(
 
 		alertTask: alertTask,
 
-		pullHandler: NewPullHandler(auth, pullStore, pullValidator),
+		pullHandler: NewPullHandler(auth, pullStore, pullValidator, db),
 
 		ipp: ipp,
+
+		ipOffenseThrottle: NewIPOffenseThrottle(defaultIPOffensePolicies()),
 	}
 
+	go p.ipOffenseThrottle.RunCleanup(ctx)
 	go p.cleanup(ctx)
 	return p
 }
@@ -130,75 +148,81 @@ func kvUploadUUID(r *http.Request) []any {
 }
 
 // Routes registers the HTTP routes with the provided router.
-func Routes(r *chi.Mux, p *PDPService) {
-	// Routes for data sets
-	r.Route(path.Join(PDPRoutePath, "/data-sets"), func(r chi.Router) {
-		// POST /pdp/data-sets - Create a new data set
-		r.Post("/", instrument("dataSetCreate", p.handleCreateDataSet, nil))
+func Routes(r chi.Router, p *PDPService) {
+	mountExploreRoutes(r, p)
 
-		// POST /pdp/data-sets/create-and-add - Create a new data set and add pieces at the same time
-		r.Post("/create-and-add", instrument("dataSetCreateAndAdd", p.handleCreateDataSetAndAddPieces, nil))
+	r.Route(PDPRoutePath, func(r chi.Router) {
+		r.Use(p.ipOffenseThrottle.Middleware)
 
-		// GET /pdp/data-sets/created/{txHash} - Get the status of a data set creation
-		r.Get("/created/{txHash}", p.handleGetDataSetCreationStatus)
+		// Routes for data sets
+		r.Route("/data-sets", func(r chi.Router) {
+			// POST /pdp/data-sets - Create a new data set
+			r.Post("/", instrument("dataSetCreate", p.handleCreateDataSet, nil))
 
-		// Individual data set routes
-		r.Route("/{dataSetId}", func(r chi.Router) {
-			// GET /pdp/data-sets/{set-id}
-			r.Get("/", p.handleGetDataSet)
+			// POST /pdp/data-sets/create-and-add - Create a new data set and add pieces at the same time
+			r.Post("/create-and-add", instrument("dataSetCreateAndAdd", p.handleCreateDataSetAndAddPieces, nil))
 
-			// POST /pdp/data-sets/{set-id}/terminate
-			r.Post("/terminate", instrument("dataSetTerminate", p.handleTerminateDataSet, kvDataSetID))
+			// GET /pdp/data-sets/created/{txHash} - Get the status of a data set creation
+			r.Get("/created/{txHash}", p.handleGetDataSetCreationStatus)
 
-			// GET /pdp/data-sets/{set-id}/terminate
-			r.Get("/terminate", p.handleGetDataSetTerminationStatus)
+			// Individual data set routes
+			r.Route("/{dataSetId}", func(r chi.Router) {
+				// GET /pdp/data-sets/{set-id}
+				r.Get("/", p.handleGetDataSet)
 
-			// Routes for pieces within a data set
-			r.Route("/pieces", func(r chi.Router) {
-				// POST /pdp/data-sets/{set-id}/pieces
-				r.Post("/", instrument("pieceAdd", p.handleAddPieceToDataSet, kvDataSetID))
+				// POST /pdp/data-sets/{set-id}/terminate
+				r.Post("/terminate", instrument("dataSetTerminate", p.handleTerminateDataSet, kvDataSetID))
 
-				// GET /pdp/data-sets/{set-id}/pieces/added/{txHash}
-				r.Get("/added/{txHash}", p.handleGetPieceAdditionStatus)
+				// GET /pdp/data-sets/{set-id}/terminate
+				r.Get("/terminate", p.handleGetDataSetTerminationStatus)
 
-				// Individual piece routes
-				r.Route("/{pieceID}", func(r chi.Router) {
-					// GET /pdp/data-sets/{set-id}/pieces/{piece-id}
-					r.Get("/", p.handleGetDataSetPiece)
+				// Routes for pieces within a data set
+				r.Route("/pieces", func(r chi.Router) {
+					// POST /pdp/data-sets/{set-id}/pieces
+					r.Post("/", instrument("pieceAdd", p.handleAddPieceToDataSet, kvDataSetID))
 
-					// DEL /pdp/data-sets/{set-id}/pieces/{piece-id}
-					r.Delete("/", instrument("pieceDelete", p.handleDeleteDataSetPiece, kvDataSetPiece))
+					// GET /pdp/data-sets/{set-id}/pieces/added/{txHash}
+					r.Get("/added/{txHash}", p.handleGetPieceAdditionStatus)
+
+					// Individual piece routes
+					r.Route("/{pieceID}", func(r chi.Router) {
+						// GET /pdp/data-sets/{set-id}/pieces/{piece-id}
+						r.Get("/", p.handleGetDataSetPiece)
+
+						// DEL /pdp/data-sets/{set-id}/pieces/{piece-id}
+						r.Delete("/", instrument("pieceDelete", p.handleDeleteDataSetPiece, kvDataSetPiece))
+					})
 				})
 			})
 		})
+
+		r.Get("/ping", p.handlePing)
+
+		// GET /pdp/piece/{pieceCid}/status - Get indexing/IPNI status for a piece
+		r.Get("/piece/{pieceCid}/status", p.handleGetPieceStatus)
+
+		// Routes for piece storage and retrieval
+		// POST /pdp/piece
+		r.Post("/piece", instrument("pieceUploadInit", p.handlePiecePost, nil))
+
+		// GET /pdp/piece
+		r.Get("/piece", p.handleFindPiece)
+
+		// PUT /pdp/piece/upload/{uploadUUID}
+		r.Put("/piece/upload/{uploadUUID}", instrument("pieceUpload", p.handlePieceUpload, kvUploadUUID))
+
+		// POST /pdp/piece/uploads
+		r.Post("/piece/uploads", instrument("pieceStreamInit", p.handleStreamingUploadURL, nil))
+
+		// PUT /pdp/piece/uploads/{uploadUUID}
+		r.Put("/piece/uploads/{uploadUUID}", instrument("pieceStreamUpload", p.handleStreamingUpload, kvUploadUUID))
+
+		// POST /pdp/piece/uploads/{uploadUUID}
+		r.Post("/piece/uploads/{uploadUUID}", instrument("pieceStreamFinalize", p.handleFinalizeStreamingUpload, kvUploadUUID))
+
+		// POST /pdp/piece/pull - Pull pieces from other SPs
+		r.Post("/piece/pull", instrument("piecePull", p.pullHandler.HandlePull, nil))
 	})
-
-	r.Get(path.Join(PDPRoutePath, "/ping"), p.handlePing)
-
-	// GET /pdp/piece/{pieceCid}/status - Get indexing/IPNI status for a piece
-	r.Get(path.Join(PDPRoutePath, "/piece/{pieceCid}/status"), p.handleGetPieceStatus)
-
-	// Routes for piece storage and retrieval
-	// POST /pdp/piece
-	r.Post(path.Join(PDPRoutePath, "/piece"), instrument("pieceUploadInit", p.handlePiecePost, nil))
-
-	// GET /pdp/piece/
-	r.Get(path.Join(PDPRoutePath, "/piece/"), p.handleFindPiece)
-
-	// PUT /pdp/piece/upload/{uploadUUID}
-	r.Put(path.Join(PDPRoutePath, "/piece/upload/{uploadUUID}"), instrument("pieceUpload", p.handlePieceUpload, kvUploadUUID))
-
-	// POST /pdp/piece/uploads
-	r.Post(path.Join(PDPRoutePath, "/piece/uploads"), instrument("pieceStreamInit", p.handleStreamingUploadURL, nil))
-
-	// PUT /pdp/piece/uploads/{uploadUUID}
-	r.Put(path.Join(PDPRoutePath, "/piece/uploads/{uploadUUID}"), instrument("pieceStreamUpload", p.handleStreamingUpload, kvUploadUUID))
-
-	// POST /pdp/piece/uploads/{uploadUUID}
-	r.Post(path.Join(PDPRoutePath, "/piece/uploads/{uploadUUID}"), instrument("pieceStreamFinalize", p.handleFinalizeStreamingUpload, kvUploadUUID))
-
-	// POST /pdp/piece/pull - Pull pieces from other SPs
-	r.Post(path.Join(PDPRoutePath, "/piece/pull"), instrument("piecePull", p.pullHandler.HandlePull, nil))
 }
 
 // Handler functions
@@ -210,12 +234,26 @@ func (p *PDPService) handlePing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if p.alertTask != nil && p.alertTask.Problems() {
-		httpServerError(w, http.StatusServiceUnavailable, "Service Unavailable", nil)
+	status, err := pdpwallet.PDPKeyStatus(r.Context(), p.db)
+	if err != nil {
+		httpServerError(w, http.StatusServiceUnavailable, "Service Unavailable", err)
+		return
+	}
+	if !status.Configured {
+		httpServerError(w, http.StatusServiceUnavailable, "PDP wallet not configured", nil)
 		return
 	}
 
+	if p.alertTask != nil {
+		if detail := p.alertTask.ProblemDetail(); detail != "" {
+			httpServerError(w, http.StatusServiceUnavailable, "Service Unavailable", errors.New(detail))
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(PingOKBody))
 }
 
 // handleGetPieceStatus returns the indexing and IPNI status for a piece
@@ -246,18 +284,16 @@ func (p *PDPService) handleGetPieceStatus(w http.ResponseWriter, r *http.Request
 
 	// Query status from database
 	var results []struct {
-		PieceCID                 string         `db:"piece_cid"`
-		PieceRawSize             uint64         `db:"piece_raw_size"`
-		CreatedAt                time.Time      `db:"created_at"`
-		Indexed                  bool           `db:"indexed"`
-		IndexedAt                sql.NullTime   `db:"indexed_at"`
-		AdvertisementCreated     bool           `db:"advertisement_created"`
-		AdvertisementCreatedAt   sql.NullTime   `db:"advertisement_created_at"`
-		AdCID                    sql.NullString `db:"ad_cid"`
-		AdvertisementRetrieved   bool           `db:"advertisement_retrieved"`
-		AdvertisementRetrievedAt sql.NullTime   `db:"advertisement_retrieved_at"`
-		Status                   string         `db:"status"`
-		Provider                 sql.NullString `db:"provider"`
+		PieceCID               string         `db:"piece_cid"`
+		PieceRawSize           uint64         `db:"piece_raw_size"`
+		CreatedAt              time.Time      `db:"created_at"`
+		Indexed                bool           `db:"indexed"`
+		IndexedAt              sql.NullTime   `db:"indexed_at"`
+		AdvertisementCreated   bool           `db:"advertisement_created"`
+		AdvertisementCreatedAt sql.NullTime   `db:"advertisement_created_at"`
+		AdCID                  sql.NullString `db:"ad_cid"`
+		Status                 string         `db:"status"`
+		Provider               sql.NullString `db:"provider"`
 	}
 
 	err = p.db.Select(ctx, &results, `
@@ -275,34 +311,27 @@ func (p *PDPService) handleGetPieceStatus(w http.ResponseWriter, r *http.Request
 			pr.advertisement_created_at as advertisement_created_at,
 			ia.ad_cid,
 
-			-- Advertisement Fetch status
-			ia.fetched_at IS NOT NULL as advertisement_retrieved,
-			ia.fetched_at as advertisement_retrieved_at,
-
-			-- Determine overall status
 			CASE
-				WHEN ia.fetched_at IS NOT NULL THEN 'retrieved'
 				WHEN ia.ad_cid IS NOT NULL THEN 'announced'
 				WHEN pr.ipni_task_id IS NOT NULL THEN 'creating_ad'
 				WHEN pr.indexing_task_id IS NOT NULL THEN 'indexing'
 				ELSE 'pending'
 			END as status,
-		
+
 			ia.provider
 
 		FROM pdp_piecerefs pr
 		JOIN parked_piece_refs pprf ON pprf.ref_id = pr.piece_ref
 		JOIN parked_pieces pp ON pp.id = pprf.piece_id
 		LEFT JOIN LATERAL (
-			SELECT
-				MIN(i.ad_cid) as ad_cid,
-				MIN(i.provider) as provider,
-				MIN(af.fetched_at) as fetched_at
+			-- created_at is the primary sort; order_number only breaks ties.
+			SELECT i.ad_cid, i.provider
 			FROM ipni i
-			LEFT JOIN ipni_ad_fetches af ON af.ad_cid = i.ad_cid
 			WHERE i.piece_cid = pr.piece_cid
 				AND i.provider = (SELECT peer_id FROM ipni_peerid WHERE sp_id = $3)
 				AND i.is_rm = FALSE
+			ORDER BY i.created_at DESC, i.order_number DESC
+			LIMIT 1
 		) ia ON true
 		WHERE pr.piece_cid = $1 AND pr.service = $2
 		LIMIT 1
@@ -334,96 +363,54 @@ func (p *PDPService) handleGetPieceStatus(w http.ResponseWriter, r *http.Request
 		IndexedAt    *time.Time `json:"indexedAt,omitempty"`
 		AdCreated    bool       `json:"adCreated"`
 		AdCreatedAt  *time.Time `json:"adCreatedAt,omitempty"`
+		AdCid        *string    `json:"adCid,omitempty"`
 		Advertised   bool       `json:"advertised"`
 		AdvertisedAt *time.Time `json:"advertisedAt,omitempty"`
-		Retrieved    bool       `json:"retrieved"`
-		RetrievedAt  *time.Time `json:"retrievedAt,omitempty"`
+		Synced       bool       `json:"synced"`
+		SyncedAt     *time.Time `json:"syncedAt,omitempty"`
 	}{
 		PieceCID:  pieceInfo.CidV2.String(),
 		Status:    result.Status,
 		Indexed:   result.Indexed,
 		AdCreated: result.AdvertisementCreated,
-		Retrieved: result.AdvertisementRetrieved,
 	}
 
 	if !result.IndexedAt.Valid {
 		response.IndexedAt = nil
 	} else {
-		response.IndexedAt = &result.IndexedAt.Time
+		response.IndexedAt = new(result.IndexedAt.Time.UTC())
 	}
 
 	if !result.AdvertisementCreatedAt.Valid {
 		response.AdCreatedAt = nil
 	} else {
-		response.AdCreatedAt = &result.AdvertisementCreatedAt.Time
+		response.AdCreatedAt = new(result.AdvertisementCreatedAt.Time.UTC())
 	}
 
-	if !result.AdvertisementRetrievedAt.Valid {
-		response.RetrievedAt = nil
-	} else {
-		response.RetrievedAt = &result.AdvertisementRetrievedAt.Time
+	if result.AdCID.Valid {
+		response.AdCid = &result.AdCID.String
 	}
 
-	// Advertised and AdvertisedAt are derived from three signals, in order:
-	// 1. A recorded fetch of this ad in ipni_ad_fetches is the strongest per-ad
-	//    signal. If an indexer fetched the ad, it must have been advertised
-	//    already. Since we do not store the actual first publish time for each
-	//    ad, AdvertisedAt is estimated as the earlier of
-	//    advertisement_created_at + PublishInterval and the first fetch time.
-	//    This keeps AdvertisedAt from appearing after RetrievedAt.
-	// 2. The in-process IPNI provider exposes LastPublishTime per provider, not
-	//    per ad. It is useful only when there is no fetch record and we know
-	//    when this ad was created. A provider publish after this ad was created
-	//    means the ad should have been included in the announced head; an older
-	//    provider publish means it was not, and we do not fall through to the
-	//    timing heuristic.
-	// 3. Without either signal, fall back to the old timing heuristic: after
-	//    PublishInterval has elapsed from ad creation, assume the ad was
-	//    announced.
-	if result.AdvertisementRetrieved {
-		response.Advertised = true
-		if result.AdvertisementRetrievedAt.Valid {
-			advertisedAt := result.AdvertisementRetrievedAt.Time
-			if result.AdvertisementCreatedAt.Valid {
-				createdAtEstimate := result.AdvertisementCreatedAt.Time.Add(ipni_provider.PublishInterval)
-				if createdAtEstimate.Before(advertisedAt) {
-					advertisedAt = createdAtEstimate
-				}
-			}
-			response.AdvertisedAt = &advertisedAt
-		} else {
-			response.AdvertisedAt = nil
-		}
-	}
-
-	advertisedFromProvider := false
-	if !response.Advertised && result.AdvertisementCreatedAt.Valid && p.ipp != nil && result.Provider.Valid {
-		publishedAt := p.ipp.LastPublishTime(result.Provider.String)
-		if publishedAt != nil {
-			advertisedFromProvider = true
-			if publishedAt.After(result.AdvertisementCreatedAt.Time) {
-				response.Advertised = true
-				response.AdvertisedAt = new(*publishedAt)
-				if publishedAt.After(time.Now().Add(ipni_provider.PublishInterval)) {
-					response.AdvertisedAt = new(result.AdvertisementCreatedAt.Time.Add(ipni_provider.PublishInterval))
-				}
-			} else {
-				response.Advertised = false
-				response.AdvertisedAt = nil
+	if result.AdCID.Valid && p.ipp != nil {
+		if adCid, err := cid.Parse(result.AdCID.String); err == nil {
+			if syncedAt := p.ipp.SyncedAt(adCid, result.Provider.String); syncedAt != nil {
+				response.Synced = true
+				response.SyncedAt = syncedAt
 			}
 		}
 	}
 
-	if !advertisedFromProvider && !response.Advertised {
-		if result.AdvertisementCreated && result.AdvertisementCreatedAt.Valid {
-			if time.Since(result.AdvertisementCreatedAt.Time) > ipni_provider.PublishInterval {
-				// More than 5 seconds since advertisement was created, assume it's published
-				response.Advertised = true
-				response.AdvertisedAt = new(result.AdvertisementCreatedAt.Time.Add(ipni_provider.PublishInterval))
-			} else {
-				response.Advertised = false
-				response.AdvertisedAt = nil
-			}
+	// LastPublishTime is per-provider, so it's only used to confirm a push
+	// happened, not as the displayed time - AdvertisedAt is always the fixed
+	// formula below, so it doesn't drift as the provider announces later ads.
+	if result.AdvertisementCreatedAt.Valid {
+		var publishedAt *time.Time
+		if p.ipp != nil && result.Provider.Valid {
+			publishedAt = p.ipp.LastPublishTime(result.Provider.String)
+		}
+		if publishedAt != nil && publishedAt.After(result.AdvertisementCreatedAt.Time) {
+			response.Advertised = true
+			response.AdvertisedAt = new(result.AdvertisementCreatedAt.Time.Add(ipni_provider.PublishInterval).UTC())
 		}
 	}
 
@@ -524,6 +511,9 @@ func (p *PDPService) handleGetDataSetCreationStatus(w http.ResponseWriter, r *ht
 		TxStatus          string  `json:"txStatus"`
 		OK                *bool   `json:"ok"`
 		DataSetId         *uint64 `json:"dataSetId,omitempty"`
+		// ConfirmedTxHash is the hash that landed on chain. It differs from
+		// createMessageHash when Curio replaced the original send by fee.
+		ConfirmedTxHash string `json:"confirmedTxHash,omitempty"`
 	}{
 		CreateMessageHash: dataSetCreate.CreateMessageHash,
 		DataSetCreated:    dataSetCreate.DataSetCreated,
@@ -531,13 +521,16 @@ func (p *PDPService) handleGetDataSetCreationStatus(w http.ResponseWriter, r *ht
 		OK:                dataSetCreate.OK,
 	}
 
-	// Now get the tx_status from message_waits_eth
+	// Now get the tx_status (and confirmed hash, if any) from message_waits_eth.
+	// Wait rows stay keyed by the original Location hash; confirmed_tx_hash is
+	// the included transaction after optional replace-by-fee.
 	var txStatus string
+	var confirmedTxHash sql.NullString
 	err = p.db.QueryRow(ctx, `
-        SELECT tx_status
+        SELECT tx_status, confirmed_tx_hash
         FROM message_waits_eth
         WHERE signed_tx_hash = $1
-    `, txHash).Scan(&txStatus)
+    `, txHash).Scan(&txStatus, &confirmedTxHash)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// This should not happen as per foreign key constraints
@@ -549,6 +542,9 @@ func (p *PDPService) handleGetDataSetCreationStatus(w http.ResponseWriter, r *ht
 	}
 
 	response.TxStatus = txStatus
+	if confirmedTxHash.Valid {
+		response.ConfirmedTxHash = confirmedTxHash.String
+	}
 
 	if dataSetCreate.DataSetCreated {
 		// The data set has been created, get the dataSetId from pdp_data_sets
@@ -573,6 +569,7 @@ func (p *PDPService) handleGetDataSetCreationStatus(w http.ResponseWriter, r *ht
 	log.Debugw("GetDataSetCreationStatus response",
 		"txHash", txHash,
 		"txStatus", response.TxStatus,
+		"confirmedTxHash", response.ConfirmedTxHash,
 		"dataSetCreated", response.DataSetCreated,
 		"ok", response.OK,
 		"dataSetId", response.DataSetId)
@@ -859,11 +856,14 @@ func (p *PDPService) handleGetPieceAdditionStatus(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Step 5: Get transaction status from message_waits_eth
+	// Step 5: Get transaction status from message_waits_eth.
+	// Wait rows stay keyed by the original Location hash; confirmed_tx_hash is
+	// the included transaction after optional replace-by-fee.
 	var txStatus string
+	var confirmedTxHash sql.NullString
 	err = p.db.QueryRow(ctx, `
-		SELECT tx_status FROM message_waits_eth WHERE signed_tx_hash = $1
-	`, txHash).Scan(&txStatus)
+		SELECT tx_status, confirmed_tx_hash FROM message_waits_eth WHERE signed_tx_hash = $1
+	`, txHash).Scan(&txStatus, &confirmedTxHash)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			http.Error(w, "Transaction status not found", http.StatusNotFound)
@@ -928,6 +928,9 @@ func (p *PDPService) handleGetPieceAdditionStatus(w http.ResponseWriter, r *http
 		AddMessageOK      *bool    `json:"addMessageOk"`
 		PiecesAdded       bool     `json:"piecesAdded"`
 		ConfirmedPieceIds []uint64 `json:"confirmedPieceIds,omitempty"`
+		// ConfirmedTxHash is the hash that landed on chain. It differs from
+		// txHash when Curio replaced the original send by fee.
+		ConfirmedTxHash string `json:"confirmedTxHash,omitempty"`
 	}{
 		TxHash:            txHash,
 		TxStatus:          txStatus,
@@ -937,12 +940,34 @@ func (p *PDPService) handleGetPieceAdditionStatus(w http.ResponseWriter, r *http
 		PiecesAdded:       allPiecesProcessed,
 		ConfirmedPieceIds: confirmedPieceIds,
 	}
+	if confirmedTxHash.Valid {
+		response.ConfirmedTxHash = confirmedTxHash.String
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		http.Error(w, "Failed to encode response: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+}
+
+func normalizeDeletePieceIDs(ids []uint64) ([]int64, error) {
+	if len(ids) > MaxDeletePiecesBatchSize {
+		return nil, fmt.Errorf("piece count (%d) exceeds the maximum allowed per DeletePiece call (%d)", len(ids), MaxDeletePiecesBatchSize)
+	}
+	seen := make(map[uint64]struct{}, len(ids))
+	out := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id > math.MaxInt64 {
+			return nil, fmt.Errorf("piece ID %d is out of range", id)
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, int64(id))
+	}
+	return out, nil
 }
 
 func (p *PDPService) handleDeleteDataSetPiece(w http.ResponseWriter, r *http.Request) {
@@ -1000,7 +1025,8 @@ func (p *PDPService) handleDeleteDataSetPiece(w http.ResponseWriter, r *http.Req
 		return
 	}
 	type DeletePiecePayload struct {
-		ExtraData *string `json:"extraData"`
+		ExtraData *string  `json:"extraData"`
+		PieceIDs  []uint64 `json:"pieceIds"`
 	}
 	var payload DeletePiecePayload
 	err = json.NewDecoder(r.Body).Decode(&payload)
@@ -1030,15 +1056,43 @@ func (p *PDPService) handleDeleteDataSetPiece(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	// Check if we have this piece or not
-	var found bool
-	err = p.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pdp_data_set_pieces WHERE data_set = $1 AND piece_id = $2)`, dataSetId, pieceID).Scan(&found)
+	pieceIDs := []uint64{pieceID}
+	if len(payload.PieceIDs) > 0 {
+		pieceIDs = payload.PieceIDs
+	}
+
+	pieceIDsI64, err := normalizeDeletePieceIDs(pieceIDs)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var foundCount int
+	err = p.db.QueryRow(ctx, `SELECT COUNT(DISTINCT piece_id) FROM pdp_data_set_pieces WHERE data_set = $1 AND piece_id = ANY($2::bigint[])`, dataSetId, pieceIDsI64).Scan(&foundCount)
 	if err != nil {
 		httpServerError(w, http.StatusInternalServerError, "Failed to query piece existence", err)
 		return
 	}
-	if !found {
-		http.Error(w, "Piece not found", http.StatusNotFound)
+	if foundCount != len(pieceIDsI64) {
+		http.Error(w, "One or more piece not found", http.StatusNotFound)
+		return
+	}
+
+	// Soft gate: refuse if the data set's on-chain removal queue is already at our
+	// conservative ceiling. This keeps us well clear of the on-chain MAX_ENQUEUED_REMOVALS.
+	pdpVerifier, err := contract.NewPDPVerifier(contract.ContractAddresses().PDPVerifier, p.ethClient)
+	if err != nil {
+		httpServerError(w, http.StatusInternalServerError, "Failed to instantiate PDPVerifier", err)
+		return
+	}
+	queued, err := pdpVerifier.GetScheduledRemovals(contract.EthCallOpts(ctx), big.NewInt(int64(dataSetId)))
+	if err != nil {
+		httpServerError(w, http.StatusInternalServerError, "Failed to read scheduled removals", err)
+		return
+	}
+	if len(queued) >= contract.ConservativeEnqueuedRemovalsLimit {
+		http.Error(w, fmt.Sprintf("data set %d already has %d scheduled removals queued (limit %d); retry once they have been processed",
+			dataSetId, len(queued), contract.ConservativeEnqueuedRemovalsLimit), http.StatusTooManyRequests)
 		return
 	}
 
@@ -1049,10 +1103,15 @@ func (p *PDPService) handleDeleteDataSetPiece(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	pieceIDArgs := make([]*big.Int, len(pieceIDsI64))
+	for i, id := range pieceIDsI64 {
+		pieceIDArgs[i] = big.NewInt(id)
+	}
+
 	// Pack the method call data
 	data, err := abiData.Pack("schedulePieceDeletions",
 		big.NewInt(int64(dataSetId)),
-		[]*big.Int{big.NewInt(int64(pieceID))},
+		pieceIDArgs,
 		[]byte(extraDataBytes),
 	)
 	if err != nil {
@@ -1105,13 +1164,14 @@ func (p *PDPService) handleDeleteDataSetPiece(w http.ResponseWriter, r *http.Req
 		_, err = tx.Exec(`
 			UPDATE pdp_data_set_pieces
 			SET rm_message_hash = $1
-			WHERE data_set = $2 AND piece_id = $3`,
-			txHashLower, dataSetId, pieceID)
+			WHERE data_set = $2 AND piece_id = ANY($3::bigint[])`,
+			txHashLower, dataSetId, pieceIDsI64)
 		if err != nil {
-			log.Errorw("Failed to update rm_message_hash in pdp_data_set_pieces", "dataSetId", dataSetId, "pieceID", pieceID, "error", err)
+			log.Errorw("Failed to update rm_message_hash in pdp_data_set_pieces", "dataSetId", dataSetId, "pieceIDs", pieceIDsI64, "error", err)
 			return false, err
 		}
-		log.Infow("scheduled user requested deletion", "dataSetId", dataSetId, "pieceID", pieceID, "txHash", txHashLower)
+
+		log.Infow("scheduled user requested deletion", "dataSetId", dataSetId, "pieceIDs", pieceIDsI64, "txHash", txHashLower)
 
 		return true, nil
 	}, harmonydb.OptionRetry())
@@ -1236,21 +1296,32 @@ func (p *PDPService) handleGetDataSetPiece(w http.ResponseWriter, r *http.Reques
 
 func (p *PDPService) cleanup(ctx context.Context) {
 	rm := func(ctx context.Context, db *harmonydb.DB) {
-		var RefIDs []int64
-
-		err := db.QueryRow(ctx, `SELECT COALESCE(array_agg(piece_ref), '{}') AS ref_ids
-												FROM pdp_piece_streaming_uploads
-												WHERE complete = TRUE
-												  AND completed_at <= TIMEZONE('UTC', NOW()) - INTERVAL '60 minutes';`).Scan(&RefIDs)
-		if err != nil {
-			log.Errorw("failed to get non-finalized uploads", "error", err)
+		if err := p.cleanupExpiredDirectUploadClaims(ctx); err != nil {
+			log.Errorw("failed to clean up expired direct upload claims", "error", err)
+		}
+		if err := p.cleanupExpiredStreamingUploadClaims(ctx); err != nil {
+			log.Errorw("failed to clean up expired streaming upload claims", "error", err)
 		}
 
-		if len(RefIDs) > 0 {
-			_, err := db.Exec(ctx, `DELETE FROM parked_piece_refs WHERE ref_id = ANY($1);`, RefIDs)
-			if err != nil {
-				log.Errorw("failed to delete non-finalized uploads", "error", err)
-			}
+		_, err := db.Exec(ctx, `
+			WITH expired AS (
+				DELETE FROM pdp_piece_streaming_uploads su
+				WHERE su.complete = TRUE
+				  AND su.completed_at <= NOW() - INTERVAL '60 minutes'
+				  AND NOT EXISTS (
+					  SELECT 1 FROM pdp_piecerefs pr WHERE pr.piece_ref = su.piece_ref
+				  )
+				RETURNING su.piece_ref
+			)
+			DELETE FROM parked_piece_refs ppr
+			USING expired
+			WHERE ppr.ref_id = expired.piece_ref
+			  AND NOT EXISTS (
+				  SELECT 1 FROM pdp_piecerefs pr WHERE pr.piece_ref = ppr.ref_id
+			  )
+		`)
+		if err != nil {
+			log.Errorw("failed to delete non-finalized uploads", "error", err)
 		}
 
 		// Clean up old piece pull records (older than 5 days). Pull items only

@@ -3,13 +3,11 @@ package gc
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
 	"github.com/oklog/ulid"
-	"github.com/yugabyte/pgx/v5"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/curio/harmony/harmonydb"
@@ -21,6 +19,7 @@ import (
 	"github.com/filecoin-project/curio/lib/promise"
 	"github.com/filecoin-project/curio/market/indexstore"
 	"github.com/filecoin-project/curio/market/mk20"
+	"github.com/filecoin-project/curio/tasks/tasknames"
 )
 
 type PieceCleanupTask struct {
@@ -36,11 +35,9 @@ func NewPieceCleanupTask(db *harmonydb.DB, indexStore *indexstore.IndexStore) *P
 	}
 }
 
-func (p *PieceCleanupTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
+func (p *PieceCleanupTask) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
 	// TODO: Plug this into PoRep 1.2 and 2.0 clean up as well
 	// TODO: Remove Deal from MK12 and Mk20?
-
-	ctx := context.Background()
 
 	var tasks []struct {
 		ID       string        `db:"id"`
@@ -431,8 +428,9 @@ func (p *PieceCleanupTask) CanAccept(ids []harmonytask.TaskID, engine *harmonyta
 
 func (p *PieceCleanupTask) TypeDetails() harmonytask.TaskTypeDetails {
 	return harmonytask.TaskTypeDetails{
-		Max:  taskhelp.Max(50),
-		Name: "PieceCleanup",
+		Max:       taskhelp.Max(50),
+		Name:      tasknames.PieceCleanup,
+		MayFollow: []string{tasknames.Indexing, tasknames.PDPIndexing, tasknames.PDPv0_Indexing},
 		Cost: resources.Resources{
 			Cpu: 0,
 			Ram: 64 << 20,
@@ -445,36 +443,40 @@ func (p *PieceCleanupTask) TypeDetails() harmonytask.TaskTypeDetails {
 }
 
 func (p *PieceCleanupTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskFunc) error {
-	var stop bool
-	for !stop {
+	for {
+		stop := true
 		taskFunc(func(id harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
-			stop = true // assume we're done until we find a task to schedule
-
-			var did string
-			var pdp bool
-			err := tx.QueryRow(`SELECT id, pdp FROM piece_cleanup 
-								  WHERE cleanup_task_id IS NULL
-								  AND after_cleanup = FALSE 
-									LIMIT 1`).Scan(&did, &pdp)
-			if err != nil {
-				if errors.Is(err, pgx.ErrNoRows) {
-					return false, nil
-				}
-				return false, xerrors.Errorf("failed to query piece_cleanup: %w", err)
-			}
-
-			_, err = tx.Exec(`UPDATE piece_cleanup SET cleanup_task_id = $1 WHERE id = $2 AND pdp = $3 AND after_cleanup = FALSE`, id, did, pdp)
+			n, err := tx.Exec(`WITH pending AS (
+					SELECT id, pdp
+					FROM piece_cleanup
+					WHERE cleanup_task_id IS NULL
+					  AND after_cleanup = FALSE
+					LIMIT 1
+				)
+				UPDATE piece_cleanup p
+				SET cleanup_task_id = $1
+				FROM pending
+				WHERE p.id = pending.id
+				  AND p.pdp = pending.pdp
+				  AND p.cleanup_task_id IS NULL
+				  AND p.after_cleanup = FALSE`, id)
 			if err != nil {
 				return false, xerrors.Errorf("failed to update piece_cleanup: %w", err)
+			}
+			if n == 0 {
+				return false, nil
+			}
+			if n != 1 {
+				return false, xerrors.Errorf("updated %d rows assigning piece cleanup task", n)
 			}
 
 			stop = false // we found a task to schedule, keep going
 			return true, nil
 		})
-
+		if stop {
+			return nil
+		}
 	}
-
-	return nil
 }
 
 func (p *PieceCleanupTask) Adder(taskFunc harmonytask.AddTaskFunc) {

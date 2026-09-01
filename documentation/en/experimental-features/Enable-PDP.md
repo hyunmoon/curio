@@ -6,6 +6,10 @@ description: >-
 
 # Enable PDP
 
+{% hint style="info" %}
+For a PDP-only node without PoRep/sealing (skiff), see the [Curio-PDP runbook](../curio-pdp.md) and [Skiff binary](../skiff-binary.md).
+{% endhint %}
+
 {% hint style="danger" %}
 **ALPHA FEATURE - UNDER DEVELOPMENT**
 
@@ -492,7 +496,9 @@ curio cli storage attach --init --store /long-term-storage/path
 ```
 
 {% hint style="info" %}
-Your fast-storage path should point to high-performance storage media such as NVMe or SSD
+Your fast-storage path should point to high-performance storage media such as NVMe or SSD.
+
+To keep PDP payloads off sealed-sector disks, attach a dedicated `piece` to denytypes on storage configuration files. See [Separate PDP / parked pieces from sealed storage](../storage-configuration.md#separate-pdp-parked-pieces).
 {% endhint %}
 
 ***

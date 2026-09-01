@@ -2,12 +2,10 @@ package pdp
 
 import (
 	"context"
-	"errors"
 	"io"
 	"time"
 
 	"github.com/ipfs/go-cid"
-	"github.com/yugabyte/pgx/v5"
 	"golang.org/x/xerrors"
 
 	commcid "github.com/filecoin-project/go-fil-commcid"
@@ -43,8 +41,8 @@ func NewTaskPDPSaveCache(db *harmonydb.DB, cpr *cachedreader.CachedPieceReader, 
 	}
 }
 
-func (t *TaskPDPSaveCache) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-	ctx := context.Background()
+func (t *TaskPDPSaveCache) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
+
 	var saveCaches []struct {
 		ID        string `db:"id"`
 		PieceCid  string `db:"piece_cid_v2"`
@@ -155,8 +153,9 @@ func (t *TaskPDPSaveCache) CanAccept(ids []harmonytask.TaskID, engine *harmonyta
 
 func (t *TaskPDPSaveCache) TypeDetails() harmonytask.TaskTypeDetails {
 	return harmonytask.TaskTypeDetails{
-		Max:  taskhelp.Max(50),
-		Name: tasknames.PDPSaveCache,
+		Max:       taskhelp.Max(50),
+		Name:      tasknames.PDPSaveCache,
+		MayFollow: []string{tasknames.PDPCommP},
 		Cost: resources.Resources{
 			Cpu: 1,
 			Ram: 64 << 20,
@@ -169,38 +168,42 @@ func (t *TaskPDPSaveCache) TypeDetails() harmonytask.TaskTypeDetails {
 }
 
 func (t *TaskPDPSaveCache) schedule(ctx context.Context, taskFunc harmonytask.AddTaskFunc) error {
-	var stop bool
-	for !stop {
+	for {
+		stop := true
 		taskFunc(func(id harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
-			stop = true // assume we're done until we find a task to schedule
-
-			var did string
-			err := tx.QueryRow(`SELECT id FROM pdp_pipeline 
-								  WHERE save_cache_task_id IS NULL 
-									AND after_save_cache = FALSE
-									AND after_add_piece_msg = TRUE`).Scan(&did)
-			if err != nil {
-				if errors.Is(err, pgx.ErrNoRows) {
-					return false, nil
-				}
-				return false, xerrors.Errorf("failed to query pdp_pipeline: %w", err)
-			}
-			if did == "" {
-				return false, xerrors.Errorf("no valid deal ID found for scheduling")
-			}
-
-			_, err = tx.Exec(`UPDATE pdp_pipeline SET save_cache_task_id = $1 WHERE id = $2 AND after_save_cache = FALSE AND after_add_piece_msg = TRUE AND save_cache_task_id IS NULL`, id, did)
+			n, err := tx.Exec(`WITH pending AS (
+					SELECT id, aggr_index
+					FROM pdp_pipeline
+					WHERE save_cache_task_id IS NULL
+					  AND after_save_cache = FALSE
+					  AND after_add_piece_msg = TRUE
+					LIMIT 1
+				)
+				UPDATE pdp_pipeline p
+				SET save_cache_task_id = $1
+				FROM pending
+				WHERE p.id = pending.id
+				  AND p.aggr_index = pending.aggr_index
+				  AND p.save_cache_task_id IS NULL
+				  AND p.after_save_cache = FALSE
+				  AND p.after_add_piece_msg = TRUE`, id)
 			if err != nil {
 				return false, xerrors.Errorf("failed to update pdp_pipeline: %w", err)
+			}
+			if n == 0 {
+				return false, nil
+			}
+			if n != 1 {
+				return false, xerrors.Errorf("updated %d rows assigning pdp save cache task", n)
 			}
 
 			stop = false // we found a task to schedule, keep going
 			return true, nil
 		})
-
+		if stop {
+			return nil
+		}
 	}
-
-	return nil
 }
 
 func (t *TaskPDPSaveCache) Adder(taskFunc harmonytask.AddTaskFunc) {}

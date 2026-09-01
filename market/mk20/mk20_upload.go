@@ -1,3 +1,5 @@
+//go:build !skiff
+
 package mk20
 
 import (
@@ -1239,6 +1241,10 @@ func (m *MK20) HandleSerialUploadFinalize(ctx context.Context, id ulid.ULID, dea
 		log.Errorw("failed to finalize deal upload", "deal", id, "error", "failed to commit transaction")
 		http.Error(w, "", int(ErrServerInternalError))
 		return
+	}
+
+	if m.OnDealInserted != nil {
+		m.OnDealInserted()
 	}
 
 	w.WriteHeader(int(Ok))

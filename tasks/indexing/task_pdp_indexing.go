@@ -17,31 +17,29 @@ import (
 	"github.com/filecoin-project/curio/harmony/resources"
 	"github.com/filecoin-project/curio/harmony/taskhelp"
 	"github.com/filecoin-project/curio/lib/cachedreader"
-	"github.com/filecoin-project/curio/lib/ffi"
 	"github.com/filecoin-project/curio/lib/passcall"
 	"github.com/filecoin-project/curio/lib/storiface"
 	"github.com/filecoin-project/curio/market/indexstore"
 	"github.com/filecoin-project/curio/market/mk20"
+	"github.com/filecoin-project/curio/tasks/tasknames"
 )
 
 type PDPIndexingTask struct {
 	db                *harmonydb.DB
 	indexStore        *indexstore.IndexStore
 	cpr               *cachedreader.CachedPieceReader
-	sc                *ffi.SealCalls
 	cfg               *config.CurioConfig
 	insertConcurrency int
 	insertBatchSize   int
 	max               taskhelp.Limiter
 }
 
-func NewPDPIndexingTask(db *harmonydb.DB, sc *ffi.SealCalls, indexStore *indexstore.IndexStore, cpr *cachedreader.CachedPieceReader, cfg *config.CurioConfig, max taskhelp.Limiter) *PDPIndexingTask {
+func NewPDPIndexingTask(db *harmonydb.DB, indexStore *indexstore.IndexStore, cpr *cachedreader.CachedPieceReader, cfg *config.CurioConfig, max taskhelp.Limiter) *PDPIndexingTask {
 
 	return &PDPIndexingTask{
 		db:                db,
 		indexStore:        indexStore,
 		cpr:               cpr,
-		sc:                sc,
 		cfg:               cfg,
 		insertConcurrency: cfg.Market.StorageMarketConfig.Indexing.InsertConcurrency,
 		insertBatchSize:   cfg.Market.StorageMarketConfig.Indexing.InsertBatchSize,
@@ -49,8 +47,7 @@ func NewPDPIndexingTask(db *harmonydb.DB, sc *ffi.SealCalls, indexStore *indexst
 	}
 }
 
-func (P *PDPIndexingTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-	ctx := context.Background()
+func (P *PDPIndexingTask) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
 
 	var tasks []struct {
 		ID         string `db:"id"`
@@ -157,17 +154,22 @@ func (P *PDPIndexingTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) 
 		return P.indexStore.AddIndex(ctx, pcid2, recs)
 	})
 
-	var aggidx map[cid.Cid][]indexstore.Record
+	aggRecs := make(chan indexstore.Record, chanSize)
 
 	if len(subPieces) > 0 {
-		blocks, aggidx, interrupted, err = IndexAggregate(pcid2, reader, pi.Size, subPieces, recs, addFail)
+		eg.Go(func() error {
+			return P.indexStore.InsertAggregateIndex(ctx, pcid2, aggRecs)
+		})
+
+		blocks, interrupted, err = IndexAggregate(pcid2, reader, pi.Size, subPieces, recs, aggRecs, addFail)
 	} else {
-		blocks, interrupted, err = IndexCAR(reader, 4<<20, recs, addFail)
+		_, blocks, interrupted, err = IndexCAR(reader, 4<<20, recs, addFail)
 	}
 
 	if err != nil {
 		// Indexing itself failed, stop early
 		close(recs) // still safe to close, AddIndex will exit on channel close
+		close(aggRecs)
 		// wait for AddIndex goroutine to finish cleanly
 		_ = eg.Wait()
 		return false, xerrors.Errorf("indexing failed: %w", err)
@@ -175,24 +177,15 @@ func (P *PDPIndexingTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) 
 
 	// Close the channel
 	close(recs)
+	close(aggRecs)
 
 	// Wait till AddIndex is finished
 	err = eg.Wait()
 	if err != nil {
-		return false, xerrors.Errorf("adding index to DB (interrupted %t): %w", interrupted, err)
+		return false, xerrors.Errorf("adding indexes to DB (interrupted %t): %w", interrupted, err)
 	}
 
 	log.Infof("Indexing deal %s took %0.3f seconds", task.ID, time.Since(startTime).Seconds())
-
-	// Save aggregate index if present
-	for k, v := range aggidx {
-		if len(v) > 0 {
-			err = P.indexStore.InsertAggregateIndex(ctx, k, v)
-			if err != nil {
-				return false, xerrors.Errorf("inserting aggregate index: %w", err)
-			}
-		}
-	}
 
 	err = P.recordCompletion(ctx, taskID, task.ID, pi.PieceCIDV1.String(), int64(pi.Size), int64(pi.RawSize), task.PieceRef, true)
 	if err != nil {
@@ -295,7 +288,8 @@ func (P *PDPIndexingTask) CanAccept(ids []harmonytask.TaskID, engine *harmonytas
 
 func (P *PDPIndexingTask) TypeDetails() harmonytask.TaskTypeDetails {
 	return harmonytask.TaskTypeDetails{
-		Name: "PDPIndexing",
+		Name:      tasknames.PDPIndexing,
+		MayFollow: []string{tasknames.PDPProve, tasknames.AggregatePDPDeal},
 		Cost: resources.Resources{
 			Cpu: 0,
 			Ram: uint64(P.insertBatchSize * P.insertConcurrency * 56 * 2),
@@ -310,41 +304,43 @@ func (P *PDPIndexingTask) TypeDetails() harmonytask.TaskTypeDetails {
 
 func (P *PDPIndexingTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskFunc) error {
 	// schedule submits
-	var stop bool
-	for !stop {
+	for {
+		stop := true
 		taskFunc(func(id harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
-			stop = true // assume we're done until we find a task to schedule
-
-			var pendings []struct {
-				ID string `db:"id"`
-			}
-
-			err := tx.Select(&pendings, `SELECT id FROM pdp_pipeline 
-            										WHERE after_save_cache = TRUE
-            										AND indexing_task_id IS NULL
-            										AND indexed = FALSE
-													ORDER BY indexing_created_at ASC LIMIT 1;`)
-			if err != nil {
-				return false, xerrors.Errorf("getting PDP pending indexing tasks: %w", err)
-			}
-
-			if len(pendings) == 0 {
-				return false, nil
-			}
-
-			pending := pendings[0]
-			_, err = tx.Exec(`UPDATE pdp_pipeline SET indexing_task_id = $1 
-                             WHERE indexing_task_id IS NULL AND id = $2`, id, pending.ID)
+			n, err := tx.Exec(`WITH pending AS (
+					SELECT id, aggr_index
+					FROM pdp_pipeline
+					WHERE after_save_cache = TRUE
+					  AND indexing_task_id IS NULL
+					  AND indexed = FALSE
+					ORDER BY indexing_created_at ASC
+					LIMIT 1
+				)
+				UPDATE pdp_pipeline p
+				SET indexing_task_id = $1
+				FROM pending
+				WHERE p.id = pending.id
+				  AND p.aggr_index = pending.aggr_index
+				  AND p.after_save_cache = TRUE
+				  AND p.indexing_task_id IS NULL
+				  AND p.indexed = FALSE`, id)
 			if err != nil {
 				return false, xerrors.Errorf("updating PDP indexing task id: %w", err)
+			}
+			if n == 0 {
+				return false, nil
+			}
+			if n != 1 {
+				return false, xerrors.Errorf("updated %d rows assigning PDP indexing task", n)
 			}
 
 			stop = false
 			return true, nil
 		})
+		if stop {
+			return nil
+		}
 	}
-
-	return nil
 }
 
 func (P *PDPIndexingTask) Adder(taskFunc harmonytask.AddTaskFunc) {}

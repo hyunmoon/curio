@@ -40,9 +40,7 @@ func NewCleanupPiecesTask(db *harmonydb.DB, ethClient ethchain.EthClient, sender
 	}
 }
 
-func (t *CleanupPiecesTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-	ctx := context.Background()
-
+func (t *CleanupPiecesTask) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
 	var dataSetID int64
 	err = t.db.QueryRow(ctx, `SELECT id FROM pdp_delete_data_set WHERE cleanup_pieces_task_id = $1`, taskID).Scan(&dataSetID)
 	if err != nil {
@@ -186,58 +184,50 @@ func (t *CleanupPiecesTask) sendCleanupPieces(ctx context.Context, sender common
 }
 
 func (t *CleanupPiecesTask) schedule(ctx context.Context, addTaskFunc harmonytask.AddTaskFunc) error {
-	var stop bool
-
-	for !stop {
+	for {
+		stop := true
 		addTaskFunc(func(taskID harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
-			stop = true
-
-			var pendings []struct {
-				ID int64 `db:"id"`
-			}
-
-			err := tx.Select(&pendings, `SELECT id
-				FROM pdp_delete_data_set
-				WHERE cleanup_pieces_task_id IS NULL
-				  AND cleanup_pieces_tx_hash IS NULL
-				  AND after_delete_data_set = TRUE
-				  AND delete_tx_hash IS NULL
-				  AND service_termination_epoch IS NOT NULL
-				  AND terminated = FALSE
-				ORDER BY id`)
-			if err != nil {
-				return false, xerrors.Errorf("failed to select pending PDP cleanup data sets: %w", err)
-			}
-
-			if len(pendings) == 0 {
-				log.Debugw("no pending PDP data sets for piece cleanup")
-				return false, nil
-			}
-
-			pending := pendings[0]
-
-			n, err := tx.Exec(`UPDATE pdp_delete_data_set
+			n, err := tx.Exec(`WITH pending AS (
+					SELECT id
+					FROM pdp_delete_data_set
+					WHERE cleanup_pieces_task_id IS NULL
+					  AND cleanup_pieces_tx_hash IS NULL
+					  AND after_delete_data_set = TRUE
+					  AND delete_tx_hash IS NULL
+					  AND service_termination_epoch IS NOT NULL
+					  AND terminated = FALSE
+					ORDER BY id
+					LIMIT 1
+				)
+				UPDATE pdp_delete_data_set p
 				SET cleanup_pieces_task_id = $1
-				WHERE id = $2
-				  AND cleanup_pieces_task_id IS NULL
-				  AND cleanup_pieces_tx_hash IS NULL
-				  AND after_delete_data_set = TRUE
-				  AND delete_tx_hash IS NULL
-				  AND service_termination_epoch IS NOT NULL
-				  AND terminated = FALSE`, taskID, pending.ID)
+				FROM pending
+				WHERE p.id = pending.id
+				  AND p.cleanup_pieces_task_id IS NULL
+				  AND p.cleanup_pieces_tx_hash IS NULL
+				  AND p.after_delete_data_set = TRUE
+				  AND p.delete_tx_hash IS NULL
+				  AND p.service_termination_epoch IS NOT NULL
+				  AND p.terminated = FALSE`, taskID)
 			if err != nil {
 				return false, xerrors.Errorf("failed to assign PDP cleanup task: %w", err)
+			}
+			if n == 0 {
+				log.Debugw("no pending PDP data sets for piece cleanup")
+				return false, nil
 			}
 			if n != 1 {
 				return false, xerrors.Errorf("updated %d rows assigning PDP cleanup task", n)
 			}
 
-			log.Debugw("scheduled PDP cleanupPieces task", "dataSetId", pending.ID)
+			log.Debugw("scheduled PDP cleanupPieces task")
 			stop = false
 			return true, nil
 		})
+		if stop {
+			return nil
+		}
 	}
-	return nil
 }
 
 func (t *CleanupPiecesTask) CanAccept(ids []harmonytask.TaskID, engine *harmonytask.TaskEngine) ([]harmonytask.TaskID, error) {

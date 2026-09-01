@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/url"
@@ -64,6 +65,7 @@ func CurioHandler(
 	remote http.HandlerFunc,
 	a api.Curio,
 	prometheusSD http.Handler,
+	dependencies *deps.Deps,
 	permissioned bool) http.Handler {
 	mux := mux.NewRouter()
 	readerHandler, readerServerOpt := rpcenc.ReaderParamDecoder()
@@ -81,6 +83,19 @@ func CurioHandler(
 
 	mux.Handle("/rpc/v0", rpcServer)
 	mux.Handle("/rpc/streams/v0/push/{uuid}", readerHandler)
+	if dependencies.PeerHTTP != nil {
+		mux.Handle("/peer/v1", dependencies.PeerHTTP) // Peer-to-peer HTTP POST communication
+	}
+	mux.HandleFunc("/market/wake-poller", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		if dependencies.WakeDealPoller != nil {
+			dependencies.WakeDealPoller()
+		}
+		w.WriteHeader(http.StatusOK)
+	})
 	mux.PathPrefix("/remote").HandlerFunc(remote)
 	mux.Handle("/debug/metrics", metrics.Exporter())
 	mux.Handle("/debug/service-discovery", prometheusSD)
@@ -474,6 +489,7 @@ func ListenAndServe(ctx context.Context, dependencies *deps.Deps, shutdownChan c
 			return payload.Allow, nil
 		}
 	}
+
 	// Serve the RPC.
 	srv := &http.Server{
 		Handler: CurioHandler(
@@ -481,6 +497,7 @@ func ListenAndServe(ctx context.Context, dependencies *deps.Deps, shutdownChan c
 			remoteHandler,
 			&CurioAPI{dependencies, dependencies.Si, shutdownChan},
 			prometheusServiceDiscovery(ctx, dependencies),
+			dependencies,
 			permissioned),
 		ReadHeaderTimeout: time.Minute * 3,
 		BaseContext: func(listener net.Listener) context.Context {
@@ -492,25 +509,22 @@ func ListenAndServe(ctx context.Context, dependencies *deps.Deps, shutdownChan c
 
 	log.Infof("Setting up RPC server at %s", dependencies.ListenAddr)
 	eg := errgroup.Group{}
-	eg.Go(srv.ListenAndServe)
+	eg.Go(func() error {
+		err := srv.ListenAndServe()
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	})
+
+	var webSrv *http.Server
 
 	if dependencies.Cfg.Subsystems.EnableWebGui {
-		web, err := web.GetSrv(ctx, dependencies, false)
+		var err error
+		webSrv, err = web.GetSrv(ctx, dependencies, false)
 		if err != nil {
 			return err
 		}
-
-		go func() {
-			<-ctx.Done()
-			log.Warn("Shutting down...")
-			if err := srv.Shutdown(context.TODO()); err != nil {
-				log.Errorf("shutting down RPC server failed: %s", err)
-			}
-			if err := web.Shutdown(context.Background()); err != nil {
-				log.Errorf("shutting down web server failed: %s", err)
-			}
-			log.Warn("Graceful shutdown successful")
-		}()
 
 		uiAddress := dependencies.Cfg.Subsystems.GuiAddress
 		if uiAddress == "" || uiAddress[0] == ':' || uiAddress == "0.0.0.0:4701" {
@@ -521,8 +535,29 @@ func ListenAndServe(ctx context.Context, dependencies *deps.Deps, shutdownChan c
 		}
 
 		log.Infof("GUI:  http://%s", uiAddress)
-		eg.Go(web.ListenAndServe)
+		eg.Go(func() error {
+			err := webSrv.ListenAndServe()
+			if errors.Is(err, http.ErrServerClosed) {
+				return nil
+			}
+			return err
+		})
 	}
+
+	go func() {
+		<-ctx.Done()
+		log.Warn("Shutting down...")
+		if err := srv.Shutdown(context.TODO()); err != nil {
+			log.Errorf("shutting down RPC server failed: %s", err)
+		}
+		if webSrv != nil {
+			if err := webSrv.Shutdown(context.Background()); err != nil {
+				log.Errorf("shutting down web server failed: %s", err)
+			}
+		}
+		log.Warn("Graceful shutdown successful")
+	}()
+
 	return eg.Wait()
 }
 

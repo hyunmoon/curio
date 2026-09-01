@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -26,7 +25,6 @@ import (
 
 	proofparams "github.com/filecoin-project/lotus/build/proof-params"
 	cliutil "github.com/filecoin-project/lotus/cli/util"
-	"github.com/filecoin-project/lotus/lib/tracing"
 )
 
 var log = logging.Logger("main")
@@ -43,14 +41,23 @@ func SetupLogLevels() {
 	}
 }
 
-func setupCloseHandler() {
+var cmdShutdownChan = make(chan struct{}, 1)
+
+// setupCloseHandler is the app-level handler for short-running commands.
+// Long-running commands can stop it early, but must install their own shutdown handling.
+func setupCloseHandler(sc chan struct{}) {
 	c := make(chan os.Signal, 1)
 	// Register our handler first, before runApp's handler
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGABRT)
 	go func() {
-		<-c
-		fmt.Println("\r- Ctrl+C pressed in Terminal")
-		panic(1)
+		select {
+		case <-sc:
+			signal.Stop(c)
+			return
+		case <-c:
+			fmt.Println("\r- Ctrl+C pressed in Terminal")
+			os.Exit(0)
+		}
 	}()
 }
 
@@ -73,21 +80,9 @@ func main() {
 		batchCmd,
 	}
 
-	jaeger := tracing.SetupJaegerTracing("curio")
-	defer func() {
-		if jaeger != nil {
-			_ = jaeger.ForceFlush(context.Background())
-		}
-	}()
-
 	for _, cmd := range local {
 		originBefore := cmd.Before
 		cmd.Before = func(cctx *cli.Context) error {
-			if jaeger != nil {
-				_ = jaeger.Shutdown(cctx.Context)
-			}
-			jaeger = tracing.SetupJaegerTracing("curio/" + cmd.Name)
-
 			if cctx.IsSet("color") {
 				color.NoColor = !cctx.Bool("color")
 			}
@@ -106,7 +101,7 @@ func main() {
 		Version:              curiobuild.UserVersion(),
 		EnableBashCompletion: true,
 		Before: func(c *cli.Context) error {
-			setupCloseHandler()
+			setupCloseHandler(cmdShutdownChan)
 			cliutil.IsVeryVerbose = c.Bool("vv")
 			return nil
 		},
@@ -172,6 +167,12 @@ func main() {
 				Usage:   translations.T("Enable load balancing for connecting to the Postgres database in Yugabyte cluster"),
 				EnvVars: []string{"CURIO_DB_LOAD_BALANCE", "CURIO_HARMONYDB_LOAD_BALANCE"},
 				Value:   true,
+			},
+			&cli.BoolFlag{
+				Name:    "db-readonly",
+				Usage:   translations.T("Open the database in read-only mode (skip schema upgrades and harmony_machines writes)"),
+				EnvVars: []string{"CURIO_DB_READONLY"},
+				Value:   false,
 			},
 			&cli.StringFlag{
 				Name:    deps.FlagRepoPath,

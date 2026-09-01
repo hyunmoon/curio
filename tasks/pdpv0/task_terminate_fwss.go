@@ -42,9 +42,7 @@ func NewTerminateServiceTask(db *harmonydb.DB, ethClient ethchain.EthClient, sen
 	}
 }
 
-func (t *TerminateFWSSTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-	ctx := context.Background()
-
+func (t *TerminateFWSSTask) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
 	var dataSet terminateDataSet
 	err = t.db.QueryRow(ctx, `
 		SELECT id, client_requested_termination, termination_extra_data
@@ -176,7 +174,8 @@ func (t *TerminateFWSSTask) CanAccept(ids []harmonytask.TaskID, engine *harmonyt
 
 func (t *TerminateFWSSTask) TypeDetails() harmonytask.TaskTypeDetails {
 	return harmonytask.TaskTypeDetails{
-		Name: tasknames.PDPv0_TermFWSS,
+		Name:      tasknames.PDPv0_TermFWSS,
+		MayFollow: []string{tasknames.PDPv0_Prove},
 		Cost: resources.Resources{
 			Cpu: 0,
 			Gpu: 0,
@@ -198,54 +197,46 @@ func terminateServiceRetryWait(retries int) time.Duration {
 }
 
 func (t *TerminateFWSSTask) schedule(ctx context.Context, addTaskFunc harmonytask.AddTaskFunc) error {
-	var stop bool
-
-	for !stop {
+	for {
+		stop := true
 		addTaskFunc(func(taskID harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
-			stop = true
-
-			var pendings []int64
-
-			err := tx.Select(&pendings, `SELECT id FROM pdp_delete_data_set WHERE terminate_service_task_id IS NULL AND after_terminate_service = FALSE LIMIT 1`)
-
-			if err != nil {
-				return false, xerrors.Errorf("failed to select pending data sets: %w", err)
-			}
-
-			if len(pendings) == 0 {
-				log.Debugw("no pending data sets to terminate service")
-				return false, nil
-			}
-
-			pending := pendings[0]
-
-			n, err := tx.Exec(`
-				UPDATE pdp_delete_data_set
+			n, err := tx.Exec(`WITH pending AS (
+					SELECT id
+					FROM pdp_delete_data_set
+					WHERE terminate_service_task_id IS NULL
+					  AND after_terminate_service = FALSE
+					LIMIT 1
+				)
+				UPDATE pdp_delete_data_set p
 				SET terminate_service_task_id = $1,
 				    client_terminate_service_task_id = CASE
-				        WHEN client_requested_termination THEN $1
-				        ELSE client_terminate_service_task_id
+				        WHEN p.client_requested_termination THEN $1
+				        ELSE p.client_terminate_service_task_id
 				    END
-				WHERE id = $2
-				  AND terminate_service_task_id IS NULL
-				  AND after_terminate_service = FALSE
-			`, taskID, pending)
-
+				FROM pending
+				WHERE p.id = pending.id
+				  AND p.terminate_service_task_id IS NULL
+				  AND p.after_terminate_service = FALSE`, taskID)
 			if err != nil {
 				return false, xerrors.Errorf("failed to update pdp_delete_data_set: %w", err)
 			}
-
+			if n == 0 {
+				log.Debugw("no pending data sets to terminate service")
+				return false, nil
+			}
 			if n != 1 {
 				return false, xerrors.Errorf("updated %d rows", n)
 			}
 
-			log.Debugw("scheduled terminate service task", "dataSetId", pending)
+			log.Debugw("scheduled terminate service task")
 
 			stop = false
 			return true, nil
 		})
+		if stop {
+			return nil
+		}
 	}
-	return nil
 }
 
 func (t *TerminateFWSSTask) Adder(taskFunc harmonytask.AddTaskFunc) {}

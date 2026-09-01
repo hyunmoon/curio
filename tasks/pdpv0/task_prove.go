@@ -11,6 +11,7 @@ import (
 	"math/bits"
 	"sort"
 	"sync/atomic"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -27,15 +28,14 @@ import (
 	"github.com/filecoin-project/go-padreader"
 	"github.com/filecoin-project/go-state-types/abi"
 
+	"github.com/filecoin-project/curio/alertmanager/curioalerting"
 	"github.com/filecoin-project/curio/harmony/harmonydb"
 	"github.com/filecoin-project/curio/harmony/harmonytask"
 	"github.com/filecoin-project/curio/harmony/resources"
-	"github.com/filecoin-project/curio/lib/cachedreader"
-	"github.com/filecoin-project/curio/lib/chainsched"
+	"github.com/filecoin-project/curio/harmony/taskhelp"
 	"github.com/filecoin-project/curio/lib/ethchain"
 	"github.com/filecoin-project/curio/lib/promise"
 	"github.com/filecoin-project/curio/lib/proof"
-	"github.com/filecoin-project/curio/market/indexstore"
 	"github.com/filecoin-project/curio/pdp/contract"
 	"github.com/filecoin-project/curio/tasks/message"
 	"github.com/filecoin-project/curio/tasks/tasknames"
@@ -44,15 +44,19 @@ import (
 	"github.com/filecoin-project/lotus/storage/pipeline/lib/nullreader"
 )
 
+const alertNameProving = "Proving"
+
 const LeafSize = proof.NODE_SIZE
 
 type ProveTask struct {
 	db        *harmonydb.DB
 	ethClient ethchain.EthClient
 	sender    *message.SenderETH
-	cpr       *cachedreader.CachedPieceReader
+	cpr       PieceReader
 	fil       ProveTaskChainApi
-	idx       *indexstore.IndexStore
+	idx       ProofCacheStore
+
+	al curioalerting.AlertingInterface
 
 	head atomic.Pointer[chainTypes.TipSet]
 
@@ -64,7 +68,7 @@ type ProveTaskChainApi interface {
 	ChainHead(context.Context) (*chainTypes.TipSet, error)                                                                              //perm:read
 }
 
-func NewProveTask(chainSched *chainsched.CurioChainSched, db *harmonydb.DB, ethClient ethchain.EthClient, fil ProveTaskChainApi, sender *message.SenderETH, cpr *cachedreader.CachedPieceReader, idx *indexstore.IndexStore) *ProveTask {
+func NewProveTask(db *harmonydb.DB, ethClient ethchain.EthClient, fil ProveTaskChainApi, w *Watcher, sender *message.SenderETH, cpr PieceReader, idx ProofCacheStore) *ProveTask {
 	pt := &ProveTask{
 		db:        db,
 		ethClient: ethClient,
@@ -72,14 +76,15 @@ func NewProveTask(chainSched *chainsched.CurioChainSched, db *harmonydb.DB, ethC
 		cpr:       cpr,
 		fil:       fil,
 		idx:       idx,
+		al:        w.al,
 	}
 
 	// ProveTasks are created on pdp_data_sets entries where
 	// challenge_request_msg_hash is not null (=not yet landed)
 
-	err := chainSched.AddHandler(func(ctx context.Context, revert, apply *chainTypes.TipSet) error {
+	err := w.AddWatcher(func(ctx context.Context, db *harmonydb.DB, ethClient ethchain.EthClient, al curioalerting.AlertingInterface, revert, apply *chainTypes.TipSet) {
 		if apply == nil {
-			return nil
+			return
 		}
 
 		pt.head.Store(apply)
@@ -102,7 +107,6 @@ func NewProveTask(chainSched *chainsched.CurioChainSched, db *harmonydb.DB, ethC
                       AND mw.tx_success = TRUE
                       AND p.prove_at_epoch < $1
                       AND p.unrecoverable_proving_failure_epoch IS NULL
-                      AND (p.next_prove_attempt_at IS NULL OR p.next_prove_attempt_at <= $1)
                     LIMIT 2
                 `, currentHeight)
 				if err != nil {
@@ -153,9 +157,7 @@ func NewProveTask(chainSched *chainsched.CurioChainSched, db *harmonydb.DB, ethC
 				break
 			}
 		}
-
-		return nil
-	})
+	}, WatcherOrderProving)
 	if err != nil {
 		// Handler registration failed
 		panic(err)
@@ -164,35 +166,7 @@ func NewProveTask(chainSched *chainsched.CurioChainSched, db *harmonydb.DB, ethC
 	return pt
 }
 
-func (p *ProveTask) disableProving(ctx context.Context, dataSetId int64) error {
-	// cleanup all proving related columns
-	// set init_ready to false so that next new piece enables proving
-	//
-	// This creates a bit of an edge case when piece deletions, additions and proving happen in the same time window:
-	// - data set gets used, pieces are added and proven
-	// - all pieces are deleted from it
-	// - nextProvingPeriod gets called on an empty dataset
-	// - a new piece gets added, it sets `init_ready = TRUE`, but it is true already
-	// - prove task fires, detects that proving set is empty, challenge epoch is 0 (as the proving set is empty),
-	// 		proving gets disabled
-	// Now the dataset won't get proven until one more piece gets added to set `init_ready = TRUE`.
-	// Better pattern here would be to react to events emitted in our messages from the transactions we send to PDPVerifier.
-	// As ordering can get even more tricky if you consider that transactions are sent async.
-	_, err := p.db.Exec(ctx, `
-		UPDATE pdp_data_sets
-		SET challenge_request_msg_hash = NULL, prove_at_epoch = NULL, init_ready = FALSE,
-			prev_challenge_request_epoch = NULL
-		WHERE id = $1
-		`, dataSetId)
-	if err != nil {
-		return xerrors.Errorf("failed set values disabling proving: %w", err)
-	}
-	return nil
-}
-
-func (p *ProveTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-	ctx := context.Background()
-
+func (p *ProveTask) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
 	// Retrieve data set and challenge epoch for the task
 	var dataSetId int64
 
@@ -259,6 +233,7 @@ func (p *ProveTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done 
 			return true, nil
 		}
 	}
+	currentHeight := int64(ts.Height())
 
 	pdpContracts := contract.ContractAddresses()
 	pdpVerifierAddress := pdpContracts.PDPVerifier
@@ -271,10 +246,30 @@ func (p *ProveTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done 
 	// Proof parameters
 	challengeEpoch, err := pdpVerifier.GetNextChallengeEpoch(contract.EthCallOpts(ctx), big.NewInt(dataSetId))
 	if err != nil {
-		return false, xerrors.Errorf("failed to get next challenge epoch: %w", err)
+		return p.handleProvePreflightError(ctx, dataSetId, currentHeight, xerrors.Errorf("failed to get next challenge epoch: %w", err))
 	}
 
-	if challengeEpoch.Sign() == 0 { // if challengeEpoch is 0 (NO_CHALLENGE_SCHEDULED), we need to disable proving
+	if challengeEpoch.Sign() == 0 { // NO_CHALLENGE_SCHEDULED
+		// A zero challenge epoch has two causes since FilOzone/pdp#297, and they
+		// need opposite handling. Leaf count tells them apart.
+		leafCount, err := pdpVerifier.GetDataSetLeafCount(contract.EthCallOpts(ctx), big.NewInt(dataSetId))
+		if err != nil {
+			return p.handleProvePreflightError(ctx, dataSetId, currentHeight, xerrors.Errorf("failed to get data set leaf count: %w", err))
+		}
+
+		if leafCount.Sign() > 0 {
+			// Removals were processed before this period's proof, invalidating
+			// the challenge. There is nothing to prove this period, but the data
+			// set is healthy and its proving schedule is still valid. Complete
+			// without a proof and leave the schedule intact: the prove watcher
+			// already cleared challenge_request_msg_hash when it claimed this
+			// task, so the nextProvingPeriod watcher picks the data set up at
+			// prove_at_epoch + challenge_window and samples a fresh challenge.
+			log.Warnw("skipping proof; challenge invalidated by processed piece deletions",
+				"dataSetId", dataSetId, "taskID", taskID, "leafCount", leafCount.String())
+			return true, nil
+		}
+
 		log.Infow("disabling proving", "dataSetId", dataSetId, "taskID", taskID, "reason", "no challenge epoch")
 		err = p.disableProving(ctx, dataSetId)
 		if err != nil {
@@ -285,7 +280,7 @@ func (p *ProveTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done 
 
 	totalLeafCount, err := pdpVerifier.GetChallengeRange(contract.EthCallOpts(ctx), big.NewInt(dataSetId))
 	if err != nil {
-		return false, xerrors.Errorf("failed to get data set leaf count: %w", err)
+		return p.handleProvePreflightError(ctx, dataSetId, currentHeight, xerrors.Errorf("failed to get data set leaf count: %w", err))
 	}
 	if !totalLeafCount.IsUint64() {
 		return false, xerrors.Errorf("total leaf count is not uint64")
@@ -309,7 +304,7 @@ func (p *ProveTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done 
 
 	proofs, err := p.GenerateProofs(ctx, pdpVerifier, dataSetId, seed, totalLeaves, contract.NumChallenges)
 	if err != nil {
-		return false, xerrors.Errorf("failed to generate proofs: %w", err)
+		return p.handleProvePreflightError(ctx, dataSetId, currentHeight, xerrors.Errorf("failed to generate proofs: %w", err))
 	}
 
 	abiData, err := contract.PDPVerifierMetaData.GetAbi()
@@ -348,7 +343,7 @@ func (p *ProveTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done 
 	calcProofFeeResult := make([]any, 0)
 	err = pdpVerifierRaw.Call(contract.EthCallOpts(ctx), &calcProofFeeResult, "calculateProofFee", big.NewInt(dataSetId))
 	if err != nil {
-		return false, xerrors.Errorf("failed to calculate proof fee: %w", err)
+		return p.handleProvePreflightError(ctx, dataSetId, currentHeight, xerrors.Errorf("failed to calculate proof fee: %w", err))
 	}
 
 	if len(calcProofFeeResult) == 0 {
@@ -368,7 +363,7 @@ func (p *ProveTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done 
 	// Get the sender address for this data set
 	owner, _, err := pdpVerifier.GetDataSetStorageProvider(contract.EthCallOpts(ctx), big.NewInt(dataSetId))
 	if err != nil {
-		return false, xerrors.Errorf("failed to get owner: %w", err)
+		return p.handleProvePreflightError(ctx, dataSetId, currentHeight, xerrors.Errorf("failed to get owner: %w", err))
 	}
 
 	fromAddress, err := p.getSenderAddress(ctx, owner)
@@ -430,38 +425,8 @@ func (p *ProveTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done 
 	reason := "pdp-prove"
 	txHash, sendErr := p.sender.Send(ctx, fromAddress, txEth, reason)
 	if sendErr != nil {
-		// Get current height for error handling
-		ts, heightErr := p.fil.ChainHead(ctx)
-		if heightErr != nil {
-			// Can't get chain height, fall back to cached head
-			ts = p.head.Load()
-		}
-		if ts == nil {
-			// No chain state available, let harmony retry
-			return false, xerrors.Errorf("failed to send transaction (no chain state): %w", err)
-		}
-		currentHeight := int64(ts.Height())
-
-		comm, err := p.db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (commit bool, err error) {
-			handleErr := HandleProvingSendError(tx, dataSetId, currentHeight, sendErr)
-			if handleErr != nil {
-				return false, xerrors.Errorf("failed to handle proving send error: %w", handleErr)
-			}
-			return true, nil
-		}, harmonydb.OptionRetry())
-		if err != nil {
-			return false, xerrors.Errorf("failed to send transaction: %w", err)
-		}
-		if !comm {
-			return false, xerrors.Errorf("failed to commit transaction")
-		}
-		return true, nil
-	}
-
-	// Success, reset any accumulated failure count. We cannot fail the task here to avoid sending proof for same dataSet multiple times
-	// In case, this reset fails, it should be handled in task_chain_sync
-	if resetErr := ResetProvingFailures(ctx, p.db, dataSetId); resetErr != nil {
-		log.Warnw("Failed to reset proving failures after success", "error", resetErr, "dataSetId", dataSetId)
+		action := handleProveSendError(p.al, dataSetId, currentHeight, sendErr)
+		return p.applyProveErrorAction(ctx, dataSetId, currentHeight, action, xerrors.Errorf("failed to send transaction: %w", sendErr))
 	}
 
 	log.Infow("PDP Prove Task: transaction sent", "txHash", txHash, "dataSetId", dataSetId, "taskID", taskID)
@@ -598,7 +563,7 @@ func (p *ProveTask) genSubPieceMemtree(ctx context.Context, subPieceCid string, 
 // NOTE: On main branch, GetSharedPieceReader accepts v2 natively so this
 // conversion can be dropped when pdpv0 merges.
 type cprPieceReader struct {
-	cpr *cachedreader.CachedPieceReader
+	cpr PieceReader
 }
 
 func (r *cprPieceReader) GetPieceReader(ctx context.Context, pieceCid cid.Cid) (proof.SectionReadCloser, uint64, error) {
@@ -611,7 +576,7 @@ func (r *cprPieceReader) GetPieceReader(ctx context.Context, pieceCid cid.Cid) (
 
 // idxProofCache adapts IndexStore to the proof.ProofCache interface.
 type idxProofCache struct {
-	idx *indexstore.IndexStore
+	idx ProofCacheStore
 }
 
 func (c *idxProofCache) GetLayerIndex(ctx context.Context, pieceCidV2 cid.Cid) (bool, int, error) {
@@ -966,12 +931,18 @@ func (p *ProveTask) TypeDetails() harmonytask.TaskTypeDetails {
 	return harmonytask.TaskTypeDetails{
 		Name:          tasknames.PDPv0_Prove,
 		TimeSensitive: true,
+		// MayFollow must stay acyclic for harmonytask scheduling (see treehelper).
+		// PDPv0_ProvPeriod already follows PDPv0_Prove; do not list ProvPeriod here.
+		// Proving pipeline only: onboarding ends before PDPv0_InitPP (see task_init_pp);
+		// chain is PDPv0_InitPP → PDPv0_Prove → PDPv0_ProvPeriod.
+		MayFollow: []string{tasknames.PDPv0_InitPP},
 		Cost: resources.Resources{
 			Cpu: 1,
 			Gpu: 0,
 			Ram: proveTaskRAM,
 		},
 		MaxFailures: 5,
+		RetryWait:   taskhelp.RetryWaitExp(10*time.Second, 2),
 	}
 }
 
@@ -993,3 +964,126 @@ var (
 	_                           = harmonytask.Reg(&ProveTask{})
 	_ harmonytask.TaskInterface = &ProveTask{}
 )
+
+func (p *ProveTask) disableProving(ctx context.Context, dataSetId int64) error {
+	// Clear stale proving fields when PDPVerifier reports that the dataset has
+	// no challenge or leaves to prove. init_ready is false while the dataset is
+	// empty; with the schedule fields cleared, a later piece-add confirmation can
+	// make the dataset init-ready again.
+	_, err := p.db.Exec(ctx, `
+		UPDATE pdp_data_sets
+		SET challenge_request_msg_hash = NULL, prove_at_epoch = NULL, init_ready = FALSE,
+			prev_challenge_request_epoch = NULL,
+			pp_reconcile_needed = FALSE
+		WHERE id = $1
+		`, dataSetId)
+	if err != nil {
+		return xerrors.Errorf("failed set values disabling proving: %w", err)
+	}
+	return nil
+}
+
+type proveSendErrorAction int
+
+const (
+	proveSendErrorRetryTask proveSendErrorAction = iota
+	proveSendErrorCompleteTask
+	proveSendErrorTerminateDataset
+	proveSendErrorResetToInitPP
+)
+
+func (p *ProveTask) applyProveErrorAction(ctx context.Context, dataSetId int64, currentHeight int64, action proveSendErrorAction, taskErr error) (bool, error) {
+	switch action {
+	case proveSendErrorRetryTask:
+		return false, taskErr
+	case proveSendErrorCompleteTask:
+		return true, nil
+	case proveSendErrorTerminateDataset:
+		committed, err := p.db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (commit bool, err error) {
+			if err := markDatasetProvingUnrecoverableAndTerminate(tx, dataSetId, currentHeight); err != nil {
+				return false, err
+			}
+			return true, nil
+		}, harmonydb.OptionRetry())
+		if err != nil {
+			return false, xerrors.Errorf("failed to handle terminal proving error: %w", err)
+		}
+		if !committed {
+			return false, xerrors.Errorf("failed to commit terminal proving error handling")
+		}
+		log.Warnw("Terminal proving error, stopping proving attempts",
+			"dataSetId", dataSetId, "error", taskErr)
+		return true, nil
+	case proveSendErrorResetToInitPP:
+		if err := resetDatasetToInitPP(ctx, p.db, dataSetId); err != nil {
+			return false, xerrors.Errorf("failed to reset dataset to init proving period state: %w", err)
+		}
+		return true, nil
+	default:
+		return false, xerrors.Errorf("unknown prove error action")
+	}
+}
+
+func (p *ProveTask) handleProvePreflightError(ctx context.Context, dataSetId int64, currentHeight int64, err error) (bool, error) {
+	switch {
+	case IsUnrecoverableError(err), IsPDPVerifierDataSetNotFound(err):
+		return p.applyProveErrorAction(ctx, dataSetId, currentHeight, proveSendErrorTerminateDataset, err)
+	case IsUnexpectedProvingInvariantError(err):
+		emitProvingSendErrorAlert(p.al, alertNameProving, err)
+		return p.applyProveErrorAction(ctx, dataSetId, currentHeight, proveSendErrorRetryTask, err)
+	case IsContractRevert(err):
+		emitProvingSendErrorAlert(p.al, alertNameProving, err)
+		return p.applyProveErrorAction(ctx, dataSetId, currentHeight, proveSendErrorRetryTask, err)
+	default:
+		return p.applyProveErrorAction(ctx, dataSetId, currentHeight, proveSendErrorRetryTask, err)
+	}
+}
+
+func handleProveSendError(al curioalerting.AlertingInterface, dataSetId int64, currentHeight int64, sendErr error) proveSendErrorAction {
+	switch {
+	case IsRetrySameProvingPeriodError(sendErr):
+		// The proof is valid but too early for chain height. Return an error so
+		// Harmony retries the same prove task with RetryWait.
+		log.Warnw("Retrying same proving period after timing revert",
+			"dataSetId", dataSetId, "height", currentHeight, "error", sendErr)
+		return proveSendErrorRetryTask
+	case IsUnrecoverableError(sendErr):
+		// FWSS payment/dataset state says proving cannot recover. The caller
+		// owns the transaction that marks local state terminal and terminates FWSS.
+		return proveSendErrorTerminateDataset
+	case IsSkipCurrentProvingPeriodError(sendErr):
+		// The current proof no longer needs to be submitted for this period.
+		// Complete the task without changing schedule state.
+		log.Warnw("Skipping current proof after known contract revert",
+			"dataSetId", dataSetId, "height", currentHeight, "error", sendErr)
+		return proveSendErrorCompleteTask
+	case IsUnexpectedProvingInvariantError(sendErr):
+		// Curio should not hit these in the normal prove path. Alert and retry
+		// without mutating proving state so the condition can be investigated.
+		emitProvingSendErrorAlert(al, alertNameProving, sendErr)
+		return proveSendErrorRetryTask
+	case IsOperatorAttentionProvingError(sendErr):
+		// PDPVerifier rejected the caller before proof checking. This is an
+		// operator/config issue, not a normal proving-state recovery path.
+		emitProvingSendErrorAlert(al, alertNameProving, sendErr)
+		return proveSendErrorRetryTask
+	case IsProofGenerationFailureError(sendErr):
+		// PDPVerifier rejected the generated proof itself. Surface it instead
+		// of treating it as an unknown contract revert.
+		emitProvingSendErrorAlert(al, alertNameProving, sendErr)
+		return proveSendErrorRetryTask
+	case IsFWSSProvingNotStartedError(sendErr):
+		// PDPVerifier reached FWSS, but FWSS had no active proving deadline.
+		// Reset local schedule state so initPP re-establishes a FWSS deadline.
+		emitProvingSendErrorAlert(al, alertNameProving, sendErr)
+		return proveSendErrorResetToInitPP
+	case IsContractRevert(sendErr):
+		// Fallback for unclassified contract reverts: alert and let Harmony
+		// retry without mutating proving state.
+		emitProvingSendErrorAlert(al, alertNameProving, sendErr)
+		return proveSendErrorRetryTask
+	default:
+		// Non-contract send failures are transport/sender/task errors.
+		return proveSendErrorRetryTask
+	}
+}

@@ -19,8 +19,10 @@ import (
 	"github.com/filecoin-project/curio/lib/ffi"
 	"github.com/filecoin-project/curio/lib/passcall"
 	"github.com/filecoin-project/curio/lib/paths"
+	"github.com/filecoin-project/curio/lib/promise"
 	"github.com/filecoin-project/curio/lib/storiface"
 	"github.com/filecoin-project/curio/tasks/seal"
+	"github.com/filecoin-project/curio/tasks/tasknames"
 )
 
 type MoveStorageTask struct {
@@ -28,6 +30,8 @@ type MoveStorageTask struct {
 
 	sc *ffi.SealCalls
 	db *harmonydb.DB
+
+	adder promise.Promise[harmonytask.AddTaskFunc]
 }
 
 func NewMoveStorageTask(sc *ffi.SealCalls, db *harmonydb.DB, max int) *MoveStorageTask {
@@ -38,8 +42,7 @@ func NewMoveStorageTask(sc *ffi.SealCalls, db *harmonydb.DB, max int) *MoveStora
 	}
 }
 
-func (m *MoveStorageTask) Do(taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
-	ctx := context.Background()
+func (m *MoveStorageTask) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
 
 	var sectorParamsArr []struct {
 		SpID         int64 `db:"sp_id"`
@@ -124,8 +127,9 @@ func (m *MoveStorageTask) TypeDetails() harmonytask.TaskTypeDetails {
 	}
 
 	return harmonytask.TaskTypeDetails{
-		Max:  taskhelp.Max(m.max),
-		Name: "UpdateStore",
+		Max:       taskhelp.Max(m.max),
+		Name:      tasknames.UpdateStore,
+		MayFollow: []string{tasknames.UpdateEncode},
 		Cost: resources.Resources{
 			Cpu:     0,
 			Ram:     128 << 20,
@@ -142,42 +146,63 @@ func (m *MoveStorageTask) TypeDetails() harmonytask.TaskTypeDetails {
 }
 
 func (m *MoveStorageTask) schedule(ctx context.Context, taskFunc harmonytask.AddTaskFunc) error {
-	var stop bool
-	for !stop {
+	for {
+		stop := true
 		taskFunc(func(id harmonytask.TaskID, tx *harmonydb.Tx) (shouldCommit bool, seriousError error) {
-			stop = true // assume we're done until we find a task to schedule
-
-			var tasks []struct {
-				SpID         int64 `db:"sp_id"`
-				SectorNumber int64 `db:"sector_number"`
-			}
-
-			err := tx.Select(&tasks, `SELECT sp_id, sector_number FROM sectors_snap_pipeline WHERE after_encode = TRUE AND after_move_storage = FALSE AND task_id_move_storage IS NULL ORDER BY start_time ASC LIMIT 1`)
-			if err != nil {
-				return false, xerrors.Errorf("getting tasks: %w", err)
-			}
-
-			if len(tasks) == 0 {
-				return false, nil
-			}
-
-			t := tasks[0]
-
-			_, err = tx.Exec(`UPDATE sectors_snap_pipeline SET task_id_move_storage = $1 WHERE sp_id = $2 AND sector_number = $3 AND after_encode = TRUE AND after_move_storage = FALSE AND task_id_move_storage IS NULL`, id, t.SpID, t.SectorNumber)
+			n, err := tx.Exec(`WITH pending AS (
+					SELECT sp_id, sector_number
+					FROM sectors_snap_pipeline
+					WHERE after_encode = TRUE
+					  AND after_move_storage = FALSE
+					  AND task_id_move_storage IS NULL
+					ORDER BY start_time ASC
+					LIMIT 1
+				)
+				UPDATE sectors_snap_pipeline s
+				SET task_id_move_storage = $1
+				FROM pending
+				WHERE s.sp_id = pending.sp_id
+				  AND s.sector_number = pending.sector_number
+				  AND s.after_encode = TRUE
+				  AND s.after_move_storage = FALSE
+				  AND s.task_id_move_storage IS NULL`, id)
 			if err != nil {
 				return false, xerrors.Errorf("updating task id: %w", err)
+			}
+			if n == 0 {
+				return false, nil
+			}
+			if n != 1 {
+				return false, xerrors.Errorf("updated %d rows assigning move storage task", n)
 			}
 
 			stop = false // we found a task to schedule, keep going
 			return true, nil
 		})
-
+		if stop {
+			return nil
+		}
 	}
-
-	return nil
 }
 
 func (m *MoveStorageTask) Adder(taskFunc harmonytask.AddTaskFunc) {
+	m.adder.Set(taskFunc)
+}
+
+// Wake triggers an immediate schedule() pass without waiting for the next
+// IAmBored tick. Call this when an upstream task (e.g. UpdateEncode) completes
+// so MoveStorage picks up newly eligible sectors right away.
+func (m *MoveStorageTask) Wake() {
+	if m == nil || !m.adder.IsSet() {
+		return
+	}
+	taskFunc := m.adder.Val(context.Background())
+	if taskFunc == nil {
+		return
+	}
+	if err := m.schedule(context.Background(), taskFunc); err != nil {
+		log.Errorf("snap move-storage wake schedule: %s", err)
+	}
 }
 
 func (m *MoveStorageTask) taskToSector(id harmonytask.TaskID) (ffi.SectorRef, error) {
