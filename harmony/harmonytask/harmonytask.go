@@ -221,7 +221,7 @@ func New(
 			// edge-case: if old assignments are not available tasks, unlock them.
 			h := e.taskMap[w.Name]
 			if h == nil || !h.considerWork(WorkSourceRecover, []TaskID{TaskID(w.ID)}) {
-				_, err := db.Exec(e.ctx, `UPDATE harmony_task SET owner_id=NULL WHERE id=$1 AND owner_id=$2`, w.ID, e.ownerID)
+				_, err := db.Exec(e.ctx, `UPDATE harmony_task SET owner_id=NULL, work_start=NULL WHERE id=$1 AND owner_id=$2`, w.ID, e.ownerID)
 				if err != nil {
 					log.Errorw("Cannot remove self from owner field", "error", err)
 					continue // not really fatal, but not great
