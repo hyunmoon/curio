@@ -239,7 +239,8 @@ func (d *CurioStorageDealMarket) signalNextMK12(ctx context.Context, uuid string
 
 func (d *CurioStorageDealMarket) signalNextMK20(ctx context.Context, id string) {
 	var pieces []MK20PipelinePiece
-	err := d.db.Select(ctx, &pieces, `SELECT 
+	err := markAndLoadMK20Pieces(ctx, d.markMK20Downloaded, func(ctx context.Context) error {
+		return d.db.Select(ctx, &pieces, `SELECT
 		id, sp_id, contract, client, piece_cid_v2, piece_cid,
 		piece_size, raw_size, offline, url, indexing, announce,
 		allocation_id, duration, piece_aggregation, started,
@@ -248,8 +249,9 @@ func (d *CurioStorageDealMarket) signalNextMK20(ctx context.Context, id string) 
 		sector_offset, indexing_created_at, indexing_task_id, indexed
 	FROM market_mk20_pipeline
 	WHERE id = $1 AND complete = false`, id)
+	})
 	if err != nil {
-		log.Errorw("SignalNext MK20: select pipeline", "error", err, "id", id)
+		log.Errorw("SignalNext MK20: mark downloads and select pipeline", "error", err, "id", id)
 		return
 	}
 

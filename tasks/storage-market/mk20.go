@@ -564,7 +564,8 @@ func insertPiecesInTransaction(ctx context.Context, tx *harmonydb.Tx, deal *mk20
 
 func (d *CurioStorageDealMarket) processMK20DealPieces(ctx context.Context) {
 	var pieces []MK20PipelinePiece
-	err := d.db.Select(ctx, &pieces, `SELECT 
+	err := markAndLoadMK20Pieces(ctx, d.markMK20Downloaded, func(ctx context.Context) error {
+		return d.db.Select(ctx, &pieces, `SELECT
 											id,
 											sp_id,
 											contract,
@@ -598,8 +599,9 @@ func (d *CurioStorageDealMarket) processMK20DealPieces(ctx context.Context) {
 											market_mk20_pipeline
 										WHERE complete = false ORDER BY created_at ASC;
 										`)
+	})
 	if err != nil {
-		log.Errorw("failed to get deals from DB", "error", err)
+		log.Errorw("failed to mark downloads and get deals from DB", "error", err)
 		return
 	}
 
@@ -613,34 +615,37 @@ func (d *CurioStorageDealMarket) processMK20DealPieces(ctx context.Context) {
 
 }
 
-func (d *CurioStorageDealMarket) processMk20Pieces(ctx context.Context, piece MK20PipelinePiece) error {
-	err := d.downloadMk20Deal(ctx, piece)
-	if err != nil {
+func markAndLoadMK20Pieces(ctx context.Context, markDownloaded func(context.Context) error, loadPieces func(context.Context) error) error {
+	if err := markDownloaded(ctx); err != nil {
 		return err
 	}
 
-	err = d.findOfflineURLMk20Deal(ctx, piece)
-	if err != nil {
+	return loadPieces(ctx)
+}
+
+type mk20PieceStage func(context.Context, MK20PipelinePiece) error
+
+func processMk20PieceStages(ctx context.Context, piece MK20PipelinePiece, findOfflineURL, createCommP, addOffset mk20PieceStage) error {
+	if err := findOfflineURL(ctx, piece); err != nil {
 		return err
 	}
 
-	err = d.createCommPMk20Piece(ctx, piece)
-	if err != nil {
+	if err := createCommP(ctx, piece); err != nil {
 		return err
 	}
 
-	err = d.addDealOffset(ctx, piece)
-	if err != nil {
+	if err := addOffset(ctx, piece); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-// downloadMk20Deal handles the downloading process of an MK20 pipeline piece by scheduling it in the database and updating its status.
-// If the pieces are part of an aggregation deal then we download for short term otherwise,
-// we download for long term to avoid the need to have unsealed copy
-func (d *CurioStorageDealMarket) downloadMk20Deal(ctx context.Context, _ MK20PipelinePiece) error {
+func (d *CurioStorageDealMarket) processMk20Pieces(ctx context.Context, piece MK20PipelinePiece) error {
+	return processMk20PieceStages(ctx, piece, d.findOfflineURLMk20Deal, d.createCommPMk20Piece, d.addDealOffset)
+}
+
+func (d *CurioStorageDealMarket) markMK20Downloaded(ctx context.Context) error {
 	var n int
 	err := d.db.QueryRow(ctx, `SELECT mk20_ddo_mark_downloaded($1)`, mk20.ProductNameDDOV1).Scan(&n)
 	if err != nil {
