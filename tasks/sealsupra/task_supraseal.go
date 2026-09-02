@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	logging "github.com/ipfs/go-log/v2"
@@ -43,6 +44,7 @@ import (
 )
 
 const suprasealConfigEnv = "SUPRASEAL_CONFIG"
+const sectorAllocationChainTimeout = 30 * time.Second
 
 var log = logging.Logger("batchseal")
 
@@ -571,6 +573,74 @@ type sectorClaim struct {
 	TaskIDSDR    sql.NullInt64 `db:"task_id_sdr"`
 }
 
+type ccSchedule struct {
+	SpID         int64 `db:"sp_id"`
+	ToSeal       int64 `db:"to_seal"`
+	Weight       int64 `db:"weight"`
+	DurationDays int64 `db:"duration_days"`
+}
+
+type ccAllocation struct {
+	schedule       ccSchedule
+	count          int64
+	miner          address.Address
+	chainAllocated *bitfield.BitField
+}
+
+func planCCAllocations(schedules []ccSchedule, toSeal int64) ([]ccAllocation, error) {
+	var totalWeight int64
+	for _, schedule := range schedules {
+		totalWeight += schedule.Weight
+	}
+	if totalWeight <= 0 {
+		return nil, xerrors.Errorf("cannot plan CC allocations with total weight %d", totalWeight)
+	}
+
+	counts := make([]int64, len(schedules))
+	remaining := toSeal
+	for i, schedule := range schedules {
+		share := (toSeal * schedule.Weight) / totalWeight
+		quota := max(schedule.ToSeal, int64(0))
+		counts[i] = min(min(share, quota), remaining)
+		remaining -= counts[i]
+	}
+
+	// Integer rounding and quota caps can leave sectors undistributed. Walk
+	// the existing weight order and give one sector at a time only to
+	// providers which still have quota, preserving proportional fairness.
+	for remaining > 0 {
+		progressed := false
+		for i, schedule := range schedules {
+			quota := max(schedule.ToSeal, int64(0))
+			if counts[i] >= quota {
+				continue
+			}
+			counts[i]++
+			remaining--
+			progressed = true
+			if remaining == 0 {
+				break
+			}
+		}
+		if !progressed {
+			return nil, xerrors.Errorf("failed to plan expected number of sectors: %d remain of %d", remaining, toSeal)
+		}
+	}
+
+	allocations := make([]ccAllocation, 0, len(schedules))
+	for i, schedule := range schedules {
+		if counts[i] == 0 {
+			continue
+		}
+		allocations = append(allocations, ccAllocation{
+			schedule: schedule,
+			count:    counts[i],
+		})
+	}
+
+	return allocations, nil
+}
+
 func (s *SupraSeal) schedule(taskFunc harmonytask.AddTaskFunc) error {
 	if s.slots.Available() == 0 {
 		return nil
@@ -632,14 +702,13 @@ func (s *SupraSeal) schedule(taskFunc harmonytask.AddTaskFunc) error {
 }
 
 func (s *SupraSeal) claimsFromCCScheduler(tx *harmonydb.Tx, toSeal int64) ([]sectorClaim, error) {
-	var enabledSchedules []struct {
-		SpID         int64 `db:"sp_id"`
-		ToSeal       int64 `db:"to_seal"`
-		Weight       int64 `db:"weight"`
-		DurationDays int64 `db:"duration_days"`
-	}
+	var enabledSchedules []ccSchedule
 
-	err := tx.Select(&enabledSchedules, `SELECT sp_id, to_seal, weight, duration_days FROM sectors_cc_scheduler WHERE enabled = TRUE AND weight > 0 ORDER BY weight DESC`)
+	err := tx.Select(&enabledSchedules, `SELECT sp_id, to_seal, weight, duration_days
+		FROM sectors_cc_scheduler
+		WHERE enabled = TRUE AND weight > 0
+		ORDER BY sp_id ASC
+		FOR UPDATE`)
 	if err != nil {
 		return nil, xerrors.Errorf("getting enabled schedules: %w", err)
 	}
@@ -647,6 +716,13 @@ func (s *SupraSeal) claimsFromCCScheduler(tx *harmonydb.Tx, toSeal int64) ([]sec
 	if len(enabledSchedules) == 0 {
 		return nil, nil
 	}
+
+	sort.Slice(enabledSchedules, func(i, j int) bool {
+		if enabledSchedules[i].Weight == enabledSchedules[j].Weight {
+			return enabledSchedules[i].SpID < enabledSchedules[j].SpID
+		}
+		return enabledSchedules[i].Weight > enabledSchedules[j].Weight
+	})
 
 	var totalWeight, totalToSeal int64
 	for _, schedule := range enabledSchedules {
@@ -659,36 +735,51 @@ func (s *SupraSeal) claimsFromCCScheduler(tx *harmonydb.Tx, toSeal int64) ([]sec
 		return nil, nil
 	}
 
-	// Calculate proportional allocation based on weights
+	// Calculate proportional allocation before taking any per-provider locks.
+	// Some enabled providers may receive no sectors.
+	allocations, err := planCCAllocations(enabledSchedules, toSeal)
+	if err != nil {
+		return nil, err
+	}
+
+	// Fetch chain allocations before acquiring any provider locks. The task
+	// scheduler has no request context, so bound each RPC explicitly.
+	for i := range allocations {
+		maddr, err := address.NewIDAddress(uint64(allocations[i].schedule.SpID))
+		if err != nil {
+			return nil, xerrors.Errorf("getting miner address for %d: %w", allocations[i].schedule.SpID, err)
+		}
+
+		chainCtx, cancel := context.WithTimeout(context.Background(), sectorAllocationChainTimeout)
+		chainAllocated, err := s.api.StateMinerAllocated(chainCtx, maddr, types.EmptyTSK)
+		cancel()
+		if err != nil {
+			return nil, xerrors.Errorf("getting on-chain allocated sector numbers for %d: %w", allocations[i].schedule.SpID, err)
+		}
+
+		allocations[i].miner = maddr
+		allocations[i].chainAllocated = chainAllocated
+	}
+
+	// This transaction can allocate for more than one provider. Acquire only
+	// the selected providers' locks in stable order before returning to the
+	// weighted scheduling order, avoiding cross-provider deadlocks.
+	lockOrder := append([]ccAllocation(nil), allocations...)
+	sort.Slice(lockOrder, func(i, j int) bool {
+		return lockOrder[i].schedule.SpID < lockOrder[j].schedule.SpID
+	})
+	for _, allocation := range lockOrder {
+		if err := seal.LockSectorState(tx, allocation.schedule.SpID); err != nil {
+			return nil, err
+		}
+	}
+
 	var outClaims []sectorClaim
-	remainingToSeal := toSeal
-
-	for i, schedule := range enabledSchedules {
-		if remainingToSeal <= 0 {
-			break
-		}
-
-		// Calculate how many sectors this SP should get based on weight
-		var sectorsForSP int64
-		if i == len(enabledSchedules)-1 {
-			// Last SP gets the remaining sectors
-			sectorsForSP = remainingToSeal
-		} else {
-			// Proportional allocation based on weight
-			sectorsForSP = min(min((toSeal*schedule.Weight)/totalWeight, schedule.ToSeal), remainingToSeal)
-		}
-
-		if sectorsForSP == 0 {
-			continue
-		}
+	for _, allocation := range allocations {
+		schedule := allocation.schedule
 
 		// Allocate sector numbers for this SP
-		maddr, err := address.NewIDAddress(uint64(schedule.SpID))
-		if err != nil {
-			return nil, xerrors.Errorf("getting miner address for %d: %w", schedule.SpID, err)
-		}
-
-		sectorNumbers, err := seal.AllocateSectorNumbers(context.Background(), s.api, tx, maddr, int(sectorsForSP))
+		sectorNumbers, err := seal.AllocateSectorNumbersFromChain(tx, allocation.miner, allocation.chainAllocated, int(allocation.count))
 		if err != nil {
 			return nil, xerrors.Errorf("allocating sector numbers for %d: %w", schedule.SpID, err)
 		}
@@ -720,13 +811,12 @@ func (s *SupraSeal) claimsFromCCScheduler(tx *harmonydb.Tx, toSeal int64) ([]sec
 		}
 
 		// Update the to_seal count for this SP
-		_, err = tx.Exec(`UPDATE sectors_cc_scheduler SET to_seal = to_seal - $1 WHERE sp_id = $2`, sectorsForSP, schedule.SpID)
+		_, err = tx.Exec(`UPDATE sectors_cc_scheduler SET to_seal = to_seal - $1 WHERE sp_id = $2`, allocation.count, schedule.SpID)
 		if err != nil {
 			return nil, xerrors.Errorf("updating to_seal for SP %d: %w", schedule.SpID, err)
 		}
 
-		remainingToSeal -= sectorsForSP
-		log.Debugw("allocated sectors from CC scheduler", "sp_id", schedule.SpID, "count", sectorsForSP, "remaining", remainingToSeal, "totalWeight", totalWeight, "totalToSeal", totalToSeal)
+		log.Debugw("allocated sectors from CC scheduler", "sp_id", schedule.SpID, "count", allocation.count, "totalWeight", totalWeight, "totalToSeal", totalToSeal)
 	}
 
 	if len(outClaims) != int(toSeal) {

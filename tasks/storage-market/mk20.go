@@ -31,6 +31,7 @@ import (
 	"github.com/filecoin-project/curio/lib/commcidv2"
 	"github.com/filecoin-project/curio/lib/parkpiece"
 	"github.com/filecoin-project/curio/market/mk20"
+	"github.com/filecoin-project/curio/tasks/seal"
 
 	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/proofs"
@@ -957,6 +958,67 @@ func (d *CurioStorageDealMarket) processMK20DealAggregation(ctx context.Context)
 
 }
 
+type mk20SectorAssignment struct {
+	sector abi.SectorNumber
+	proof  abi.RegisteredSealProof
+}
+
+type mk20IngestClaim func() (aggrIndex int64, ready bool, err error)
+type mk20IngestAllocate func() (mk20SectorAssignment, error)
+type mk20IngestPersist func(assignment mk20SectorAssignment, aggrIndex int64) (bool, error)
+
+func runMK20IngestTransaction(claim mk20IngestClaim, allocate mk20IngestAllocate, persist mk20IngestPersist) (bool, error) {
+	aggrIndex, ready, err := claim()
+	if err != nil || !ready {
+		return false, err
+	}
+
+	assignment, err := allocate()
+	if err != nil {
+		return false, err
+	}
+
+	return persist(assignment, aggrIndex)
+}
+
+func claimMK20IngestRow(tx *harmonydb.Tx, spID int64, dealID string) (int64, bool, error) {
+	if err := seal.LockSectorState(tx, spID); err != nil {
+		return 0, false, err
+	}
+
+	var readyRows []struct {
+		AggrIndex int64 `db:"aggr_index"`
+	}
+	err := tx.Select(&readyRows, `SELECT aggr_index
+		FROM market_mk20_pipeline
+		WHERE id = $1 AND sp_id = $2 AND aggregated = TRUE AND sector IS NULL
+		FOR UPDATE`, dealID, spID)
+	if err != nil {
+		return 0, false, xerrors.Errorf("locking deal before sector allocation: %w", err)
+	}
+	if len(readyRows) == 0 {
+		return 0, false, nil
+	}
+	if len(readyRows) != 1 {
+		return 0, false, xerrors.Errorf("expected one unassigned aggregate row for deal %s, got %d", dealID, len(readyRows))
+	}
+	return readyRows[0].AggrIndex, true, nil
+}
+
+func persistMK20IngestAssignment(tx *harmonydb.Tx, spID int64, dealID string, assignment mk20SectorAssignment, aggrIndex int64) (bool, error) {
+	n, err := tx.Exec(`UPDATE market_mk20_pipeline
+		SET sector = $1, reg_seal_proof = $2
+		WHERE id = $3 AND aggr_index = $4 AND sp_id = $5 AND aggregated = TRUE AND sector IS NULL`,
+		assignment.sector, assignment.proof, dealID, aggrIndex, spID)
+	if err != nil {
+		return false, xerrors.Errorf("failed to update deal: %w", err)
+	}
+	if n != 1 {
+		return false, xerrors.Errorf("failed to claim deal %s after sector allocation: updated %d rows", dealID, n)
+	}
+	return true, nil
+}
+
 func (d *CurioStorageDealMarket) processMK20DealIngestion(ctx context.Context) {
 
 	head, err := d.api.ChainHead(ctx)
@@ -1138,23 +1200,31 @@ func (d *CurioStorageDealMarket) processMK20DealIngestion(ctx context.Context) {
 		}
 
 		comm, err := d.db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (commit bool, err error) {
-			sector, sp, err := d.pin.AllocatePieceToSector(ctx, tx, maddr, pdi, deal.RawSize, *aurl, nil)
-			if err != nil {
-				return false, xerrors.Errorf("failed to allocate piece to sector: %w", err)
-			}
-
-			n, err := tx.Exec(`UPDATE market_mk20_pipeline SET sector = $1, reg_seal_proof = $2 WHERE id = $3`, *sector, *sp, deal.ID)
-			if err != nil {
-				return false, xerrors.Errorf("failed to update deal: %w", err)
-			}
-
-			return n == 1, nil
+			return runMK20IngestTransaction(
+				func() (int64, bool, error) {
+					if d.pin == nil {
+						return 0, false, xerrors.Errorf("piece ingester is not initialized")
+					}
+					return claimMK20IngestRow(tx, deal.SPID, deal.ID)
+				},
+				func() (mk20SectorAssignment, error) {
+					sector, sp, err := d.pin.AllocatePieceToSector(ctx, tx, maddr, pdi, deal.RawSize, *aurl, nil)
+					if err != nil {
+						return mk20SectorAssignment{}, xerrors.Errorf("failed to allocate piece to sector: %w", err)
+					}
+					return mk20SectorAssignment{sector: *sector, proof: *sp}, nil
+				},
+				func(assignment mk20SectorAssignment, aggrIndex int64) (bool, error) {
+					return persistMK20IngestAssignment(tx, deal.SPID, deal.ID, assignment, aggrIndex)
+				},
+			)
 		}, harmonydb.OptionRetry())
 		if err != nil {
 			log.Errorf("failed to commit transaction: %s", err)
 			continue
 		}
 		if comm {
+			d.pin.Wake()
 			log.Infow("deal ingested successfully", "deal", deal)
 		} else {
 			log.Infow("deal not ingested", "deal", deal)

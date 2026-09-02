@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/filecoin-project/go-state-types/abi"
 )
 
 func TestFullMK20PollRunsGlobalStagesInOrder(t *testing.T) {
@@ -257,5 +260,71 @@ func TestProcessMK20PieceStagesPreservesOrdering(t *testing.T) {
 	want := []string{"offline", "commp", "offset"}
 	if !reflect.DeepEqual(stages, want) {
 		t.Fatalf("stages = %v, want %v", stages, want)
+	}
+}
+
+func TestConcurrentMK20IngestionAllocatesRequestedDealOnce(t *testing.T) {
+	type result struct {
+		committed bool
+		err       error
+	}
+
+	var transactionMu sync.Mutex
+	assigned := false
+	allocations := 0
+	openPieces := 0
+	start := make(chan struct{})
+	results := make(chan result, 2)
+
+	for range 2 {
+		go func() {
+			<-start
+			transactionMu.Lock()
+			defer transactionMu.Unlock()
+
+			committed, err := runMK20IngestTransaction(
+				func() (int64, bool, error) {
+					return 0, !assigned, nil
+				},
+				func() (mk20SectorAssignment, error) {
+					allocations++
+					openPieces++
+					return mk20SectorAssignment{
+						sector: abi.SectorNumber(allocations),
+						proof:  abi.RegisteredSealProof_StackedDrg32GiBV1_1,
+					}, nil
+				},
+				func(mk20SectorAssignment, int64) (bool, error) {
+					if assigned {
+						return false, errors.New("deal already assigned")
+					}
+					assigned = true
+					return true, nil
+				},
+			)
+			results <- result{committed: committed, err: err}
+		}()
+	}
+
+	close(start)
+	commits := 0
+	for range 2 {
+		got := <-results
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if got.committed {
+			commits++
+		}
+	}
+
+	if commits != 1 {
+		t.Fatalf("committed transactions = %d, want 1", commits)
+	}
+	if allocations != 1 {
+		t.Fatalf("sector allocations = %d, want 1", allocations)
+	}
+	if openPieces != 1 {
+		t.Fatalf("open-sector pieces = %d, want 1", openPieces)
 	}
 }
