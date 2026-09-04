@@ -31,6 +31,7 @@ import (
 	"github.com/filecoin-project/curio/lib/commcidv2"
 	"github.com/filecoin-project/curio/lib/parkpiece"
 	"github.com/filecoin-project/curio/market/mk20"
+	"github.com/filecoin-project/curio/tasks/seal"
 
 	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/proofs"
@@ -87,10 +88,15 @@ func (d *CurioStorageDealMarket) processMK20Deals(ctx context.Context) {
 			log.Errorf("panic occurred: %v\n%s", r, trace[:n])
 		}
 	}()
-	d.processMK20DealPieces(ctx)
-	//d.downloadMk20Deal(ctx)
-	d.processMK20DealAggregation(ctx)
-	d.processMK20DealIngestion(ctx)
+	runMK20PollStages(ctx, d.processMK20DealPieces, d.processMK20DealAggregation, d.processMK20DealIngestion)
+}
+
+type mk20PollStage func(context.Context)
+
+func runMK20PollStages(ctx context.Context, processPieces, processAggregation, processIngestion mk20PollStage) {
+	processPieces(ctx)
+	processAggregation(ctx)
+	processIngestion(ctx)
 }
 
 func (d *CurioStorageDealMarket) pipelineInsertLoop(ctx context.Context) {
@@ -564,7 +570,8 @@ func insertPiecesInTransaction(ctx context.Context, tx *harmonydb.Tx, deal *mk20
 
 func (d *CurioStorageDealMarket) processMK20DealPieces(ctx context.Context) {
 	var pieces []MK20PipelinePiece
-	err := d.db.Select(ctx, &pieces, `SELECT 
+	err := markAndLoadMK20Pieces(ctx, d.markMK20Downloaded, func(ctx context.Context) error {
+		return d.db.Select(ctx, &pieces, `SELECT
 											id,
 											sp_id,
 											contract,
@@ -598,8 +605,9 @@ func (d *CurioStorageDealMarket) processMK20DealPieces(ctx context.Context) {
 											market_mk20_pipeline
 										WHERE complete = false ORDER BY created_at ASC;
 										`)
+	})
 	if err != nil {
-		log.Errorw("failed to get deals from DB", "error", err)
+		log.Errorw("failed to mark downloads and get deals from DB", "error", err)
 		return
 	}
 
@@ -613,34 +621,41 @@ func (d *CurioStorageDealMarket) processMK20DealPieces(ctx context.Context) {
 
 }
 
-func (d *CurioStorageDealMarket) processMk20Pieces(ctx context.Context, piece MK20PipelinePiece) error {
-	err := d.downloadMk20Deal(ctx, piece)
-	if err != nil {
+func markAndLoadMK20Pieces(ctx context.Context, markDownloaded func(context.Context) error, loadPieces func(context.Context) error) error {
+	if err := markDownloaded(ctx); err != nil {
 		return err
 	}
 
-	err = d.findOfflineURLMk20Deal(ctx, piece)
-	if err != nil {
+	return loadMK20Pieces(ctx, loadPieces)
+}
+
+func loadMK20Pieces(ctx context.Context, loadPieces func(context.Context) error) error {
+	return loadPieces(ctx)
+}
+
+type mk20PieceStage func(context.Context, MK20PipelinePiece) error
+
+func processMk20PieceStages(ctx context.Context, piece MK20PipelinePiece, findOfflineURL, createCommP, addOffset mk20PieceStage) error {
+	if err := findOfflineURL(ctx, piece); err != nil {
 		return err
 	}
 
-	err = d.createCommPMk20Piece(ctx, piece)
-	if err != nil {
+	if err := createCommP(ctx, piece); err != nil {
 		return err
 	}
 
-	err = d.addDealOffset(ctx, piece)
-	if err != nil {
+	if err := addOffset(ctx, piece); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-// downloadMk20Deal handles the downloading process of an MK20 pipeline piece by scheduling it in the database and updating its status.
-// If the pieces are part of an aggregation deal then we download for short term otherwise,
-// we download for long term to avoid the need to have unsealed copy
-func (d *CurioStorageDealMarket) downloadMk20Deal(ctx context.Context, _ MK20PipelinePiece) error {
+func (d *CurioStorageDealMarket) processMk20Pieces(ctx context.Context, piece MK20PipelinePiece) error {
+	return processMk20PieceStages(ctx, piece, d.findOfflineURLMk20Deal, d.createCommPMk20Piece, d.addDealOffset)
+}
+
+func (d *CurioStorageDealMarket) markMK20Downloaded(ctx context.Context) error {
 	var n int
 	err := d.db.QueryRow(ctx, `SELECT mk20_ddo_mark_downloaded($1)`, mk20.ProductNameDDOV1).Scan(&n)
 	if err != nil {
@@ -943,6 +958,67 @@ func (d *CurioStorageDealMarket) processMK20DealAggregation(ctx context.Context)
 
 }
 
+type mk20SectorAssignment struct {
+	sector abi.SectorNumber
+	proof  abi.RegisteredSealProof
+}
+
+type mk20IngestClaim func() (aggrIndex int64, ready bool, err error)
+type mk20IngestAllocate func() (mk20SectorAssignment, error)
+type mk20IngestPersist func(assignment mk20SectorAssignment, aggrIndex int64) (bool, error)
+
+func runMK20IngestTransaction(claim mk20IngestClaim, allocate mk20IngestAllocate, persist mk20IngestPersist) (bool, error) {
+	aggrIndex, ready, err := claim()
+	if err != nil || !ready {
+		return false, err
+	}
+
+	assignment, err := allocate()
+	if err != nil {
+		return false, err
+	}
+
+	return persist(assignment, aggrIndex)
+}
+
+func claimMK20IngestRow(tx *harmonydb.Tx, spID int64, dealID string) (int64, bool, error) {
+	if err := seal.LockSectorState(tx, spID); err != nil {
+		return 0, false, err
+	}
+
+	var readyRows []struct {
+		AggrIndex int64 `db:"aggr_index"`
+	}
+	err := tx.Select(&readyRows, `SELECT aggr_index
+		FROM market_mk20_pipeline
+		WHERE id = $1 AND sp_id = $2 AND aggregated = TRUE AND sector IS NULL
+		FOR UPDATE`, dealID, spID)
+	if err != nil {
+		return 0, false, xerrors.Errorf("locking deal before sector allocation: %w", err)
+	}
+	if len(readyRows) == 0 {
+		return 0, false, nil
+	}
+	if len(readyRows) != 1 {
+		return 0, false, xerrors.Errorf("expected one unassigned aggregate row for deal %s, got %d", dealID, len(readyRows))
+	}
+	return readyRows[0].AggrIndex, true, nil
+}
+
+func persistMK20IngestAssignment(tx *harmonydb.Tx, spID int64, dealID string, assignment mk20SectorAssignment, aggrIndex int64) (bool, error) {
+	n, err := tx.Exec(`UPDATE market_mk20_pipeline
+		SET sector = $1, reg_seal_proof = $2
+		WHERE id = $3 AND aggr_index = $4 AND sp_id = $5 AND aggregated = TRUE AND sector IS NULL`,
+		assignment.sector, assignment.proof, dealID, aggrIndex, spID)
+	if err != nil {
+		return false, xerrors.Errorf("failed to update deal: %w", err)
+	}
+	if n != 1 {
+		return false, xerrors.Errorf("failed to claim deal %s after sector allocation: updated %d rows", dealID, n)
+	}
+	return true, nil
+}
+
 func (d *CurioStorageDealMarket) processMK20DealIngestion(ctx context.Context) {
 
 	head, err := d.api.ChainHead(ctx)
@@ -1124,23 +1200,31 @@ func (d *CurioStorageDealMarket) processMK20DealIngestion(ctx context.Context) {
 		}
 
 		comm, err := d.db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (commit bool, err error) {
-			sector, sp, err := d.pin.AllocatePieceToSector(ctx, tx, maddr, pdi, deal.RawSize, *aurl, nil)
-			if err != nil {
-				return false, xerrors.Errorf("failed to allocate piece to sector: %w", err)
-			}
-
-			n, err := tx.Exec(`UPDATE market_mk20_pipeline SET sector = $1, reg_seal_proof = $2 WHERE id = $3`, *sector, *sp, deal.ID)
-			if err != nil {
-				return false, xerrors.Errorf("failed to update deal: %w", err)
-			}
-
-			return n == 1, nil
+			return runMK20IngestTransaction(
+				func() (int64, bool, error) {
+					if d.pin == nil {
+						return 0, false, xerrors.Errorf("piece ingester is not initialized")
+					}
+					return claimMK20IngestRow(tx, deal.SPID, deal.ID)
+				},
+				func() (mk20SectorAssignment, error) {
+					sector, sp, err := d.pin.AllocatePieceToSector(ctx, tx, maddr, pdi, deal.RawSize, *aurl, nil)
+					if err != nil {
+						return mk20SectorAssignment{}, xerrors.Errorf("failed to allocate piece to sector: %w", err)
+					}
+					return mk20SectorAssignment{sector: *sector, proof: *sp}, nil
+				},
+				func(assignment mk20SectorAssignment, aggrIndex int64) (bool, error) {
+					return persistMK20IngestAssignment(tx, deal.SPID, deal.ID, assignment, aggrIndex)
+				},
+			)
 		}, harmonydb.OptionRetry())
 		if err != nil {
 			log.Errorf("failed to commit transaction: %s", err)
 			continue
 		}
 		if comm {
+			d.pin.Wake()
 			log.Infow("deal ingested successfully", "deal", deal)
 		} else {
 			log.Infow("deal not ingested", "deal", deal)
