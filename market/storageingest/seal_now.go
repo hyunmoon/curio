@@ -10,6 +10,7 @@ import (
 	"github.com/filecoin-project/go-state-types/network"
 
 	"github.com/filecoin-project/curio/harmony/harmonydb"
+	"github.com/filecoin-project/curio/tasks/seal"
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
@@ -45,6 +46,10 @@ func SealNow(ctx context.Context, node SealNowNodeApi, db *harmonydb.DB, act add
 	}
 
 	comm, err := db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (commit bool, err error) {
+		if err := seal.LockSectorState(tx, int64(mid)); err != nil {
+			return false, err
+		}
+
 		// Get current open sector pieces from DB
 		var pieces []struct {
 			Sector abi.SectorNumber    `db:"sector_number"`

@@ -41,6 +41,7 @@ import (
 	"github.com/filecoin-project/curio/market/mk12/legacytypes"
 	"github.com/filecoin-project/curio/market/mk20"
 	"github.com/filecoin-project/curio/market/storageingest"
+	"github.com/filecoin-project/curio/tasks/seal"
 
 	lminer "github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/proofs"
@@ -72,7 +73,7 @@ type storageMarketAPI interface {
 type CurioStorageDealMarket struct {
 	cfg         *config.CurioConfig
 	db          *harmonydb.DB
-	pin         storageingest.Ingester
+	pin         storageingest.WakingIngester
 	miners      *config.Dynamic[[]address.Address]
 	api         storageMarketAPI
 	MK12Handler *mk12.MK12
@@ -1009,16 +1010,20 @@ func (d *CurioStorageDealMarket) ingestDeal(ctx context.Context, deal MK12Pipeli
 			return false, xerrors.Errorf("UUID: %s: %w", deal.UUID, err)
 		}
 
-		var shouldProceed bool
-
-		err = tx.QueryRow(`SELECT EXISTS(SELECT TRUE FROM market_mk12_deal_pipeline WHERE uuid = $1 AND sector IS NULL)`, deal.UUID).Scan(&shouldProceed)
-		if err != nil {
-			return false, xerrors.Errorf("failed to check status in DB before adding to sector: %w", err)
+		if err := seal.LockSectorState(tx, deal.SpID); err != nil {
+			return false, err
 		}
 
-		if !shouldProceed {
-			// Exit early
-			return false, xerrors.Errorf("deal %s already added to sector by another process", deal.UUID)
+		var lockedUUID string
+		err = tx.QueryRow(`SELECT uuid
+			FROM market_mk12_deal_pipeline
+			WHERE uuid = $1 AND sector IS NULL
+			FOR UPDATE`, deal.UUID).Scan(&lockedUUID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return false, xerrors.Errorf("deal %s already added to sector by another process", deal.UUID)
+			}
+			return false, xerrors.Errorf("failed to lock deal before adding to sector: %w", err)
 		}
 
 		var sp *abi.RegisteredSealProof
@@ -1049,6 +1054,7 @@ func (d *CurioStorageDealMarket) ingestDeal(ctx context.Context, deal MK12Pipeli
 		return xerrors.Errorf("UUID: %s: failed to commit transaction: %w", deal.UUID, err)
 	}
 
+	d.pin.Wake()
 	log.Infof("Added deal %s to sector %d", deal.UUID, *sector)
 	return nil
 }
