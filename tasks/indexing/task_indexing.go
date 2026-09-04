@@ -602,16 +602,12 @@ func (i *IndexingTask) Wake() {
 	}
 }
 
-func (i *IndexingTask) GetSpid(db *harmonydb.DB, taskID int64) string {
-	var spid string
-	err := db.QueryRow(context.Background(), `SELECT sp_id FROM market_mk12_deal_pipeline WHERE indexing_task_id = $1
-													UNION ALL
-													SELECT sp_id FROM market_mk20_pipeline WHERE indexing_task_id = $1`, taskID).Scan(&spid)
-	if err != nil {
-		log.Errorf("getting spid: %s", err)
-		return ""
-	}
-	return spid
+func (i *IndexingTask) GetSpids(ctx context.Context, db *harmonydb.DB, taskIDs []int64) ([]harmonytask.TaskSPID, error) {
+	var spids []harmonytask.TaskSPID
+	err := db.Select(ctx, &spids, `SELECT indexing_task_id AS task_id, sp_id FROM market_mk12_deal_pipeline WHERE indexing_task_id = ANY($1::BIGINT[])
+		UNION ALL
+		SELECT indexing_task_id AS task_id, sp_id FROM market_mk20_pipeline WHERE indexing_task_id = ANY($1::BIGINT[])`, taskIDs)
+	return spids, err
 }
 
 var _ = harmonytask.Reg(&IndexingTask{})

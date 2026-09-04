@@ -188,13 +188,10 @@ func (t *TaskUnsealSdr) schedule(ctx context.Context, taskFunc harmonytask.AddTa
 func (t *TaskUnsealSdr) Adder(taskFunc harmonytask.AddTaskFunc) {
 }
 
-func (t *TaskUnsealSdr) GetSpid(db *harmonydb.DB, taskID int64) string {
-	sid, err := t.GetSectorID(db, taskID)
-	if err != nil {
-		log.Errorf("getting sector id: %s", err)
-		return ""
-	}
-	return sid.Miner.String()
+func (t *TaskUnsealSdr) GetSpids(ctx context.Context, db *harmonydb.DB, taskIDs []int64) ([]harmonytask.TaskSPID, error) {
+	var spids []harmonytask.TaskSPID
+	err := db.Select(ctx, &spids, `SELECT task_id_unseal_sdr AS task_id, sp_id FROM sectors_unseal_pipeline WHERE task_id_unseal_sdr = ANY($1::BIGINT[])`, taskIDs)
+	return spids, err
 }
 
 func (t *TaskUnsealSdr) GetSectorID(db *harmonydb.DB, taskID int64) (*abi.SectorID, error) {

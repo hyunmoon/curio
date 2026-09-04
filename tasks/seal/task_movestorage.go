@@ -202,13 +202,10 @@ func (m *MoveStorageTask) TypeDetails() harmonytask.TaskTypeDetails {
 	}
 }
 
-func (m *MoveStorageTask) GetSpid(db *harmonydb.DB, taskID int64) string {
-	sid, err := m.GetSectorID(db, taskID)
-	if err != nil {
-		log.Errorf("getting sector id: %s", err)
-		return ""
-	}
-	return sid.Miner.String()
+func (m *MoveStorageTask) GetSpids(ctx context.Context, db *harmonydb.DB, taskIDs []int64) ([]harmonytask.TaskSPID, error) {
+	var spids []harmonytask.TaskSPID
+	err := db.Select(ctx, &spids, `SELECT task_id_move_storage AS task_id, sp_id FROM sectors_sdr_pipeline WHERE task_id_move_storage = ANY($1::BIGINT[])`, taskIDs)
+	return spids, err
 }
 
 func (m *MoveStorageTask) GetSectorID(db *harmonydb.DB, taskID int64) (*abi.SectorID, error) {

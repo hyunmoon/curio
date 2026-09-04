@@ -346,13 +346,10 @@ func (e *EncodeTask) taskToSector(id harmonytask.TaskID) (ffi.SectorRef, error) 
 	return refs[0], nil
 }
 
-func (e *EncodeTask) GetSpid(db *harmonydb.DB, taskID int64) string {
-	sid, err := e.GetSectorID(db, taskID)
-	if err != nil {
-		log.Errorf("getting sector id: %s", err)
-		return ""
-	}
-	return sid.Miner.String()
+func (e *EncodeTask) GetSpids(ctx context.Context, db *harmonydb.DB, taskIDs []int64) ([]harmonytask.TaskSPID, error) {
+	var spids []harmonytask.TaskSPID
+	err := db.Select(ctx, &spids, `SELECT task_id_encode AS task_id, sp_id FROM sectors_snap_pipeline WHERE task_id_encode = ANY($1::BIGINT[])`, taskIDs)
+	return spids, err
 }
 
 func (e *EncodeTask) GetSectorID(db *harmonydb.DB, taskID int64) (*abi.SectorID, error) {

@@ -931,13 +931,10 @@ func (s *SubmitTask) notifySealed() {
 	}()
 }
 
-func (s *SubmitTask) GetSpid(db *harmonydb.DB, taskID int64) string {
-	sid, err := s.GetSectorID(db, taskID)
-	if err != nil {
-		log.Errorf("getting sector id: %s", err)
-		return ""
-	}
-	return sid.Miner.String()
+func (s *SubmitTask) GetSpids(ctx context.Context, db *harmonydb.DB, taskIDs []int64) ([]harmonytask.TaskSPID, error) {
+	var spids []harmonytask.TaskSPID
+	err := db.Select(ctx, &spids, `SELECT task_id_submit AS task_id, sp_id FROM sectors_snap_pipeline WHERE task_id_submit = ANY($1::BIGINT[])`, taskIDs)
+	return spids, err
 }
 
 func (s *SubmitTask) GetSectorID(db *harmonydb.DB, taskID int64) (*abi.SectorID, error) {

@@ -1,6 +1,7 @@
 import {LitElement, html, css} from 'https://cdn.jsdelivr.net/gh/lit/dist@3/all/lit-all.min.js';
 import RPCCall from '/lib/jsonrpc.mjs';
 import { pollRPC } from '/lib/poll.mjs';
+import {groupConsecutiveTasks} from '/cluster-tasks-grouping.mjs';
 
 class ClusterTasks extends LitElement {
   static get properties() {
@@ -78,29 +79,7 @@ class ClusterTasks extends LitElement {
    * Returns an array of groups, where each group is an array of entries.
    */
   groupData(data) {
-    const groups = [];
-    let currentGroup = [];
-    let currentKey = null;
-
-    for (const entry of data) {
-      // The grouping key is the triplet: [SpID, Name, OwnerID]
-      const key = JSON.stringify([entry.SpID, entry.Name, entry.OwnerID]);
-      if (key !== currentKey) {
-        if (currentGroup.length > 0) {
-          groups.push(currentGroup);
-        }
-        currentGroup = [entry];
-        currentKey = key;
-      } else {
-        currentGroup.push(entry);
-      }
-    }
-    // Push the last group
-    if (currentGroup.length > 0) {
-      groups.push(currentGroup);
-    }
-
-    return groups;
+    return groupConsecutiveTasks(data);
   }
 
   /**
@@ -149,31 +128,10 @@ class ClusterTasks extends LitElement {
         (entry) => this.showBackgroundTasks || !entry.Name.startsWith('bg:')
     );
 
-    let sortedOrOriginal = filtered;
-
-    // In coalesced mode, we sort by [Name -> SpID -> OwnerID]
-    // Otherwise, leave data in its default order (e.g., posted time).
-    if (this.coalesceEntries) {
-      sortedOrOriginal = [...filtered].sort((a, b) => {
-        const nameCmp = a.Name.localeCompare(b.Name);
-        if (nameCmp !== 0) return nameCmp;
-        // If SpID is numeric, do numeric sort, else compare as strings
-        const spA = typeof a.SpID === 'number' ? a.SpID : Number.parseInt(a.SpID, 10) || a.SpID;
-        const spB = typeof b.SpID === 'number' ? b.SpID : Number.parseInt(b.SpID, 10) || b.SpID;
-        const spCmp = spA > spB ? 1 : spA < spB ? -1 : 0;
-        if (spCmp !== 0) return spCmp;
-        // Compare OwnerIDs (if numeric, do numeric compare; fallback to string)
-        const ownerA = typeof a.OwnerID === 'number' ? a.OwnerID : Number.parseInt(a.OwnerID, 10) || a.OwnerID || '';
-        const ownerB = typeof b.OwnerID === 'number' ? b.OwnerID : Number.parseInt(b.OwnerID, 10) || b.OwnerID || '';
-        const ownerCmp = ownerA > ownerB ? 1 : ownerA < ownerB ? -1 : 0;
-        return ownerCmp;
-      });
-    }
-
     // If coalescing, group them, otherwise each entry is its own group
     const grouped = this.coalesceEntries
-        ? this.groupData(sortedOrOriginal)
-        : sortedOrOriginal.map((e) => [e]);
+        ? this.groupData(filtered)
+        : filtered.map((e) => [e]);
 
     return html`
       <link rel="stylesheet" href="/ux/vendor/bootstrap.min.css">

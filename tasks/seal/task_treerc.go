@@ -174,13 +174,10 @@ func (t *TreeRCTask) TypeDetails() harmonytask.TaskTypeDetails {
 	}
 }
 
-func (t *TreeRCTask) GetSpid(db *harmonydb.DB, taskID int64) string {
-	sid, err := t.GetSectorID(db, taskID)
-	if err != nil {
-		log.Errorf("getting sector id: %s", err)
-		return ""
-	}
-	return sid.Miner.String()
+func (t *TreeRCTask) GetSpids(ctx context.Context, db *harmonydb.DB, taskIDs []int64) ([]harmonytask.TaskSPID, error) {
+	var spids []harmonytask.TaskSPID
+	err := db.Select(ctx, &spids, `SELECT task_id_tree_r AS task_id, sp_id FROM sectors_sdr_pipeline WHERE task_id_tree_r = ANY($1::BIGINT[])`, taskIDs)
+	return spids, err
 }
 
 func (t *TreeRCTask) GetSectorID(db *harmonydb.DB, taskID int64) (*abi.SectorID, error) {

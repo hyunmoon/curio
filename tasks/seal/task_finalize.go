@@ -42,13 +42,10 @@ func NewFinalizeTask(max int, sp *SealPoller, sc *ffi.SealCalls, db *harmonydb.D
 	}
 }
 
-func (f *FinalizeTask) GetSpid(db *harmonydb.DB, taskID int64) string {
-	sid, err := f.GetSectorID(db, taskID)
-	if err != nil {
-		log.Errorf("getting sector id: %s", err)
-		return ""
-	}
-	return sid.Miner.String()
+func (f *FinalizeTask) GetSpids(ctx context.Context, db *harmonydb.DB, taskIDs []int64) ([]harmonytask.TaskSPID, error) {
+	var spids []harmonytask.TaskSPID
+	err := db.Select(ctx, &spids, `SELECT task_id_finalize AS task_id, sp_id FROM sectors_sdr_pipeline WHERE task_id_finalize = ANY($1::BIGINT[])`, taskIDs)
+	return spids, err
 }
 
 func (f *FinalizeTask) GetSectorID(db *harmonydb.DB, taskID int64) (*abi.SectorID, error) {

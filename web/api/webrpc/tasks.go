@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -15,6 +16,8 @@ import (
 	"github.com/filecoin-project/curio/harmony/harmonydb"
 	"github.com/filecoin-project/curio/harmony/harmonytask"
 )
+
+const CLUSTER_TASK_SPID_BATCH_SIZE = 10_000
 
 type TaskSummary struct {
 	ID    int64
@@ -37,20 +40,30 @@ type taskSummaryRow struct {
 	OwnerID    *string `db:"owner_id"`
 }
 
-func (r taskSummaryRow) summary(now time.Time) (TaskSummary, error) {
-	state := "pending"
-	ageStart := r.PostedTime
+func (r taskSummaryRow) ageStart() (time.Time, error) {
 	if r.OwnerID != nil {
 		if !r.WorkStart.Valid {
-			return TaskSummary{}, fmt.Errorf("running task %d has no work_start", r.ID)
+			return time.Time{}, fmt.Errorf("running task %d has no work_start", r.ID)
 		}
-		state = "running"
-		ageStart = r.WorkStart.Time
+		return r.WorkStart.Time, nil
+	}
+	return r.PostedTime, nil
+}
+
+func (r taskSummaryRow) summary(now time.Time) (TaskSummary, error) {
+	ageStart, err := r.ageStart()
+	if err != nil {
+		return TaskSummary{}, err
 	}
 
 	age := now.Sub(ageStart)
 	if age < 0 {
 		age = 0
+	}
+
+	state := "pending"
+	if r.OwnerID != nil {
+		state = "running"
 	}
 
 	return TaskSummary{
@@ -63,45 +76,86 @@ func (r taskSummaryRow) summary(now time.Time) (TaskSummary, error) {
 	}, nil
 }
 
-func (a *WebRPC) ClusterTaskSummary(ctx context.Context) ([]TaskSummary, error) {
-	var rows []taskSummaryRow
-	err := a.Deps.DB.Select(ctx, &rows, `SELECT
-		t.id as id, t.name as name, t.posted_time, t.work_start, t.owner_id as owner_id, hm.host_and_port as owner
-	FROM harmony_task t LEFT JOIN harmony_machines hm ON hm.id = t.owner_id 
-	ORDER BY
-	    CASE WHEN t.owner_id IS NULL THEN 1 ELSE 0 END,
-	    CASE WHEN t.owner_id IS NULL THEN t.posted_time ELSE t.work_start END ASC`)
+func sortTaskSummaryRows(rows []taskSummaryRow) error {
+	ageStarts := make(map[int64]time.Time, len(rows))
+	for _, row := range rows {
+		ageStart, err := row.ageStart()
+		if err != nil {
+			return err
+		}
+		ageStarts[row.ID] = ageStart
+	}
+
+	sort.Slice(rows, func(i, j int) bool {
+		left, right := ageStarts[rows[i].ID], ageStarts[rows[j].ID]
+		if left.Equal(right) {
+			return rows[i].ID < rows[j].ID
+		}
+		return left.Before(right)
+	})
+	return nil
+}
+
+func resolveTaskSPIDs(ctx context.Context, db *harmonydb.DB, rows []taskSummaryRow, getters map[string]SpidGetter) (map[int64]int64, error) {
+	taskIDsByName := make(map[string][]int64)
+	taskNames := make([]string, 0)
+	for _, row := range rows {
+		if _, ok := getters[row.Name]; !ok {
+			continue
+		}
+		if _, ok := taskIDsByName[row.Name]; !ok {
+			taskNames = append(taskNames, row.Name)
+		}
+		taskIDsByName[row.Name] = append(taskIDsByName[row.Name], row.ID)
+	}
+
+	spids := make(map[int64]int64)
+	for _, name := range taskNames {
+		ids := taskIDsByName[name]
+		for start := 0; start < len(ids); start += CLUSTER_TASK_SPID_BATCH_SIZE {
+			end := min(start+CLUSTER_TASK_SPID_BATCH_SIZE, len(ids))
+			resolved, err := getters[name].GetSpids(ctx, db, ids[start:end])
+			if err != nil {
+				return nil, fmt.Errorf("resolving SpIDs for %s tasks: %w", name, err)
+			}
+
+			for _, resolvedTask := range resolved {
+				current, ok := spids[resolvedTask.TaskID]
+				if !ok || resolvedTask.SPID < current {
+					spids[resolvedTask.TaskID] = resolvedTask.SPID
+				}
+			}
+		}
+	}
+
+	return spids, nil
+}
+
+func buildTaskSummaries(ctx context.Context, db *harmonydb.DB, rows []taskSummaryRow, getters map[string]SpidGetter, now time.Time) ([]TaskSummary, error) {
+	if err := sortTaskSummaryRows(rows); err != nil {
+		return nil, err
+	}
+
+	spids, err := resolveTaskSPIDs(ctx, db, rows, getters)
 	if err != nil {
-		return nil, err // Handle error
+		return nil, err
 	}
 
 	ts := make([]TaskSummary, 0, len(rows))
-	now := time.Now()
-	// Populate MinerID
 	for _, row := range rows {
 		task, err := row.summary(now)
 		if err != nil {
 			return nil, err
 		}
 
-		if v, ok := a.TaskSPIDs[task.Name]; ok {
-			task.SpID = v.GetSpid(a.Deps.DB, task.ID)
-		}
-
-		if task.SpID != "" {
-			spid, err := strconv.ParseInt(task.SpID, 10, 64)
-			if err != nil {
-				return nil, err
-			}
-
+		if spid, ok := spids[task.ID]; ok {
+			task.SpID = strconv.FormatInt(spid, 10)
 			if spid > 0 {
 				maddr, err := address.NewIDAddress(uint64(spid))
 				if err != nil {
 					return nil, err
 				}
 				task.Miner = maddr.String()
-			} else {
-				task.Miner = ""
 			}
 		}
 
@@ -111,8 +165,20 @@ func (a *WebRPC) ClusterTaskSummary(ctx context.Context) ([]TaskSummary, error) 
 	return ts, nil
 }
 
+func (a *WebRPC) ClusterTaskSummary(ctx context.Context) ([]TaskSummary, error) {
+	var rows []taskSummaryRow
+	err := a.Deps.DB.Select(ctx, &rows, `SELECT
+		t.id as id, t.name as name, t.posted_time, t.work_start, t.owner_id as owner_id, hm.host_and_port as owner
+	FROM harmony_task t LEFT JOIN harmony_machines hm ON hm.id = t.owner_id`)
+	if err != nil {
+		return nil, err // Handle error
+	}
+
+	return buildTaskSummaries(ctx, a.Deps.DB, rows, a.TaskSPIDs, time.Now())
+}
+
 type SpidGetter interface {
-	GetSpid(db *harmonydb.DB, taskID int64) string
+	GetSpids(ctx context.Context, db *harmonydb.DB, taskIDs []int64) ([]harmonytask.TaskSPID, error)
 }
 
 func makeTaskSPIDs() map[string]SpidGetter {
