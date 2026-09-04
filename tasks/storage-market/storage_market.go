@@ -41,6 +41,7 @@ import (
 	"github.com/filecoin-project/curio/market/mk12/legacytypes"
 	"github.com/filecoin-project/curio/market/mk20"
 	"github.com/filecoin-project/curio/market/storageingest"
+	"github.com/filecoin-project/curio/tasks/seal"
 
 	lminer "github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/proofs"
@@ -72,7 +73,7 @@ type storageMarketAPI interface {
 type CurioStorageDealMarket struct {
 	cfg         *config.CurioConfig
 	db          *harmonydb.DB
-	pin         storageingest.Ingester
+	pin         storageingest.WakingIngester
 	miners      *config.Dynamic[[]address.Address]
 	api         storageMarketAPI
 	MK12Handler *mk12.MK12
@@ -238,29 +239,44 @@ func (d *CurioStorageDealMarket) signalNextMK12(ctx context.Context, uuid string
 }
 
 func (d *CurioStorageDealMarket) signalNextMK20(ctx context.Context, id string) {
-	var pieces []MK20PipelinePiece
-	err := d.db.Select(ctx, &pieces, `SELECT 
-		id, sp_id, contract, client, piece_cid_v2, piece_cid,
-		piece_size, raw_size, offline, url, indexing, announce,
-		allocation_id, duration, piece_aggregation, started,
-		downloaded, commp_task_id, after_commp, deal_aggregation,
-		aggr_index, agg_task_id, aggregated, sector, reg_seal_proof,
-		sector_offset, indexing_created_at, indexing_task_id, indexed
-	FROM market_mk20_pipeline
-	WHERE id = $1 AND complete = false`, id)
+	err := runSignalNextMK20(ctx, id, func(ctx context.Context, id string) ([]MK20PipelinePiece, error) {
+		var pieces []MK20PipelinePiece
+		err := loadMK20Pieces(ctx, func(ctx context.Context) error {
+			return d.db.Select(ctx, &pieces, `SELECT
+			id, sp_id, contract, client, piece_cid_v2, piece_cid,
+			piece_size, raw_size, offline, url, indexing, announce,
+			allocation_id, duration, piece_aggregation, started,
+			downloaded, commp_task_id, after_commp, deal_aggregation,
+			aggr_index, agg_task_id, aggregated, sector, reg_seal_proof,
+			sector_offset, indexing_created_at, indexing_task_id, indexed
+		FROM market_mk20_pipeline
+		WHERE id = $1 AND complete = false`, id)
+		})
+		return pieces, err
+	}, d.processMk20Pieces, func(piece MK20PipelinePiece, err error) {
+		log.Errorw("SignalNext MK20: process piece", "error", err, "id", id)
+	}, d.WakeDealPoller)
 	if err != nil {
 		log.Errorw("SignalNext MK20: select pipeline", "error", err, "id", id)
-		return
 	}
+}
 
+type mk20DealPieceLoader func(context.Context, string) ([]MK20PipelinePiece, error)
+type mk20PieceErrorHandler func(MK20PipelinePiece, error)
+
+func runSignalNextMK20(ctx context.Context, id string, loadPieces mk20DealPieceLoader, processPiece mk20PieceStage, onPieceError mk20PieceErrorHandler, wakePoller func()) error {
+	pieces, err := loadPieces(ctx, id)
+	if err != nil {
+		return err
+	}
 	for _, piece := range pieces {
-		if err := d.processMk20Pieces(ctx, piece); err != nil {
-			log.Errorw("SignalNext MK20: process piece", "error", err, "id", id)
+		if err := processPiece(ctx, piece); err != nil {
+			onPieceError(piece, err)
 		}
 	}
 
-	d.processMK20DealAggregation(ctx)
-	d.processMK20DealIngestion(ctx)
+	wakePoller()
+	return nil
 }
 
 func (d *CurioStorageDealMarket) StartMarket(ctx context.Context) error {
@@ -994,16 +1010,20 @@ func (d *CurioStorageDealMarket) ingestDeal(ctx context.Context, deal MK12Pipeli
 			return false, xerrors.Errorf("UUID: %s: %w", deal.UUID, err)
 		}
 
-		var shouldProceed bool
-
-		err = tx.QueryRow(`SELECT EXISTS(SELECT TRUE FROM market_mk12_deal_pipeline WHERE uuid = $1 AND sector IS NULL)`, deal.UUID).Scan(&shouldProceed)
-		if err != nil {
-			return false, xerrors.Errorf("failed to check status in DB before adding to sector: %w", err)
+		if err := seal.LockSectorState(tx, deal.SpID); err != nil {
+			return false, err
 		}
 
-		if !shouldProceed {
-			// Exit early
-			return false, xerrors.Errorf("deal %s already added to sector by another process", deal.UUID)
+		var lockedUUID string
+		err = tx.QueryRow(`SELECT uuid
+			FROM market_mk12_deal_pipeline
+			WHERE uuid = $1 AND sector IS NULL
+			FOR UPDATE`, deal.UUID).Scan(&lockedUUID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return false, xerrors.Errorf("deal %s already added to sector by another process", deal.UUID)
+			}
+			return false, xerrors.Errorf("failed to lock deal before adding to sector: %w", err)
 		}
 
 		var sp *abi.RegisteredSealProof
@@ -1034,6 +1054,7 @@ func (d *CurioStorageDealMarket) ingestDeal(ctx context.Context, deal MK12Pipeli
 		return xerrors.Errorf("UUID: %s: failed to commit transaction: %w", deal.UUID, err)
 	}
 
+	d.pin.Wake()
 	log.Infof("Added deal %s to sector %d", deal.UUID, *sector)
 	return nil
 }
