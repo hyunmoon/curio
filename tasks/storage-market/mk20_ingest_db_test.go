@@ -2,7 +2,6 @@ package storage_market
 
 import (
 	"context"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -10,22 +9,17 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 
 	"github.com/filecoin-project/curio/harmony/harmonydb"
+	storageingestitest "github.com/filecoin-project/curio/market/storageingest/itest"
 )
 
 func TestStorageMarketDBConcurrentMK20IngestionClaimsOnce(t *testing.T) {
-	if os.Getenv("CURIO_STORAGEINGEST_ITEST") != "1" {
-		t.Skip("set CURIO_STORAGEINGEST_ITEST=1 to run Yugabyte storage-ingest integration tests")
-	}
-	db, err := harmonydb.NewFromConfigWithITestID(t, harmonydb.YugabyteDB(true))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storageingestitest.NewYugabyteDB(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	const spID = int64(2000)
 	const dealID = "01JTESTMK20CONCURRENTCLAIM000"
-	_, err = db.Exec(ctx, `INSERT INTO market_mk20_pipeline (
+	_, err := db.Exec(ctx, `INSERT INTO market_mk20_pipeline (
 		id, sp_id, contract, client, piece_cid_v2, piece_cid,
 		piece_size, raw_size, offline, indexing, announce, duration,
 		piece_aggregation, aggregated

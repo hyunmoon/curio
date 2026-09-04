@@ -3,7 +3,6 @@ package storageingest
 import (
 	"context"
 	"fmt"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 
 	"github.com/filecoin-project/curio/harmony/harmonydb"
+	storageingestitest "github.com/filecoin-project/curio/market/storageingest/itest"
 	"github.com/filecoin-project/curio/tasks/seal"
 
 	"github.com/filecoin-project/lotus/chain/types"
@@ -263,14 +263,7 @@ func (emptyAllocatedAPI) StateMinerAllocated(context.Context, address.Address, t
 
 func storageIngestTestDB(t *testing.T) *harmonydb.DB {
 	t.Helper()
-	if os.Getenv("CURIO_STORAGEINGEST_ITEST") != "1" {
-		t.Skip("set CURIO_STORAGEINGEST_ITEST=1 to run Yugabyte storage-ingest integration tests")
-	}
-	db, err := harmonydb.NewFromConfigWithITestID(t, harmonydb.YugabyteDB(true))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return db
+	return storageingestitest.NewYugabyteDB(t)
 }
 
 func insertTestOpenSectors(t *testing.T, db *harmonydb.DB, spID int64, first, count int, isSnap bool) {
