@@ -16,7 +16,6 @@ import (
 	actorstypes "github.com/filecoin-project/go-state-types/actors"
 	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-state-types/builtin"
-	miner12 "github.com/filecoin-project/go-state-types/builtin/v12/miner"
 	"github.com/filecoin-project/go-state-types/network"
 
 	"github.com/filecoin-project/curio/deps/config"
@@ -61,11 +60,18 @@ type precommitSectorParams struct {
 }
 
 type precommitPiece struct {
-	PieceIndex     int64  `db:"piece_index"`
-	PieceCID       string `db:"piece_cid"`
-	PieceSize      int64  `db:"piece_size"`
-	DealStartEpoch int64  `db:"deal_start_epoch"`
-	DealEndEpoch   int64  `db:"deal_end_epoch"`
+	PieceIndex           int64         `db:"piece_index"`
+	PieceCID             string        `db:"piece_cid"`
+	PieceSize            int64         `db:"piece_size"`
+	F05DealStartEpoch    sql.NullInt64 `db:"f05_deal_start_epoch"`
+	F05DealEndEpoch      sql.NullInt64 `db:"f05_deal_end_epoch"`
+	DirectDealStartEpoch sql.NullInt64 `db:"direct_start_epoch"`
+	DirectDealEndEpoch   sql.NullInt64 `db:"direct_end_epoch"`
+}
+
+type precommitSectorFailure struct {
+	reason  string
+	message string
 }
 
 type precommitTaskStore interface {
@@ -100,8 +106,10 @@ const SUBMIT_PRECOMMIT_LOAD_PIECES_SQL = `
 	SELECT piece_index,
 		piece_cid,
 		piece_size,
-		COALESCE(f05_deal_end_epoch, direct_end_epoch, 0) AS deal_end_epoch,
-		COALESCE(f05_deal_start_epoch, direct_start_epoch, 0) AS deal_start_epoch
+		f05_deal_start_epoch,
+		f05_deal_end_epoch,
+		direct_start_epoch,
+		direct_end_epoch
 	FROM sectors_sdr_initial_pieces
 	WHERE sp_id = $1 AND sector_number = $2
 	ORDER BY piece_index ASC`
@@ -154,6 +162,73 @@ func (h *harmonyPrecommitTaskStore) setMessageCID(ctx context.Context, taskID ha
 func (h *harmonyPrecommitTaskStore) addMessageWait(ctx context.Context, mcid cid.Cid) error {
 	_, err := h.db.Exec(ctx, `INSERT INTO message_waits (signed_message_cid) VALUES ($1)`, mcid)
 	return err
+}
+
+func calculatePrecommitExpiration(
+	head, ticketEpoch, maxProveCommitDuration, maxSectorExpirationExtension abi.ChainEpoch,
+	userSectorDuration sql.NullInt64,
+	pieces []precommitPiece,
+) (abi.ChainEpoch, *precommitSectorFailure) {
+	protocolMaxExpiration := head + maxSectorExpirationExtension
+
+	var expiration abi.ChainEpoch
+	if len(pieces) == 0 {
+		expiration = ticketEpoch + maxSectorExpirationExtension
+		if userSectorDuration.Valid {
+			expiration = ticketEpoch + abi.ChainEpoch(userSectorDuration.Int64)
+		}
+	} else {
+		// Preserve the existing piece-driven expiration behavior, but keep F05
+		// requirements distinct from clampable Direct Data Onboarding targets.
+		var hardF05End abi.ChainEpoch
+		var requestedDirectEnd abi.ChainEpoch
+		for _, piece := range pieces {
+			starts := []sql.NullInt64{piece.F05DealStartEpoch, piece.DirectDealStartEpoch}
+			for _, start := range starts {
+				if start.Valid && start.Int64 > 0 && abi.ChainEpoch(start.Int64) < head {
+					return 0, &precommitSectorFailure{
+						reason:  "past-start-epoch",
+						message: "precommit: start epoch is in the past",
+					}
+				}
+			}
+
+			if piece.F05DealEndEpoch.Valid && piece.F05DealEndEpoch.Int64 > 0 {
+				hardF05End = max(hardF05End, abi.ChainEpoch(piece.F05DealEndEpoch.Int64))
+			}
+			if piece.DirectDealEndEpoch.Valid && piece.DirectDealEndEpoch.Int64 > 0 {
+				requestedDirectEnd = max(requestedDirectEnd, abi.ChainEpoch(piece.DirectDealEndEpoch.Int64))
+			}
+		}
+
+		if hardF05End > protocolMaxExpiration {
+			return 0, &precommitSectorFailure{
+				reason: "precommit-expiration",
+				message: fmt.Sprintf(
+					"requested F05 end %d exceeds protocol max expiration %d (current head %d, max extension %d)",
+					hardF05End, protocolMaxExpiration, head, maxSectorExpirationExtension),
+			}
+		}
+
+		directCandidate := min(requestedDirectEnd, protocolMaxExpiration)
+		expiration = max(hardF05End, directCandidate)
+	}
+
+	minimumExpiration := ticketEpoch + policy.MaxPreCommitRandomnessLookback + maxProveCommitDuration + miner.MinSectorExpiration
+	if expiration < minimumExpiration {
+		expiration = minimumExpiration
+	}
+
+	if expiration > protocolMaxExpiration {
+		return 0, &precommitSectorFailure{
+			reason: "precommit-expiration",
+			message: fmt.Sprintf(
+				"calculated precommit expiration %d exceeds protocol max expiration %d (current head %d, max extension %d, minimum expiration %d)",
+				expiration, protocolMaxExpiration, head, maxSectorExpirationExtension, minimumExpiration),
+		}
+	}
+
+	return expiration, nil
 }
 
 type SubmitPrecommitTask struct {
@@ -243,6 +318,10 @@ func (s *SubmitPrecommitTask) Do(ctx context.Context, taskID harmonytask.TaskID,
 	if err != nil {
 		return false, xerrors.Errorf("getting network version: %w", err)
 	}
+	maxSectorExpirationExtension, err := policy.GetMaxSectorExpirationExtension(nv)
+	if err != nil {
+		return false, xerrors.Errorf("getting max sector expiration extension: %w", err)
+	}
 	av, err := actorstypes.VersionForNetwork(nv)
 	if err != nil {
 		return false, xerrors.Errorf("failed to get actors version: %w", err)
@@ -309,45 +388,31 @@ func (s *SubmitPrecommitTask) Do(ctx context.Context, taskID harmonytask.TaskID,
 			SealRandEpoch: sectorParams.TicketEpoch,
 		}
 
-		expiration := sectorParams.TicketEpoch + miner12.MaxSectorExpirationExtension
-		if sectorParams.UserSectorDurationEpochs.Valid {
-			expiration = sectorParams.TicketEpoch + abi.ChainEpoch(sectorParams.UserSectorDurationEpochs.Int64)
-		}
-
 		pieces, err := s.store.loadPieces(ctx, sectorParams.SpID, sectorParams.SectorNumber)
 		if err != nil {
 			return false, xerrors.Errorf("getting pieces: %w", err)
 		}
 
-		sectorFailed := false
 		if len(pieces) > 0 {
-			var endEpoch abi.ChainEpoch
 			param.UnsealedCid = &unsealedCID
-			for _, p := range pieces {
-				if p.DealStartEpoch > 0 && abi.ChainEpoch(p.DealStartEpoch) < head.Height() {
-					perr := s.store.failSector(ctx, taskID, sectorParams.SpID, sectorParams.SectorNumber,
-						"past-start-epoch", "precommit: start epoch is in the past")
-					if perr != nil {
-						return false, xerrors.Errorf("persisting precommit start epoch expiry: %w", perr)
-					}
-					log.Errorw("deal start epoch is in the past", "task_id", taskID, "sp_id", sectorParams.SpID, "sector_number", sectorParams.SectorNumber, "deal_start_epoch", p.DealStartEpoch, "chain_height", head.Height())
-					sectorFailed = true
-					break
-				}
-				if p.DealEndEpoch > 0 && abi.ChainEpoch(p.DealEndEpoch) > endEpoch {
-					endEpoch = abi.ChainEpoch(p.DealEndEpoch)
-				}
-			}
-			if sectorFailed {
-				continue
-			}
-			if endEpoch != expiration {
-				expiration = endEpoch
-			}
 		}
 
-		if minExpiration := sectorParams.TicketEpoch + policy.MaxPreCommitRandomnessLookback + msd + miner.MinSectorExpiration; expiration < minExpiration {
-			expiration = minExpiration
+		expiration, sectorFailure := calculatePrecommitExpiration(
+			head.Height(), sectorParams.TicketEpoch, msd, maxSectorExpirationExtension,
+			sectorParams.UserSectorDurationEpochs, pieces)
+		if sectorFailure != nil {
+			perr := s.store.failSector(ctx, taskID, sectorParams.SpID, sectorParams.SectorNumber,
+				sectorFailure.reason, sectorFailure.message)
+			if perr != nil {
+				return false, xerrors.Errorf("persisting precommit sector validation error: %w", perr)
+			}
+			log.Errorw("sector failed precommit validation",
+				"task_id", taskID,
+				"sp_id", sectorParams.SpID,
+				"sector_number", sectorParams.SectorNumber,
+				"reason", sectorFailure.reason,
+				"message", sectorFailure.message)
+			continue
 		}
 
 		param.Expiration = expiration
