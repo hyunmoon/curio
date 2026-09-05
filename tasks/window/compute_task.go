@@ -468,14 +468,10 @@ func (t *WdPostTask) TypeDetails() harmonytask.TaskTypeDetails {
 	}
 }
 
-func (t *WdPostTask) GetSpid(db *harmonydb.DB, taskID int64) string {
-	var spid string
-	err := db.QueryRow(context.Background(), `SELECT sp_id FROM wdpost_partition_tasks WHERE task_id = $1`, taskID).Scan(&spid)
-	if err != nil {
-		log.Errorf("getting spid: %s", err.Error())
-		return ""
-	}
-	return spid
+func (t *WdPostTask) GetSpids(ctx context.Context, db *harmonydb.DB, taskIDs []int64) ([]harmonytask.TaskSPID, error) {
+	var spids []harmonytask.TaskSPID
+	err := db.Select(ctx, &spids, `SELECT task_id, sp_id FROM wdpost_partition_tasks WHERE task_id = ANY($1::BIGINT[])`, taskIDs)
+	return spids, err
 }
 
 var _ = harmonytask.Reg(&WdPostTask{})

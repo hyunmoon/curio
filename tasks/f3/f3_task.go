@@ -234,13 +234,10 @@ func (f *F3Task) Adder(taskFunc harmonytask.AddTaskFunc) {
 	f.actors.OnChange(f3TheActors)
 }
 
-func (f *F3Task) GetSpid(db *harmonydb.DB, taskID int64) string {
-	var spId string
-	err := db.QueryRow(context.Background(), `SELECT sp_id FROM f3_tasks WHERE task_id = $1`, taskID).Scan(&spId)
-	if err != nil {
-		return ""
-	}
-	return spId
+func (f *F3Task) GetSpids(ctx context.Context, db *harmonydb.DB, taskIDs []int64) ([]harmonytask.TaskSPID, error) {
+	var spids []harmonytask.TaskSPID
+	err := db.Select(ctx, &spids, `SELECT task_id, sp_id FROM f3_tasks WHERE task_id = ANY($1::BIGINT[])`, taskIDs)
+	return spids, err
 }
 
 var _ = harmonytask.Reg(&F3Task{})
