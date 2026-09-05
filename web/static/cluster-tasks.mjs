@@ -7,6 +7,7 @@ import {
 import {
   CLUSTER_TASK_DEFAULTS,
   CLUSTER_TASK_ORDER_POLICY,
+  advanceClusterTaskDisplayClock,
   beginClusterTaskRefresh,
   buildClusterTaskLastSuccessPresentation,
   buildClusterTaskRequest,
@@ -16,11 +17,15 @@ import {
   clusterTaskSectionEmptyMessage,
   clusterTaskSnapshotMismatchMessage,
   completeClusterTaskRefresh,
+  createClusterTaskDisplayClock,
   createClusterTaskViewState,
   failClusterTaskRefresh,
+  freezeClusterTaskDisplayClock,
   formatClusterTaskSectionSummary,
   formatTaskAgeSeconds,
+  interpolateClusterTaskAgeSeconds,
   parseBoundedInteger,
+  resetClusterTaskDisplayClock,
   shouldRunClusterTaskFreshness,
   UNKNOWN_RUNNING_AGE_TOOLTIP,
 } from '/cluster-tasks-model.mjs';
@@ -41,6 +46,7 @@ class ClusterTasks extends LitElement {
       paused: {type: Boolean},
       viewVisible: {type: Boolean},
       freshnessNow: {type: Number},
+      displayClock: {type: Object},
     };
   }
 
@@ -114,6 +120,8 @@ class ClusterTasks extends LitElement {
       .status-pill {
         display: inline-flex;
         align-items: center;
+        justify-content: center;
+        min-width: 5.75rem;
         padding: 2px 8px;
         border-radius: var(--radius-md, 6px);
         font-weight: 600;
@@ -183,11 +191,15 @@ class ClusterTasks extends LitElement {
       }
 
       table {
-        min-width: 42rem;
+        width: 100%;
+        min-width: 36rem;
+        table-layout: fixed;
       }
 
       th,
       td {
+        padding-right: 0.375rem;
+        padding-left: 0.375rem;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -195,19 +207,25 @@ class ClusterTasks extends LitElement {
 
       th:nth-child(1),
       td:nth-child(1) {
-        width: 8ch;
+        width: 10ch;
       }
 
       th:nth-child(2),
       td:nth-child(2) {
-        width: 16ch;
-        max-width: 20ch;
+        width: 14ch;
+        max-width: 18ch;
       }
 
       th:nth-child(3),
-      td:nth-child(3),
+      td:nth-child(3) {
+        width: 9ch;
+      }
+
       th:nth-child(4),
-      td:nth-child(4),
+      td:nth-child(4) {
+        width: 9ch;
+      }
+
       th:nth-child(5),
       td:nth-child(5) {
         width: 10ch;
@@ -215,8 +233,18 @@ class ClusterTasks extends LitElement {
 
       th:nth-child(6),
       td:nth-child(6) {
-        min-width: 20ch;
-        max-width: 28ch;
+        width: 23ch;
+        min-width: 23ch;
+        max-width: none;
+      }
+
+      td:nth-child(6) {
+        overflow: visible;
+        text-overflow: clip;
+      }
+
+      td:nth-child(6) > a {
+        white-space: nowrap;
       }
 
       .age-column {
@@ -257,6 +285,8 @@ class ClusterTasks extends LitElement {
     this.paused = false;
     this.viewVisible = false;
     this.freshnessNow = Date.now();
+    this.displayClock = createClusterTaskDisplayClock();
+    this.monotonicNow = () => performance.now();
 
     this.drawer = null;
     this.drawerObserver = null;
@@ -276,17 +306,23 @@ class ClusterTasks extends LitElement {
       onSuccess: (response) => {
         const completedAt = Date.now();
         this.viewState = completeClusterTaskRefresh(this.viewState, response, completedAt);
+        this.displayClock = resetClusterTaskDisplayClock(this.monotonicNow());
         this.applyServerLimits(this.viewState.response.Applied);
         this.freshnessNow = completedAt;
         this.syncFreshnessTicker();
       },
       onError: (error) => {
+        this.freezeDisplayClock();
         this.viewState = failClusterTaskRefresh(this.viewState, error);
       },
     });
     this.freshnessTicker = new ClusterTaskFreshnessTicker({
       onTick: (now) => {
         this.freshnessNow = now;
+        this.displayClock = advanceClusterTaskDisplayClock(
+            this.displayClock,
+            this.monotonicNow(),
+        );
       },
     });
   }
@@ -312,6 +348,7 @@ class ClusterTasks extends LitElement {
     document.removeEventListener('visibilitychange', this.handleDocumentVisibility);
     window.removeEventListener('resize', this.handleWindowResize);
     this.disconnectVisibilityObservers();
+    this.freezeDisplayClock();
     this.freshnessTicker.stop();
     this.pollController.setActivity({mounted: false, viewVisible: false});
     this.viewState = cancelClusterTaskRefresh(this.viewState);
@@ -408,9 +445,14 @@ class ClusterTasks extends LitElement {
     });
 
     if (!this.pollController.active) {
+      this.freezeDisplayClock();
       this.viewState = cancelClusterTaskRefresh(this.viewState);
     }
     this.syncFreshnessTicker();
+  }
+
+  freezeDisplayClock() {
+    this.displayClock = freezeClusterTaskDisplayClock(this.displayClock);
   }
 
   syncFreshnessTicker() {
@@ -735,7 +777,9 @@ class ClusterTasks extends LitElement {
     const hasOwner = entry.OwnerID !== null && entry.OwnerID !== undefined;
     const state = entry.State || (hasOwner ? 'running' : 'pending');
     const miner = entry.SpID ? entry.Miner : 'n/a';
-    const age = formatTaskAgeSeconds(entry.AgeSeconds);
+    const age = formatTaskAgeSeconds(
+        interpolateClusterTaskAgeSeconds(entry.AgeSeconds, this.displayClock),
+    );
     const ageTitle = age === 'unknown'
       ? state === 'running'
         ? UNKNOWN_RUNNING_AGE_TOOLTIP

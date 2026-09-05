@@ -8,6 +8,11 @@ import {
   ClusterTaskFreshnessTicker,
   ClusterTaskPollController,
 } from '../static/cluster-tasks-controller.mjs';
+import {
+  advanceClusterTaskDisplayClock,
+  freezeClusterTaskDisplayClock,
+  resetClusterTaskDisplayClock,
+} from '../static/cluster-tasks-model.mjs';
 
 class FakeClock {
   constructor() {
@@ -129,6 +134,33 @@ test('freshness ticker starts once, advances, and cleans up', () => {
   assert.equal(ticker.start(), true);
   assert.deepEqual(ticks, [0, CLUSTER_TASK_FRESHNESS_TICK_MS, clock.now]);
   ticker.stop();
+});
+
+test('display-clock ticks do not issue monitoring requests', async () => {
+  const clock = new FakeClock();
+  const harness = requestHarness();
+  const controller = makeController({clock, harness});
+  let displayClock = resetClusterTaskDisplayClock(clock.now);
+  const ticker = new ClusterTaskFreshnessTicker({
+    onTick: () => {
+      displayClock = advanceClusterTaskDisplayClock(displayClock, clock.now);
+    },
+    nowFn: () => clock.now,
+    setTimeoutFn: (callback, delay) => clock.setTimeout(callback, delay),
+    clearTimeoutFn: (id) => clock.clearTimeout(id),
+  });
+
+  activate(controller);
+  ticker.start();
+  assert.equal(harness.calls.length, 1);
+
+  clock.advance(CLUSTER_TASK_FRESHNESS_TICK_MS * 4);
+  assert.equal(displayClock.elapsedSeconds, 4);
+  assert.equal(harness.calls.length, 1, 'display updates must not trigger RPCs');
+
+  ticker.stop();
+  controller.setActivity({mounted: false});
+  await flushPromises();
 });
 
 test('inactive controllers do not issue requests', () => {
@@ -275,6 +307,48 @@ test('request timeout settles at 15s and retries even when transport abort lags'
   await flushPromises();
   assert.equal(errors.length, 1, 'late completion must not alter timeout state');
 
+  controller.setActivity({mounted: false});
+  await flushPromises();
+});
+
+test('timeout freezes display ages while the shared ticker can update freshness', async () => {
+  const clock = new FakeClock();
+  const harness = requestHarness({honorAbort: false});
+  const errors = [];
+  let freshnessTicks = 0;
+  let displayClock = resetClusterTaskDisplayClock(clock.now);
+  const ticker = new ClusterTaskFreshnessTicker({
+    onTick: () => {
+      freshnessTicks += 1;
+      displayClock = advanceClusterTaskDisplayClock(displayClock, clock.now);
+    },
+    nowFn: () => clock.now,
+    setTimeoutFn: (callback, delay) => clock.setTimeout(callback, delay),
+    clearTimeoutFn: (id) => clock.clearTimeout(id),
+  });
+  const controller = new ClusterTaskPollController({
+    request: (signal) => harness.request(signal),
+    onError: (error) => {
+      errors.push(error);
+      displayClock = freezeClusterTaskDisplayClock(displayClock);
+    },
+    setTimeoutFn: (callback, delay) => clock.setTimeout(callback, delay),
+    clearTimeoutFn: (id) => clock.clearTimeout(id),
+  });
+
+  activate(controller);
+  ticker.start();
+  clock.advance(CLUSTER_TASK_TIMEOUT_MS);
+  await flushPromises();
+
+  assert.equal(errors[0].name, 'TimeoutError');
+  const frozenAge = displayClock.elapsedSeconds;
+  const ticksAtFailure = freshnessTicks;
+  clock.advance(CLUSTER_TASK_FRESHNESS_TICK_MS * 2);
+  assert.equal(displayClock.elapsedSeconds, frozenAge);
+  assert.ok(freshnessTicks > ticksAtFailure, 'freshness may keep updating while stale');
+
+  ticker.stop();
   controller.setActivity({mounted: false});
   await flushPromises();
 });

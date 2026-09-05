@@ -16,6 +16,8 @@ export const PENDING_AGE_TOOLTIP =
   'Waiting time starts when the task was posted.';
 export const UNKNOWN_RUNNING_AGE_TOOLTIP =
   'Runtime is unknown because work_start is unavailable for this ownership interval.';
+export const INTERPOLATED_AGE_TOOLTIP =
+  'Between successful refreshes, displayed time is estimated locally from the last task snapshot.';
 
 export function parseBoundedInteger(value, min, max) {
   const text = String(value).trim();
@@ -57,6 +59,61 @@ export function formatTaskAgeSeconds(value) {
     return `${minutes}m${seconds}s`;
   }
   return `${seconds}s`;
+}
+
+export function createClusterTaskDisplayClock() {
+  return {
+    anchorMonotonic: null,
+    elapsedSeconds: 0,
+    interpolating: false,
+  };
+}
+
+export function resetClusterTaskDisplayClock(monotonicNow) {
+  if (!Number.isFinite(monotonicNow)) {
+    return createClusterTaskDisplayClock();
+  }
+  return {
+    anchorMonotonic: monotonicNow,
+    elapsedSeconds: 0,
+    interpolating: true,
+  };
+}
+
+export function advanceClusterTaskDisplayClock(clock, monotonicNow) {
+  if (
+    !clock?.interpolating ||
+    !Number.isFinite(clock.anchorMonotonic) ||
+    !Number.isFinite(monotonicNow)
+  ) {
+    return clock;
+  }
+
+  const elapsedSeconds = Math.max(
+      clock.elapsedSeconds,
+      Math.floor(Math.max(0, monotonicNow - clock.anchorMonotonic) / 1000),
+  );
+  return elapsedSeconds === clock.elapsedSeconds
+    ? clock
+    : {...clock, elapsedSeconds};
+}
+
+export function freezeClusterTaskDisplayClock(clock) {
+  if (!clock?.interpolating) {
+    return clock;
+  }
+  return {...clock, interpolating: false};
+}
+
+export function interpolateClusterTaskAgeSeconds(ageSeconds, clock) {
+  if (!Number.isFinite(ageSeconds) || ageSeconds < 0) {
+    return null;
+  }
+  const elapsedSeconds = Number.isSafeInteger(clock?.elapsedSeconds) &&
+    clock.elapsedSeconds >= 0
+    ? clock.elapsedSeconds
+    : 0;
+  return Math.floor(ageSeconds) + elapsedSeconds;
 }
 
 export function formatClusterTaskFreshness(now, updatedAt) {
@@ -317,7 +374,7 @@ export function buildClusterTaskSections(response, coalesceEntries) {
       key: 'running',
       title: 'Running',
       ageLabel: 'Runtime',
-      ageTooltip: RUNNING_AGE_TOOLTIP,
+      ageTooltip: `${RUNNING_AGE_TOOLTIP} ${INTERPOLATED_AGE_TOOLTIP}`,
       entries: normalized.Running,
       groups: groupsFor(normalized.Running, coalesceEntries),
       total: normalized.RunningTotal,
@@ -326,7 +383,7 @@ export function buildClusterTaskSections(response, coalesceEntries) {
       key: 'pending',
       title: 'Pending preview',
       ageLabel: 'Waiting',
-      ageTooltip: PENDING_AGE_TOOLTIP,
+      ageTooltip: `${PENDING_AGE_TOOLTIP} ${INTERPOLATED_AGE_TOOLTIP}`,
       entries: normalized.Pending,
       groups: groupsFor(normalized.Pending, coalesceEntries),
       total: normalized.PendingTotal,
