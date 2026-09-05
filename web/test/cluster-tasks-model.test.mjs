@@ -8,9 +8,13 @@ import {
   RUNNING_AGE_TOOLTIP,
   UNKNOWN_RUNNING_AGE_TOOLTIP,
   beginClusterTaskRefresh,
+  buildClusterTaskLastSuccessPresentation,
   buildClusterTaskRequest,
   buildClusterTaskSections,
   buildClusterTaskTypeOptions,
+  clusterTaskControlsMatchApplied,
+  clusterTaskSectionEmptyMessage,
+  clusterTaskSnapshotMismatchMessage,
   completeClusterTaskRefresh,
   createClusterTaskViewState,
   failClusterTaskRefresh,
@@ -83,6 +87,38 @@ test('freshness is relative to the last successful client update', () => {
   assert.equal(formatClusterTaskFreshness(Date.now(), null), '');
 });
 
+test('paused freshness uses an absolute date and time instead of frozen relative text', () => {
+  const lastSuccessAt = Date.UTC(2026, 8, 5, 3, 4, 5);
+  const absolute = new Date(lastSuccessAt).toLocaleString();
+
+  assert.deepEqual(buildClusterTaskLastSuccessPresentation({
+    paused: true,
+    now: lastSuccessAt + 60_000,
+    lastSuccessAt,
+  }), {
+    text: `Last successful update: ${absolute}`,
+    title: absolute,
+  });
+  assert.doesNotMatch(buildClusterTaskLastSuccessPresentation({
+    paused: true,
+    now: lastSuccessAt + 60_000,
+    lastSuccessAt,
+  }).text, /ago/);
+  assert.deepEqual(buildClusterTaskLastSuccessPresentation({
+    paused: true,
+    now: lastSuccessAt,
+    lastSuccessAt: null,
+  }), {
+    text: 'No successful snapshot is available yet.',
+    title: '',
+  });
+  assert.equal(buildClusterTaskLastSuccessPresentation({
+    paused: false,
+    now: lastSuccessAt + 5_000,
+    lastSuccessAt,
+  }).text, 'Last successful update: 5s ago');
+});
+
 test('freshness ticks only for a loaded, active, unpaused view', () => {
   const active = {
     isConnected: true,
@@ -105,6 +141,145 @@ test('section summaries expose shown and total counts', () => {
       formatClusterTaskSectionSummary(12, 0, false),
       '12 shown; total unavailable',
   );
+});
+
+test('pending empty states distinguish capacity, filters, disabled previews, and unknown totals', () => {
+  const runningAtLimit = Array.from({length: 500}, (_, index) => ({ID: index + 1}));
+  const capacityResponse = normalizeClusterTaskResponse({
+    Running: runningAtLimit,
+    Pending: [],
+    Applied: {MaxTasks: 500, MaxPending: 30},
+    RunningTotal: 600,
+    PendingTotal: 40_000,
+    TotalsAvailable: true,
+  });
+  assert.equal(
+      clusterTaskSectionEmptyMessage('pending', capacityResponse),
+      'Pending preview is omitted because running tasks use the display limit.',
+  );
+  assert.equal(
+      formatClusterTaskSectionSummary(
+          capacityResponse.Pending.length,
+          capacityResponse.PendingTotal,
+          capacityResponse.TotalsAvailable,
+      ),
+      '0 of 40000',
+  );
+
+  assert.equal(clusterTaskSectionEmptyMessage('pending', {
+    Pending: [],
+    Applied: {MaxTasks: 500, MaxPending: 0},
+    PendingTotal: 40_000,
+    TotalsAvailable: true,
+  }), 'Pending preview is disabled.');
+  assert.equal(clusterTaskSectionEmptyMessage('pending', {
+    Pending: [],
+    Applied: {MaxTasks: 500, MaxPending: 30},
+    PendingTotal: 0,
+    TotalsAvailable: true,
+  }), 'No pending tasks match the applied snapshot filters.');
+  assert.equal(clusterTaskSectionEmptyMessage('pending', {
+    Pending: [],
+    Applied: {MaxTasks: 500, MaxPending: 30},
+    TotalsAvailable: false,
+  }), 'No pending rows displayed; total unavailable.');
+});
+
+test('snapshot mismatch compares every applied control and normalizes empty task names', () => {
+  const selected = {
+    maxTasks: 500,
+    maxPending: 30,
+    includeBackground: false,
+    taskName: '',
+  };
+  const applied = {
+    MaxTasks: 500,
+    MaxPending: 30,
+    IncludeBackground: false,
+    TaskName: null,
+  };
+  assert.equal(clusterTaskControlsMatchApplied(selected, applied), true);
+
+  for (const changed of [
+    {MaxTasks: 499},
+    {MaxPending: 29},
+    {IncludeBackground: true},
+    {TaskName: 'SDR'},
+  ]) {
+    assert.equal(
+        clusterTaskControlsMatchApplied(selected, {...applied, ...changed}),
+        false,
+        JSON.stringify(changed),
+    );
+  }
+});
+
+test('retained snapshots identify filters that have not been applied', () => {
+  const allTasksResponse = {
+    Running: [{ID: 1}],
+    Pending: [],
+    Applied: {
+      MaxTasks: 500,
+      MaxPending: 30,
+      IncludeBackground: false,
+      TaskName: '',
+    },
+  };
+  const selectedSDR = {
+    maxTasks: 500,
+    maxPending: 30,
+    includeBackground: false,
+    taskName: 'SDR',
+  };
+
+  let state = completeClusterTaskRefresh(
+      createClusterTaskViewState(),
+      allTasksResponse,
+      1000,
+  );
+  state = beginClusterTaskRefresh(state);
+  const refreshing = clusterTaskSnapshotMismatchMessage({
+    controls: selectedSDR,
+    response: state.response,
+    refreshing: state.refreshing,
+    failed: Boolean(state.error),
+    paused: false,
+  });
+  assert.match(refreshing, /last snapshot for All tasks/);
+  assert.match(refreshing, /selected controls have not been applied yet: SDR tasks/);
+
+  state = failClusterTaskRefresh(state, new Error('offline'));
+  const failed = clusterTaskSnapshotMismatchMessage({
+    controls: selectedSDR,
+    response: state.response,
+    refreshing: state.refreshing,
+    failed: Boolean(state.error),
+    paused: false,
+  });
+  assert.match(failed, /last snapshot for All tasks/);
+  assert.match(failed, /were not applied because the refresh failed: SDR tasks/);
+
+  const paused = clusterTaskSnapshotMismatchMessage({
+    controls: selectedSDR,
+    response: state.response,
+    refreshing: false,
+    failed: false,
+    paused: true,
+  });
+  assert.match(paused, /last snapshot for All tasks/);
+  assert.match(paused, /have not been applied while updates are paused: SDR tasks/);
+
+  state = completeClusterTaskRefresh(state, {
+    ...allTasksResponse,
+    Applied: {...allTasksResponse.Applied, TaskName: 'SDR'},
+  }, 2000);
+  assert.equal(clusterTaskSnapshotMismatchMessage({
+    controls: selectedSDR,
+    response: state.response,
+    refreshing: false,
+    failed: false,
+    paused: false,
+  }), '');
 });
 
 test('task-type options preserve an active filter while metadata changes', () => {

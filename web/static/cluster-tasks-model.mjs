@@ -70,10 +70,125 @@ export function formatClusterTaskFreshness(now, updatedAt) {
     : `${formatTaskAgeSeconds(elapsedSeconds)} ago`;
 }
 
+export function buildClusterTaskLastSuccessPresentation({
+  paused,
+  now,
+  lastSuccessAt,
+}) {
+  if (!Number.isFinite(lastSuccessAt)) {
+    return {
+      text: paused ? 'No successful snapshot is available yet.' : '',
+      title: '',
+    };
+  }
+
+  const absolute = new Date(lastSuccessAt).toLocaleString();
+  if (paused) {
+    return {
+      text: `Last successful update: ${absolute}`,
+      title: absolute,
+    };
+  }
+
+  const relative = formatClusterTaskFreshness(now, lastSuccessAt);
+  return {
+    text: relative ? `Last successful update: ${relative}` : '',
+    title: absolute,
+  };
+}
+
 export function formatClusterTaskSectionSummary(shown, total, totalsAvailable) {
   return totalsAvailable
     ? `${shown} of ${total}`
     : `${shown} shown; total unavailable`;
+}
+
+export function clusterTaskSectionEmptyMessage(sectionKey, value) {
+  const response = normalizeClusterTaskResponse(value);
+  const entries = sectionKey === 'pending' ? response.Pending : response.Running;
+  if (sectionKey === 'pending' && response.Applied.MaxPending === 0) {
+    return 'Pending preview is disabled.';
+  }
+  if (entries.length > 0) {
+    return '';
+  }
+  if (!response.TotalsAvailable) {
+    return `No ${sectionKey} rows displayed; total unavailable.`;
+  }
+
+  const total = sectionKey === 'pending'
+    ? response.PendingTotal
+    : response.RunningTotal;
+  if (total === 0) {
+    return `No ${sectionKey} tasks match the applied snapshot filters.`;
+  }
+  if (
+    sectionKey === 'pending' &&
+    response.Running.length >= response.Applied.MaxTasks
+  ) {
+    return 'Pending preview is omitted because running tasks use the display limit.';
+  }
+  return `No ${sectionKey} rows displayed for this snapshot.`;
+}
+
+function normalizeTaskName(value) {
+  return typeof value === 'string' && value.length > 0 ? value : '';
+}
+
+function normalizeQueryControls(value) {
+  const controls = value && typeof value === 'object' ? value : {};
+  return {
+    MaxTasks: controls.MaxTasks ?? controls.maxTasks,
+    MaxPending: controls.MaxPending ?? controls.maxPending,
+    IncludeBackground: Boolean(
+        controls.IncludeBackground ?? controls.includeBackground,
+    ),
+    TaskName: normalizeTaskName(controls.TaskName ?? controls.taskName),
+  };
+}
+
+export function clusterTaskControlsMatchApplied(controls, applied) {
+  const selected = normalizeQueryControls(controls);
+  const snapshot = normalizeQueryControls(applied);
+  return selected.MaxTasks === snapshot.MaxTasks &&
+    selected.MaxPending === snapshot.MaxPending &&
+    selected.IncludeBackground === snapshot.IncludeBackground &&
+    selected.TaskName === snapshot.TaskName;
+}
+
+export function formatClusterTaskControls(value) {
+  const controls = normalizeQueryControls(value);
+  const taskScope = controls.TaskName ? `${controls.TaskName} tasks` : 'All tasks';
+  const background = controls.IncludeBackground
+    ? 'background included'
+    : 'background hidden';
+  return `${taskScope}; ${background}; max ${controls.MaxTasks}; ` +
+    `pending preview ${controls.MaxPending}`;
+}
+
+export function clusterTaskSnapshotMismatchMessage({
+  controls,
+  response,
+  refreshing,
+  failed,
+  paused,
+}) {
+  if (!response?.Applied || clusterTaskControlsMatchApplied(controls, response.Applied)) {
+    return '';
+  }
+
+  const snapshot = formatClusterTaskControls(response.Applied);
+  const selected = formatClusterTaskControls(controls);
+  let explanation = 'The selected controls have not been applied yet';
+  if (paused) {
+    explanation = 'The selected controls have not been applied while updates are paused';
+  } else if (failed) {
+    explanation = 'The selected controls were not applied because the refresh failed';
+  } else if (refreshing) {
+    explanation = 'The selected controls have not been applied yet';
+  }
+
+  return `Showing the last snapshot for ${snapshot}. ${explanation}: ${selected}.`;
 }
 
 export function shouldRunClusterTaskFreshness({

@@ -8,14 +8,16 @@ import {
   CLUSTER_TASK_DEFAULTS,
   CLUSTER_TASK_ORDER_POLICY,
   beginClusterTaskRefresh,
+  buildClusterTaskLastSuccessPresentation,
   buildClusterTaskRequest,
   buildClusterTaskSections,
   buildClusterTaskTypeOptions,
   cancelClusterTaskRefresh,
+  clusterTaskSectionEmptyMessage,
+  clusterTaskSnapshotMismatchMessage,
   completeClusterTaskRefresh,
   createClusterTaskViewState,
   failClusterTaskRefresh,
-  formatClusterTaskFreshness,
   formatClusterTaskSectionSummary,
   formatTaskAgeSeconds,
   parseBoundedInteger,
@@ -561,13 +563,16 @@ class ClusterTasks extends LitElement {
     }
 
     const observedAt = this.formatTimestamp(state.response?.ObservedAt);
-    const lastSuccess = formatClusterTaskFreshness(this.freshnessNow, state.lastSuccessAt);
-    const lastSuccessTimestamp = this.formatTimestamp(state.lastSuccessAt);
+    const lastSuccess = buildClusterTaskLastSuccessPresentation({
+      paused: this.paused,
+      now: this.freshnessNow,
+      lastSuccessAt: state.lastSuccessAt,
+    });
     return html`
       <div class="status-row" role="status" aria-live="polite">
         <span class="status-pill ${tone}">${label}</span>
-        ${lastSuccess ? html`
-          <span title=${lastSuccessTimestamp}>Last successful update: ${lastSuccess}</span>
+        ${lastSuccess.text ? html`
+          <span title=${lastSuccess.title}>${lastSuccess.text}</span>
         ` : ''}
         ${observedAt ? html`<span>Snapshot observed: ${observedAt}</span>` : ''}
       </div>
@@ -577,7 +582,19 @@ class ClusterTasks extends LitElement {
   renderMessages() {
     const state = this.viewState;
     const warnings = state.response?.Warnings || [];
+    const snapshotMismatch = clusterTaskSnapshotMismatchMessage({
+      controls: this.currentControls(),
+      response: state.response,
+      refreshing: state.refreshing,
+      failed: Boolean(state.error),
+      paused: this.paused,
+    });
     return html`
+      ${snapshotMismatch ? html`
+        <div class="alert alert-warning message" role="status">
+          ${snapshotMismatch}
+        </div>
+      ` : ''}
       ${state.error ? html`
         <div class="alert ${state.hasSuccessfulLoad ? 'alert-warning' : 'alert-danger'} message" role="alert">
           ${state.hasSuccessfulLoad
@@ -749,17 +766,15 @@ class ClusterTasks extends LitElement {
   }
 
   renderSection(section, response) {
-    const disabled = section.key === 'pending' && response.Applied.MaxPending === 0;
+    const emptyMessage = clusterTaskSectionEmptyMessage(section.key, response);
     return html`
       <section class="task-section" aria-labelledby="cluster-tasks-${section.key}">
         <div class="section-heading">
           <h3 id="cluster-tasks-${section.key}">${section.title}</h3>
           <span class="section-summary">${this.sectionSummary(section, response)}</span>
         </div>
-        ${disabled ? html`
-          <div class="empty-state">Pending preview is disabled.</div>
-        ` : section.groups.length === 0 ? html`
-          <div class="empty-state">No ${section.key} tasks match these controls.</div>
+        ${emptyMessage ? html`
+          <div class="empty-state">${emptyMessage}</div>
         ` : html`
           <div class="table-wrap">
             <table class="table table-dark">
