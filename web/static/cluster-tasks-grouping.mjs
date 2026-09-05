@@ -4,7 +4,7 @@ export function groupConsecutiveTasks(data) {
   let currentKey = null;
 
   for (const entry of data) {
-    const key = JSON.stringify([entry.SpID, entry.Name, entry.OwnerID]);
+    const key = JSON.stringify([entry.State, entry.SpID, entry.Name, entry.OwnerID]);
     if (key !== currentKey) {
       if (currentGroup.length > 0) {
         groups.push(currentGroup);
