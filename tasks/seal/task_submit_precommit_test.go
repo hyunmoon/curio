@@ -1,18 +1,24 @@
 package seal
 
 import (
+	"bytes"
 	"context"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/ipfs/go-cid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/crypto"
 	"github.com/filecoin-project/go-state-types/network"
 
 	"github.com/filecoin-project/curio/deps/config"
+	"github.com/filecoin-project/curio/harmony/harmonytask"
 	"github.com/filecoin-project/curio/lib/multictladdr"
 
 	"github.com/filecoin-project/lotus/api"
@@ -25,10 +31,12 @@ type mockPrecommitAPI struct {
 	walletBalances map[address.Address]big.Int
 	walletHas      map[address.Address]bool
 	minerBalance   big.Int
+	head           *types.TipSet
+	minerInfo      api.MinerInfo
 }
 
 func (m *mockPrecommitAPI) ChainHead(context.Context) (*types.TipSet, error) {
-	return nil, nil
+	return m.head, nil
 }
 
 func (m *mockPrecommitAPI) StateMinerPreCommitDepositForPower(context.Context, address.Address, miner.SectorPreCommitInfo, types.TipSetKey) (big.Int, error) {
@@ -36,7 +44,7 @@ func (m *mockPrecommitAPI) StateMinerPreCommitDepositForPower(context.Context, a
 }
 
 func (m *mockPrecommitAPI) StateMinerInfo(context.Context, address.Address, types.TipSetKey) (api.MinerInfo, error) {
-	return api.MinerInfo{}, nil
+	return m.minerInfo, nil
 }
 
 func (m *mockPrecommitAPI) StateNetworkVersion(context.Context, types.TipSetKey) (network.Version, error) {
@@ -72,6 +80,147 @@ func (m *mockPrecommitAPI) StateAccountKey(ctx context.Context, addr address.Add
 
 func (m *mockPrecommitAPI) StateLookupID(ctx context.Context, addr address.Address, tsk types.TipSetKey) (address.Address, error) {
 	return addr, nil
+}
+
+type precommitSectorKey struct {
+	spID         int64
+	sectorNumber int64
+}
+
+type recordedPrecommitFailure struct {
+	reason  string
+	message string
+}
+
+type mockPrecommitTaskStore struct {
+	sectors          []precommitSectorParams
+	pieces           map[precommitSectorKey][]precommitPiece
+	detached         []precommitSectorKey
+	failures         map[precommitSectorKey]recordedPrecommitFailure
+	messageSectors   []int64
+	messageSPID      int64
+	messageTaskID    harmonytask.TaskID
+	messageCID       cid.Cid
+	messageWaits     []cid.Cid
+	loadSectorsCalls int
+}
+
+func (m *mockPrecommitTaskStore) loadSectors(context.Context, harmonytask.TaskID) ([]precommitSectorParams, error) {
+	m.loadSectorsCalls++
+	return append([]precommitSectorParams(nil), m.sectors...), nil
+}
+
+func (m *mockPrecommitTaskStore) detachFailedSector(_ context.Context, _ harmonytask.TaskID, spID, sectorNumber int64) error {
+	m.detached = append(m.detached, precommitSectorKey{spID: spID, sectorNumber: sectorNumber})
+	return nil
+}
+
+func (m *mockPrecommitTaskStore) loadPieces(_ context.Context, spID, sectorNumber int64) ([]precommitPiece, error) {
+	return append([]precommitPiece(nil), m.pieces[precommitSectorKey{spID: spID, sectorNumber: sectorNumber}]...), nil
+}
+
+func (m *mockPrecommitTaskStore) failSector(_ context.Context, _ harmonytask.TaskID, spID, sectorNumber int64, reason, message string) error {
+	if m.failures == nil {
+		m.failures = map[precommitSectorKey]recordedPrecommitFailure{}
+	}
+	m.failures[precommitSectorKey{spID: spID, sectorNumber: sectorNumber}] = recordedPrecommitFailure{
+		reason:  reason,
+		message: message,
+	}
+	return nil
+}
+
+func (m *mockPrecommitTaskStore) setMessageCID(_ context.Context, taskID harmonytask.TaskID, spID int64, sectors []int64, mcid cid.Cid) error {
+	m.messageTaskID = taskID
+	m.messageSPID = spID
+	m.messageSectors = append([]int64(nil), sectors...)
+	m.messageCID = mcid
+	return nil
+}
+
+func (m *mockPrecommitTaskStore) addMessageWait(_ context.Context, mcid cid.Cid) error {
+	m.messageWaits = append(m.messageWaits, mcid)
+	return nil
+}
+
+type mockPrecommitMessageSender struct {
+	messages []*types.Message
+	cid      cid.Cid
+}
+
+func (m *mockPrecommitMessageSender) Send(_ context.Context, msg *types.Message, _ *api.MessageSendSpec, _ string) (cid.Cid, error) {
+	m.messages = append(m.messages, msg)
+	return m.cid, nil
+}
+
+func makePrecommitTipSet(t *testing.T, height abi.ChainEpoch) *types.TipSet {
+	t.Helper()
+
+	minerAddr, err := address.NewIDAddress(1000)
+	require.NoError(t, err)
+	root, err := cid.Decode("bafy2bzacea3wsdh6y3a36tb3skempjoxqpuyompjbmfeyf34fi3uy6uue42v4")
+	require.NoError(t, err)
+
+	ts, err := types.NewTipSet([]*types.BlockHeader{{
+		Miner:                 minerAddr,
+		Ticket:                &types.Ticket{VRFProof: []byte{1}},
+		Height:                height,
+		ParentStateRoot:       root,
+		Messages:              root,
+		ParentMessageReceipts: root,
+		BlockSig:              &crypto.Signature{Type: crypto.SigTypeSecp256k1},
+		BLSAggregate:          &crypto.Signature{Type: crypto.SigTypeSecp256k1},
+		Timestamp:             uint64(time.Now().Unix()),
+		ParentBaseFee:         types.NewInt(100),
+	}})
+	require.NoError(t, err)
+	return ts
+}
+
+func makeSubmitPrecommitTaskForTest(t *testing.T, sectors []precommitSectorParams, pieces map[precommitSectorKey][]precommitPiece) (*SubmitPrecommitTask, *mockPrecommitTaskStore, *mockPrecommitMessageSender) {
+	t.Helper()
+
+	worker, err := address.NewIDAddress(1001)
+	require.NoError(t, err)
+	messageCID, err := cid.Decode("bafy2bzacea3wsdh6y3a36tb3skempjoxqpuyompjbmfeyf34fi3uy6uue42v4")
+	require.NoError(t, err)
+
+	store := &mockPrecommitTaskStore{
+		sectors: sectors,
+		pieces:  pieces,
+	}
+	sender := &mockPrecommitMessageSender{cid: messageCID}
+	task := &SubmitPrecommitTask{
+		store: store,
+		api: &mockPrecommitAPI{
+			head:      makePrecommitTipSet(t, 1000),
+			minerInfo: api.MinerInfo{Worker: worker},
+		},
+		sender: sender,
+		feeCfg: &config.CurioFees{},
+	}
+	return task, store, sender
+}
+
+func makePrecommitSector(sectorNumber int64) precommitSectorParams {
+	const COMMITMENT_CID = "bafy2bzacea3wsdh6y3a36tb3skempjoxqpuyompjbmfeyf34fi3uy6uue42v4"
+
+	return precommitSectorParams{
+		SpID:         1000,
+		SectorNumber: sectorNumber,
+		RegSealProof: abi.RegisteredSealProof_StackedDrg32GiBV1_1,
+		TicketEpoch:  900,
+		SealedCID:    COMMITMENT_CID,
+		UnsealedCID:  COMMITMENT_CID,
+	}
+}
+
+func decodePrecommitParams(t *testing.T, msg *types.Message) miner.PreCommitSectorBatchParams2 {
+	t.Helper()
+
+	var params miner.PreCommitSectorBatchParams2
+	require.NoError(t, params.UnmarshalCBOR(bytes.NewReader(msg.Params)))
+	return params
 }
 
 // calculatePrecommitNeedFunds simulates the needFunds calculation in SubmitPrecommitTask.Do
@@ -503,4 +652,114 @@ func TestPrecommitFeeCfgIntegration(t *testing.T) {
 			assert.Equal(t, tt.expectedGoodFunds, goodFunds, "goodFunds should be needFunds + 10%% of maxFee")
 		})
 	}
+}
+
+func TestSubmitPrecommitMixedBatchIsolatesPastStartSector(t *testing.T) {
+	taskID := harmonytask.TaskID(42)
+	expired := makePrecommitSector(101)
+	valid := makePrecommitSector(102)
+	task, store, sender := makeSubmitPrecommitTaskForTest(t,
+		[]precommitSectorParams{expired, valid},
+		map[precommitSectorKey][]precommitPiece{
+			{spID: expired.SpID, sectorNumber: expired.SectorNumber}: {{PieceIndex: 0, DealStartEpoch: 999, DealEndEpoch: 2000}},
+			{spID: valid.SpID, sectorNumber: valid.SectorNumber}:     {{PieceIndex: 0, DealStartEpoch: 1100, DealEndEpoch: 2000}},
+		})
+
+	done, err := task.Do(t.Context(), taskID, func() bool { return true })
+	require.NoError(t, err)
+	require.True(t, done)
+
+	require.Equal(t, map[precommitSectorKey]recordedPrecommitFailure{
+		{spID: expired.SpID, sectorNumber: expired.SectorNumber}: {
+			reason:  "past-start-epoch",
+			message: "precommit: start epoch is in the past",
+		},
+	}, store.failures)
+	require.Len(t, sender.messages, 1)
+	params := decodePrecommitParams(t, sender.messages[0])
+	require.Len(t, params.Sectors, 1)
+	require.Equal(t, abi.SectorNumber(valid.SectorNumber), params.Sectors[0].SectorNumber)
+	require.Equal(t, []int64{valid.SectorNumber}, store.messageSectors)
+	require.Equal(t, valid.SpID, store.messageSPID)
+	require.Equal(t, taskID, store.messageTaskID)
+	require.Equal(t, sender.cid, store.messageCID)
+	require.Equal(t, []cid.Cid{sender.cid}, store.messageWaits)
+}
+
+func TestSubmitPrecommitAllInvalidCompletesWithoutMessage(t *testing.T) {
+	pastStart := makePrecommitSector(201)
+	expiredTicket := makePrecommitSector(202)
+	expiredTicket.TicketEpoch = -10000
+	task, store, sender := makeSubmitPrecommitTaskForTest(t,
+		[]precommitSectorParams{pastStart, expiredTicket},
+		map[precommitSectorKey][]precommitPiece{
+			{spID: pastStart.SpID, sectorNumber: pastStart.SectorNumber}: {{PieceIndex: 0, DealStartEpoch: 999, DealEndEpoch: 2000}},
+		})
+
+	done, err := task.Do(t.Context(), harmonytask.TaskID(43), func() bool { return true })
+	require.NoError(t, err)
+	require.True(t, done)
+	require.Empty(t, sender.messages)
+	require.Empty(t, store.messageSectors)
+	require.Empty(t, store.messageWaits)
+	require.Equal(t, "past-start-epoch", store.failures[precommitSectorKey{spID: pastStart.SpID, sectorNumber: pastStart.SectorNumber}].reason)
+	ticketFailure := store.failures[precommitSectorKey{spID: expiredTicket.SpID, sectorNumber: expiredTicket.SectorNumber}]
+	require.Equal(t, "precommit-check", ticketFailure.reason)
+	require.Contains(t, ticketFailure.message, "ticket expired")
+}
+
+func TestSubmitPrecommitDetachesPreviouslyFailedSector(t *testing.T) {
+	failed := makePrecommitSector(301)
+	failed.Failed = true
+	valid := makePrecommitSector(302)
+	task, store, sender := makeSubmitPrecommitTaskForTest(t, []precommitSectorParams{failed, valid}, nil)
+
+	done, err := task.Do(t.Context(), harmonytask.TaskID(44), func() bool { return true })
+	require.NoError(t, err)
+	require.True(t, done)
+	require.Equal(t, []precommitSectorKey{{spID: failed.SpID, sectorNumber: failed.SectorNumber}}, store.detached)
+	require.Empty(t, store.failures, "detaching must preserve the existing failure reason")
+	require.Len(t, sender.messages, 1)
+	params := decodePrecommitParams(t, sender.messages[0])
+	require.Len(t, params.Sectors, 1)
+	require.Equal(t, abi.SectorNumber(valid.SectorNumber), params.Sectors[0].SectorNumber)
+	require.Equal(t, []int64{valid.SectorNumber}, store.messageSectors)
+	require.Equal(t, []cid.Cid{sender.cid}, store.messageWaits)
+}
+
+func TestSubmitPrecommitTicketExpirationRemainsPerSector(t *testing.T) {
+	expired := makePrecommitSector(401)
+	expired.TicketEpoch = -10000
+	valid := makePrecommitSector(402)
+	task, store, sender := makeSubmitPrecommitTaskForTest(t, []precommitSectorParams{expired, valid}, nil)
+
+	done, err := task.Do(t.Context(), harmonytask.TaskID(45), func() bool { return true })
+	require.NoError(t, err)
+	require.True(t, done)
+	require.Equal(t, "precommit-check", store.failures[precommitSectorKey{spID: expired.SpID, sectorNumber: expired.SectorNumber}].reason)
+	require.NotContains(t, store.failures, precommitSectorKey{spID: valid.SpID, sectorNumber: valid.SectorNumber})
+	require.Len(t, sender.messages, 1)
+	params := decodePrecommitParams(t, sender.messages[0])
+	require.Len(t, params.Sectors, 1)
+	require.Equal(t, abi.SectorNumber(valid.SectorNumber), params.Sectors[0].SectorNumber)
+	require.Equal(t, []int64{valid.SectorNumber}, store.messageSectors)
+}
+
+func TestSubmitPrecommitSQLScopesFailuresAndMessageAssociation(t *testing.T) {
+	normalize := func(query string) string {
+		return strings.ToLower(strings.Join(strings.Fields(query), " "))
+	}
+
+	loadSQL := normalize(SUBMIT_PRECOMMIT_LOAD_SECTORS_SQL)
+	require.Contains(t, loadSQL, "tree_d_cid, failed from sectors_sdr_pipeline")
+
+	detachSQL := normalize(SUBMIT_PRECOMMIT_DETACH_FAILED_SECTOR_SQL)
+	require.Contains(t, detachSQL, "where task_id_precommit_msg = $1 and sp_id = $2 and sector_number = $3 and failed = true")
+
+	failSQL := normalize(SUBMIT_PRECOMMIT_FAIL_SECTOR_SQL)
+	require.Contains(t, failSQL, "where task_id_precommit_msg = $3 and sp_id = $4 and sector_number = $5 and failed = false")
+
+	messageSQL := normalize(SUBMIT_PRECOMMIT_SET_MESSAGE_CID_SQL)
+	require.Contains(t, messageSQL, "where task_id_precommit_msg = $2 and sp_id = $3 and sector_number = any($4::bigint[])")
+	require.Contains(t, messageSQL, "and after_precommit_msg = false and failed = false")
 }
