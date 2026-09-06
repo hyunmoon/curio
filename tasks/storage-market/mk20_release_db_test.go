@@ -9,6 +9,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,12 +20,14 @@ import (
 
 	"github.com/ipfs/go-cid"
 	"github.com/oklog/ulid"
+	"github.com/yugabyte/pgx/v5"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
 
 	"github.com/filecoin-project/curio/deps/config"
 	"github.com/filecoin-project/curio/harmony/harmonydb"
+	"github.com/filecoin-project/curio/market/backpressure"
 	"github.com/filecoin-project/curio/market/mk20"
 	"github.com/filecoin-project/curio/market/mk20release"
 )
@@ -32,6 +37,16 @@ const mk20ReleaseITestPieceCID = "bafkzcibfxx3meais3xzh6qn56y6hiasmrufhegoweu3o5
 type mk20ReleaseITestDB struct {
 	primary   *harmonydb.DB
 	secondary *harmonydb.DB
+	target    mk20ReleaseITestTarget
+}
+
+type mk20ReleaseITestTarget struct {
+	host     string
+	port     string
+	database string
+	username string
+	password string
+	schema   string
 }
 
 // newMK20ReleaseITestDB opens two independent pools on one random, isolated
@@ -78,13 +93,27 @@ func newMK20ReleaseITestDB(t *testing.T) mk20ReleaseITestDB {
 	if _, err := primary.Exec(ctx, mk20ReleaseITestSchema); err != nil {
 		t.Fatalf("bootstrapping focused MK20 release schema: %v", err)
 	}
+	target := mk20ReleaseITestTarget{
+		host:     host,
+		port:     opts.Port,
+		database: opts.Database,
+		username: opts.Username,
+		password: opts.Password,
+		schema:   "itest_" + string(opts.ITestID),
+	}
+	applyMK20ReleaseGateMigration(t, ctx, target)
 
-	var version, isolation string
+	var version, defaultIsolation, transactionIsolation string
 	if err := primary.QueryRow(ctx, `SELECT version()`).Scan(&version); err != nil {
 		t.Fatalf("reading database version: %v", err)
 	}
-	if err := primary.QueryRow(ctx, `SHOW transaction_isolation`).Scan(&isolation); err != nil {
+	if err := primary.QueryRow(ctx, `SHOW default_transaction_isolation`).Scan(&defaultIsolation); err != nil {
 		t.Fatalf("reading default transaction isolation: %v", err)
+	}
+	if _, err := primary.BeginTransaction(ctx, func(tx *harmonydb.Tx) (bool, error) {
+		return false, tx.QueryRow(`SHOW transaction_isolation`).Scan(&transactionIsolation)
+	}); err != nil {
+		t.Fatalf("reading HarmonyDB transaction isolation: %v", err)
 	}
 	var primaryPID, secondaryPID int64
 	if err := primary.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&primaryPID); err != nil {
@@ -97,9 +126,58 @@ func newMK20ReleaseITestDB(t *testing.T) mk20ReleaseITestDB {
 		t.Fatalf("integration handles unexpectedly share backend PID %d", primaryPID)
 	}
 	t.Logf("database=%s", version)
-	t.Logf("default transaction_isolation=%s primary_backend=%d secondary_backend=%d", isolation, primaryPID, secondaryPID)
+	t.Logf("session default_transaction_isolation=%s", defaultIsolation)
+	t.Logf("HarmonyDB default transaction requested isolation=driver default displayed transaction_isolation=%s effective Yugabyte isolation=UNVERIFIED", transactionIsolation)
+	t.Logf("primary_backend=%d secondary_backend=%d", primaryPID, secondaryPID)
 
-	return mk20ReleaseITestDB{primary: primary, secondary: secondary}
+	return mk20ReleaseITestDB{primary: primary, secondary: secondary, target: target}
+}
+
+func readMK20ReleaseGateMigration(t *testing.T) string {
+	t.Helper()
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locating MK20 release integration test source")
+	}
+	path := filepath.Join(filepath.Dir(filename), "..", "..", "harmony", "harmonydb", "sql", "20260906-mk20-release-gate.sql")
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading MK20 release gate migration %s: %v", path, err)
+	}
+	return string(contents)
+}
+
+func applyMK20ReleaseGateMigration(t *testing.T, ctx context.Context, target mk20ReleaseITestTarget) {
+	t.Helper()
+	// HarmonyDB intentionally accepts only SQL literals. Use a separate pgx
+	// connection to execute the bytes read from the real migration file in the
+	// same loopback-only, random integration-test schema.
+	baseConfig, err := pgx.ParseConfig("postgresql://yugabyte:yugabyte@localhost:5433/yugabyte?sslmode=disable")
+	if err != nil {
+		t.Fatalf("building isolated migration connection config: %v", err)
+	}
+	baseConfig.Host = strings.Trim(target.host, "[]")
+	port, err := strconv.ParseUint(target.port, 10, 16)
+	if err != nil {
+		t.Fatalf("parsing isolated migration port %q: %v", target.port, err)
+	}
+	baseConfig.Port = uint16(port)
+	baseConfig.Database = target.database
+	baseConfig.User = target.username
+	baseConfig.Password = target.password
+	baseConfig.RuntimeParams["search_path"] = target.schema
+	conn, err := pgx.ConnectConfig(ctx, baseConfig)
+	if err != nil {
+		t.Fatalf("opening isolated migration connection: %v", err)
+	}
+	defer func() {
+		if err := conn.Close(context.Background()); err != nil {
+			t.Errorf("closing isolated migration connection: %v", err)
+		}
+	}()
+	if _, err := conn.Exec(ctx, readMK20ReleaseGateMigration(t)); err != nil {
+		t.Fatalf("applying MK20 release gate migration: %v", err)
+	}
 }
 
 func isLoopbackDBHost(host string) bool {
@@ -327,6 +405,47 @@ func TestMK20ReleaseDBMissingGateFailsClosed(t *testing.T) {
 	assertMK20ReleaseCounts(t, ctx, dbs.primary, 0, 1)
 }
 
+func TestMK20ReleaseDBGateMigrationIsIdempotent(t *testing.T) {
+	dbs := newMK20ReleaseITestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	var rows int
+	var singleton, token bool
+	if err := dbs.primary.QueryRow(ctx, `SELECT COUNT(*), BOOL_AND(singleton), BOOL_AND(token)
+		FROM market_mk20_release_gate`).Scan(&rows, &singleton, &token); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 || !singleton || token {
+		t.Fatalf("initial gate rows=%d singleton=%t token=%t, want one true/false singleton", rows, singleton, token)
+	}
+
+	if n, err := dbs.primary.Exec(ctx, `UPDATE market_mk20_release_gate
+		SET token = TRUE
+		WHERE singleton = TRUE`); err != nil || n != 1 {
+		t.Fatalf("setting migration token: rows=%d err=%v", n, err)
+	}
+	applyMK20ReleaseGateMigration(t, ctx, dbs.target)
+
+	if err := dbs.primary.QueryRow(ctx, `SELECT COUNT(*), BOOL_AND(singleton), BOOL_AND(token)
+		FROM market_mk20_release_gate`).Scan(&rows, &singleton, &token); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 || !singleton || !token {
+		t.Fatalf("reapplied gate rows=%d singleton=%t token=%t, want one true/true singleton", rows, singleton, token)
+	}
+	if _, err := dbs.primary.Exec(ctx, `INSERT INTO market_mk20_release_gate (singleton, token)
+		VALUES (FALSE, FALSE)`); err == nil {
+		t.Fatal("singleton CHECK constraint accepted a false key")
+	}
+	if err := dbs.primary.QueryRow(ctx, `SELECT COUNT(*) FROM market_mk20_release_gate`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("gate rows=%d after rejected second singleton, want 1", rows)
+	}
+}
+
 func TestMK20ReleaseDBPipelineInsertCallSiteUsesGate(t *testing.T) {
 	dbs := newMK20ReleaseITestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -349,6 +468,98 @@ func TestMK20ReleaseDBPipelineInsertCallSiteUsesGate(t *testing.T) {
 	}
 	if rows != 0 {
 		t.Fatalf("pipeline insert call site bypassed missing gate: rows=%d", rows)
+	}
+}
+
+func TestMK20ReleaseDBControlledPipelineInsertCallSite(t *testing.T) {
+	dbs := newMK20ReleaseITestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	const malformedID = "0"
+	if _, err := dbs.primary.Exec(ctx, `INSERT INTO market_mk20_pipeline_waiting (id) VALUES ($1)`, malformedID); err != nil {
+		t.Fatal(err)
+	}
+	validIDs := []string{
+		"01ARZ3NDEKTSV4RRFFQ69G5FAV",
+		"01ARZ3NDEKTSV4RRFFQ69G5FAW",
+		"01ARZ3NDEKTSV4RRFFQ69G5FAX",
+		"01ARZ3NDEKTSV4RRFFQ69G5FAY",
+	}
+	for i, id := range validIDs {
+		seedOfflineMK20WaitingDealWithID(t, ctx, dbs.primary, uint64(1000+i), ulid.MustParse(id))
+	}
+
+	// Exercise the real fresh sector-pressure query, including the blocked
+	// result. Removing these rows must be observed by the very next pass.
+	for i := 0; i < 9; i++ {
+		if _, err := dbs.primary.Exec(ctx, `INSERT INTO sectors_sdr_pipeline
+			(sp_id, sector_number, failed, task_id_sdr, after_sdr)
+			VALUES (9000, $1, FALSE, $2, FALSE)`, i, i+1); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := config.DefaultCurioConfig()
+	cfg.Ingest.DoSnap = false
+	cfg.Ingest.MK20PipelineInsertBatch.Set(2)
+	cfg.Ingest.MK20PipelineInsertMaxActive.Set(3)
+	market := &CurioStorageDealMarket{
+		cfg: cfg,
+		db:  dbs.secondary,
+		bp:  backpressure.NewCachedBackPressure(),
+	}
+
+	market.insertDDODealInPipeline(ctx)
+	assertMK20ReleaseCounts(t, ctx, dbs.primary, 0, len(validIDs)+1)
+	if _, err := dbs.primary.Exec(ctx, `DELETE FROM sectors_sdr_pipeline WHERE sp_id = 9000`); err != nil {
+		t.Fatal(err)
+	}
+
+	market.insertDDODealInPipeline(ctx)
+	assertMK20ReleaseCounts(t, ctx, dbs.primary, 2, len(validIDs)-1)
+
+	market.insertDDODealInPipeline(ctx)
+	assertMK20ReleaseCounts(t, ctx, dbs.primary, 3, len(validIDs)-2)
+
+	// An already-full pass must not release the final valid waiting deal.
+	market.insertDDODealInPipeline(ctx)
+	assertMK20ReleaseCounts(t, ctx, dbs.primary, 3, len(validIDs)-2)
+
+	if n, err := dbs.primary.Exec(ctx, `UPDATE market_mk20_pipeline
+		SET complete = TRUE
+		WHERE id = $1`, validIDs[0]); err != nil || n != 1 {
+		t.Fatalf("returning one fixture slot: rows=%d err=%v", n, err)
+	}
+	market.insertDDODealInPipeline(ctx)
+	assertMK20ReleaseCounts(t, ctx, dbs.primary, 3, 1)
+
+	var releasedRows, malformedWaiting, validWaiting int
+	for _, id := range validIDs {
+		var pipelineRows, waitingRows int
+		if err := dbs.primary.QueryRow(ctx, `SELECT COUNT(*)
+			FROM market_mk20_pipeline
+			WHERE id = $1`, id).Scan(&pipelineRows); err != nil {
+			t.Fatal(err)
+		}
+		if err := dbs.primary.QueryRow(ctx, `SELECT COUNT(*)
+			FROM market_mk20_pipeline_waiting
+			WHERE id = $1`, id).Scan(&waitingRows); err != nil {
+			t.Fatal(err)
+		}
+		if pipelineRows != 1 || waitingRows != 0 {
+			t.Fatalf("deal %s pipeline rows=%d waiting rows=%d, want 1/0", id, pipelineRows, waitingRows)
+		}
+		releasedRows += pipelineRows
+		validWaiting += waitingRows
+	}
+	if err := dbs.primary.QueryRow(ctx, `SELECT COUNT(*)
+		FROM market_mk20_pipeline_waiting
+		WHERE id = $1`, malformedID).Scan(&malformedWaiting); err != nil {
+		t.Fatal(err)
+	}
+	if releasedRows != len(validIDs) || malformedWaiting != 1 || validWaiting != 0 {
+		t.Fatalf("released rows=%d malformed waiting=%d valid waiting=%d", releasedRows, malformedWaiting, validWaiting)
 	}
 }
 
@@ -475,6 +686,16 @@ func seedHTTPMK20WaitingDeal(t *testing.T, ctx context.Context, db *harmonydb.DB
 
 func seedMK20WaitingDeal(t *testing.T, ctx context.Context, db *harmonydb.DB, providerID uint64, useHTTP bool) string {
 	t.Helper()
+	return seedMK20WaitingDealWithID(t, ctx, db, providerID, useHTTP, ulid.MustNew(ulid.Timestamp(time.Now()), rand.Reader))
+}
+
+func seedOfflineMK20WaitingDealWithID(t *testing.T, ctx context.Context, db *harmonydb.DB, providerID uint64, id ulid.ULID) string {
+	t.Helper()
+	return seedMK20WaitingDealWithID(t, ctx, db, providerID, false, id)
+}
+
+func seedMK20WaitingDealWithID(t *testing.T, ctx context.Context, db *harmonydb.DB, providerID uint64, useHTTP bool, id ulid.ULID) string {
+	t.Helper()
 	provider, err := address.NewIDAddress(providerID)
 	if err != nil {
 		t.Fatal(err)
@@ -497,7 +718,7 @@ func seedMK20WaitingDeal(t *testing.T, ctx context.Context, db *harmonydb.DB, pr
 	}
 
 	deal := &mk20.Deal{
-		Identifier: ulid.MustNew(ulid.Timestamp(time.Now()), rand.Reader),
+		Identifier: id,
 		Client:     fmt.Sprintf("client-%d", providerID),
 		Data:       data,
 		Products: mk20.Products{
@@ -549,16 +770,9 @@ func assertMK20ReleaseCounts(t *testing.T, ctx context.Context, db *harmonydb.DB
 
 // mk20ReleaseITestSchema is a focused projection of the current Curio schema.
 // Production columns and primary keys used by DealFromTX,
-// insertPiecesInTransaction, and release accounting are retained. The two
-// release_* tables are test-only probes for transaction rollback/retry.
+// insertPiecesInTransaction, pressure checks, and release accounting are
+// retained. release_retry_writes is a test-only transaction-retry probe.
 const mk20ReleaseITestSchema = `
-CREATE TABLE market_mk20_release_gate (
-    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton = TRUE),
-    token BOOLEAN NOT NULL DEFAULT FALSE
-);
-
-INSERT INTO market_mk20_release_gate (singleton, token) VALUES (TRUE, FALSE);
-
 CREATE TABLE market_mk20_deal (
     created_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('UTC', NOW()),
     id TEXT PRIMARY KEY,
@@ -648,7 +862,32 @@ CREATE TABLE sectors_sdr_pipeline (
     sp_id BIGINT NOT NULL,
     sector_number BIGINT NOT NULL,
     failed BOOLEAN NOT NULL DEFAULT FALSE,
+	task_id_sdr BIGINT,
+	after_sdr BOOLEAN NOT NULL DEFAULT FALSE,
+	task_id_tree_r BIGINT,
+	after_tree_r BOOLEAN NOT NULL DEFAULT FALSE,
+	task_id_porep BIGINT,
+	after_porep BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (sp_id, sector_number)
+);
+
+CREATE TABLE harmony_task (
+    id BIGINT PRIMARY KEY,
+    owner_id BIGINT
+);
+
+CREATE TABLE open_sector_pieces (
+    sp_id BIGINT NOT NULL,
+    sector_number BIGINT NOT NULL,
+    piece_index INT NOT NULL,
+    PRIMARY KEY (sp_id, sector_number, piece_index)
+);
+
+CREATE TABLE sectors_sdr_initial_pieces (
+    sp_id BIGINT NOT NULL,
+    sector_number BIGINT NOT NULL,
+    piece_index INT NOT NULL,
+    PRIMARY KEY (sp_id, sector_number, piece_index)
 );
 
 CREATE TABLE release_retry_writes (

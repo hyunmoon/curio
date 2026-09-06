@@ -199,3 +199,30 @@ level. At minimum, validate:
 These checks must use separate database connections and the real database
 conflict behavior, not a process-local mutex. Until that YugabyteDB run is
 completed successfully, production concurrency readiness remains unverified.
+
+The opt-in tests record `SELECT version()`, the session default isolation,
+and the value reported by `SHOW transaction_isolation` inside a HarmonyDB
+transaction. The production-core retry test also records that it requested
+`REPEATABLE READ` and the value SQL reports for that stale-snapshot
+transaction.
+These are requested/reported isolation values only. `SHOW
+transaction_isolation` does not establish whether YugabyteDB's read-committed
+isolation flag is enabled or which effective isolation implementation handled
+the transaction, so the tests report effective YugabyteDB isolation as
+`UNVERIFIED` unless that server configuration is independently confirmed in
+the disposable test environment. A later YugabyteDB run should record the
+server version and independently confirmed state of
+`yb_enable_read_committed_isolation`; if that evidence is unavailable, its
+effective isolation result must remain `UNVERIFIED` rather than being inferred
+from `SHOW transaction_isolation`.
+
+The focused fixture applies the actual
+`harmony/harmonydb/sql/20260906-mk20-release-gate.sql` migration. It verifies
+singleton initialization, idempotent reapplication without resetting the
+live token, and the singleton constraint. The call-site test executes
+`CurioStorageDealMarket.insertDDODealInPipeline` with real fresh pressure SQL,
+positive batch and active limits, cursor wrap, and slot return after a
+fixture-owned completion. The retry test runs the production release core and
+HarmonyDB transaction adapter, forces a real serialization failure after a
+provisional release, and verifies that the retried callback uses fresh
+capacity or waiting state without leaking the rolled-back result.
