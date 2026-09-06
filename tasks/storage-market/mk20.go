@@ -864,41 +864,18 @@ func findMK20PieceOffset(pieces []mk20SectorPiece, pieceCID string, pieceSize ab
 func (d *CurioStorageDealMarket) addDealOffset(ctx context.Context, piece MK20PipelinePiece) error {
 	// Get the deal offset if sector has started sealing
 	if piece.Sector.Valid && piece.RegSealProof.Valid && !piece.SectorOffset.Valid {
+		target := mk20OffsetTarget{
+			ID:               piece.ID,
+			SPID:             piece.SPID,
+			AggregationIndex: piece.AggregationIndex,
+			Sector:           piece.Sector.Int64,
+			RegSealProof:     piece.RegSealProof.Int64,
+			PieceCID:         piece.PieceCID,
+			PieceSize:        piece.PieceSize,
+		}
+
 		_, err := d.db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (commit bool, err error) {
-			var pieceList []mk20SectorPiece
-			err = tx.Select(&pieceList, `SELECT piece_cid, piece_size, piece_index
-												FROM sectors_sdr_initial_pieces
-												WHERE sp_id = $1 AND sector_number = $2
-												
-												UNION ALL
-												
-												SELECT piece_cid, piece_size, piece_index
-												FROM sectors_snap_initial_pieces
-												WHERE sp_id = $1 AND sector_number = $2
-												
-												ORDER BY piece_index ASC;`, piece.SPID, piece.Sector.Int64)
-			if err != nil {
-				return false, xerrors.Errorf("getting pieces for sector: %w", err)
-			}
-
-			if len(pieceList) == 0 {
-				// Sector might be waiting for more deals
-				return false, nil
-			}
-
-			offset, found := findMK20PieceOffset(pieceList, piece.PieceCID, abi.PaddedPieceSize(piece.PieceSize))
-			if !found {
-				return false, xerrors.Errorf("failed to find deal offset for piece %s", piece.PieceCID)
-			}
-
-			n, err := tx.Exec(`UPDATE market_mk20_pipeline SET sector_offset = $1 WHERE id = $2 AND sector = $3 AND sector_offset IS NULL`, offset, piece.ID, piece.Sector.Int64)
-			if err != nil {
-				return false, xerrors.Errorf("updating deal offset: %w", err)
-			}
-			if n != 1 {
-				return false, xerrors.Errorf("expected to update 1 deal, updated %d", n)
-			}
-			return true, nil
+			return resolveMK20PieceOffset(&harmonyMK20OffsetStore{tx: tx}, target)
 		}, harmonydb.OptionRetry())
 		if err != nil {
 			return xerrors.Errorf("failed to get deal offset: %w", err)
