@@ -3,7 +3,9 @@ package seal
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/builtin"
 	"github.com/filecoin-project/go-state-types/crypto"
 	"github.com/filecoin-project/go-state-types/network"
 
@@ -24,8 +27,11 @@ import (
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
+	"github.com/filecoin-project/lotus/chain/actors/policy"
 	"github.com/filecoin-project/lotus/chain/types"
 )
+
+const testPrecommitHead = abi.ChainEpoch(1000)
 
 // mockPrecommitAPI implements the minimal SubmitPrecommitTaskApi interface for testing
 type mockPrecommitAPI struct {
@@ -35,6 +41,7 @@ type mockPrecommitAPI struct {
 	head           *types.TipSet
 	minerInfo      api.MinerInfo
 	precommitErr   error
+	networkVersion network.Version
 	chainHeadCalls int
 }
 
@@ -55,7 +62,7 @@ func (m *mockPrecommitAPI) StateMinerInfo(context.Context, address.Address, type
 }
 
 func (m *mockPrecommitAPI) StateNetworkVersion(context.Context, types.TipSetKey) (network.Version, error) {
-	return network.Version21, nil
+	return m.networkVersion, nil
 }
 
 func (m *mockPrecommitAPI) StateMinerAvailableBalance(context.Context, address.Address, types.TipSetKey) (big.Int, error) {
@@ -226,8 +233,9 @@ func makeSubmitPrecommitTaskForTest(t *testing.T, sectors []precommitSectorParam
 	}
 	sender := &mockPrecommitMessageSender{cid: messageCID}
 	testAPI := &mockPrecommitAPI{
-		head:      makePrecommitTipSet(t, 1000),
-		minerInfo: api.MinerInfo{Worker: worker},
+		head:           makePrecommitTipSet(t, testPrecommitHead),
+		minerInfo:      api.MinerInfo{Worker: worker},
+		networkVersion: network.Version21,
 	}
 	task := &SubmitPrecommitTask{
 		store:  store,
@@ -249,6 +257,32 @@ func makePrecommitSector(sectorNumber int64) precommitSectorParams {
 		SealedCID:    COMMITMENT_CID,
 		UnsealedCID:  COMMITMENT_CID,
 	}
+}
+
+func precommitEpoch(epoch abi.ChainEpoch) sql.NullInt64 {
+	return sql.NullInt64{Int64: int64(epoch), Valid: true}
+}
+
+func makeDirectPrecommitPiece(start, end abi.ChainEpoch) precommitPiece {
+	return precommitPiece{
+		DirectDealStartEpoch: precommitEpoch(start),
+		DirectDealEndEpoch:   precommitEpoch(end),
+	}
+}
+
+func makeF05PrecommitPiece(start, end abi.ChainEpoch) precommitPiece {
+	return precommitPiece{
+		F05DealStartEpoch: precommitEpoch(start),
+		F05DealEndEpoch:   precommitEpoch(end),
+	}
+}
+
+func currentProtocolMaxExpiration(t *testing.T) (abi.ChainEpoch, abi.ChainEpoch) {
+	t.Helper()
+
+	maxExtension, err := policy.GetMaxSectorExpirationExtension(network.Version21)
+	require.NoError(t, err)
+	return testPrecommitHead + maxExtension, maxExtension
 }
 
 func decodePrecommitParams(t *testing.T, msg *types.Message) miner.PreCommitSectorBatchParams2 {
@@ -769,8 +803,8 @@ func TestSubmitPrecommitMixedBatchIsolatesPastStartSector(t *testing.T) {
 	task, store, sender, _ := makeSubmitPrecommitTaskForTest(t,
 		[]precommitSectorParams{expired, valid},
 		map[precommitSectorKey][]precommitPiece{
-			{spID: expired.SpID, sectorNumber: expired.SectorNumber}: {{DealStartEpoch: 999, DealEndEpoch: 600000}},
-			{spID: valid.SpID, sectorNumber: valid.SectorNumber}:     {{DealStartEpoch: 1100, DealEndEpoch: 600000}},
+			{spID: expired.SpID, sectorNumber: expired.SectorNumber}: {makeDirectPrecommitPiece(999, 600000)},
+			{spID: valid.SpID, sectorNumber: valid.SectorNumber}:     {makeDirectPrecommitPiece(1100, 600000)},
 		})
 
 	done, err := task.Do(t.Context(), taskID, func() bool { return true })
@@ -821,7 +855,7 @@ func TestSubmitPrecommitMultipleInvalidSectorsKeepValidSubset(t *testing.T) {
 	task, store, sender, _ := makeSubmitPrecommitTaskForTest(t,
 		[]precommitSectorParams{pastStart, expiredTicket, validA, validB},
 		map[precommitSectorKey][]precommitPiece{
-			{spID: pastStart.SpID, sectorNumber: pastStart.SectorNumber}: {{DealStartEpoch: 999, DealEndEpoch: 600000}},
+			{spID: pastStart.SpID, sectorNumber: pastStart.SectorNumber}: {makeDirectPrecommitPiece(999, 600000)},
 		})
 
 	done, err := task.Do(t.Context(), taskID, func() bool { return true })
@@ -846,7 +880,7 @@ func TestSubmitPrecommitPreviouslyFailedAndNewValidationFailure(t *testing.T) {
 	task, store, sender, _ := makeSubmitPrecommitTaskForTest(t,
 		[]precommitSectorParams{previouslyFailed, pastStart, valid},
 		map[precommitSectorKey][]precommitPiece{
-			{spID: pastStart.SpID, sectorNumber: pastStart.SectorNumber}: {{DealStartEpoch: 999, DealEndEpoch: 600000}},
+			{spID: pastStart.SpID, sectorNumber: pastStart.SectorNumber}: {makeDirectPrecommitPiece(999, 600000)},
 		})
 
 	done, err := task.Do(t.Context(), taskID, func() bool { return true })
@@ -868,7 +902,7 @@ func TestSubmitPrecommitAllValidationFailuresCompleteWithoutMessage(t *testing.T
 	task, store, sender, _ := makeSubmitPrecommitTaskForTest(t,
 		[]precommitSectorParams{pastStart, expiredTicket},
 		map[precommitSectorKey][]precommitPiece{
-			{spID: pastStart.SpID, sectorNumber: pastStart.SectorNumber}: {{DealStartEpoch: 999, DealEndEpoch: 600000}},
+			{spID: pastStart.SpID, sectorNumber: pastStart.SectorNumber}: {makeDirectPrecommitPiece(999, 600000)},
 		})
 
 	done, err := task.Do(t.Context(), harmonytask.TaskID(64), func() bool { return true })
@@ -884,7 +918,7 @@ func TestSubmitPrecommitInfrastructureErrorsRemainRetryable(t *testing.T) {
 	valid := makePrecommitSector(701)
 	pastStart := makePrecommitSector(702)
 	pieces := map[precommitSectorKey][]precommitPiece{
-		{spID: pastStart.SpID, sectorNumber: pastStart.SectorNumber}: {{DealStartEpoch: 999, DealEndEpoch: 600000}},
+		{spID: pastStart.SpID, sectorNumber: pastStart.SectorNumber}: {makeDirectPrecommitPiece(999, 600000)},
 	}
 
 	tests := []struct {
@@ -919,7 +953,7 @@ func TestSubmitPrecommitInfrastructureErrorsRemainRetryable(t *testing.T) {
 			configure: func(store *mockPrecommitTaskStore, _ *mockPrecommitMessageSender, _ *mockPrecommitAPI) {
 				store.failSectorErr = errors.New("failure update failed")
 			},
-			errorMatch: "persisting precommit start epoch expiry",
+			errorMatch: "persisting precommit sector validation error",
 		},
 		{
 			name:    "precommit deposit RPC",
@@ -977,6 +1011,420 @@ func TestSubmitPrecommitInfrastructureErrorsRemainRetryable(t *testing.T) {
 	}
 }
 
+func TestCalculatePrecommitExpirationByPieceType(t *testing.T) {
+	protocolMax, maxExtension := currentProtocolMaxExpiration(t)
+	const ticketEpoch = abi.ChainEpoch(900)
+	minimumExpiration := ticketEpoch + policy.MaxPreCommitRandomnessLookback + miner.MinSectorExpiration
+	validStart := testPrecommitHead + 1
+	directUnderMax := testPrecommitHead + 365*builtin.EpochsInDay
+	f05UnderMax := testPrecommitHead + 300*builtin.EpochsInDay
+	fiveYearDirectEnd := testPrecommitHead + builtin.EpochsInFiveYears
+
+	tests := []struct {
+		name        string
+		pieces      []precommitPiece
+		want        abi.ChainEpoch
+		wantFailure string
+	}{
+		{
+			name:   "direct below protocol maximum",
+			pieces: []precommitPiece{makeDirectPrecommitPiece(validStart, directUnderMax)},
+			want:   directUnderMax,
+		},
+		{
+			name:   "direct exactly at protocol maximum",
+			pieces: []precommitPiece{makeDirectPrecommitPiece(validStart, protocolMax)},
+			want:   protocolMax,
+		},
+		{
+			name:   "five-year direct above protocol maximum is clamped",
+			pieces: []precommitPiece{makeDirectPrecommitPiece(validStart, fiveYearDirectEnd)},
+			want:   protocolMax,
+		},
+		{
+			name:   "F05 below protocol maximum",
+			pieces: []precommitPiece{makeF05PrecommitPiece(validStart, f05UnderMax)},
+			want:   f05UnderMax,
+		},
+		{
+			name:   "F05 exactly at protocol maximum",
+			pieces: []precommitPiece{makeF05PrecommitPiece(validStart, protocolMax)},
+			want:   protocolMax,
+		},
+		{
+			name:        "F05 above protocol maximum is rejected",
+			pieces:      []precommitPiece{makeF05PrecommitPiece(validStart, protocolMax+1)},
+			wantFailure: "precommit-expiration",
+		},
+		{
+			name: "mixed F05 and long direct uses direct clamp",
+			pieces: []precommitPiece{
+				makeF05PrecommitPiece(validStart, f05UnderMax),
+				makeDirectPrecommitPiece(validStart, fiveYearDirectEnd),
+			},
+			want: protocolMax,
+		},
+		{
+			name: "mixed sector does not truncate excessive F05 end",
+			pieces: []precommitPiece{
+				makeF05PrecommitPiece(validStart, protocolMax+1),
+				makeDirectPrecommitPiece(validStart, fiveYearDirectEnd),
+			},
+			wantFailure: "precommit-expiration",
+		},
+		{
+			name: "nullable and zero epochs preserve minimum",
+			pieces: []precommitPiece{{
+				F05DealStartEpoch:    sql.NullInt64{},
+				F05DealEndEpoch:      sql.NullInt64{Int64: 0, Valid: true},
+				DirectDealStartEpoch: sql.NullInt64{Int64: 0, Valid: true},
+				DirectDealEndEpoch:   sql.NullInt64{},
+			}},
+			want: minimumExpiration,
+		},
+		{
+			name: "nil direct start preserves a valid direct end",
+			pieces: []precommitPiece{{
+				DirectDealStartEpoch: sql.NullInt64{},
+				DirectDealEndEpoch:   precommitEpoch(directUnderMax),
+			}},
+			want: directUnderMax,
+		},
+		{
+			name: "nil F05 start preserves a valid F05 end",
+			pieces: []precommitPiece{{
+				F05DealStartEpoch: sql.NullInt64{},
+				F05DealEndEpoch:   precommitEpoch(f05UnderMax),
+			}},
+			want: f05UnderMax,
+		},
+		{
+			name: "past F05 start is rejected independently",
+			pieces: []precommitPiece{{
+				F05DealStartEpoch:    precommitEpoch(testPrecommitHead - 1),
+				F05DealEndEpoch:      precommitEpoch(f05UnderMax),
+				DirectDealStartEpoch: precommitEpoch(validStart),
+				DirectDealEndEpoch:   precommitEpoch(directUnderMax),
+			}},
+			wantFailure: "past-start-epoch",
+		},
+		{
+			name: "past direct start is rejected independently",
+			pieces: []precommitPiece{{
+				F05DealStartEpoch:    precommitEpoch(validStart),
+				F05DealEndEpoch:      precommitEpoch(f05UnderMax),
+				DirectDealStartEpoch: precommitEpoch(testPrecommitHead - 1),
+				DirectDealEndEpoch:   precommitEpoch(directUnderMax),
+			}},
+			wantFailure: "past-start-epoch",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			originalPieces := append([]precommitPiece(nil), test.pieces...)
+			expiration, failure := calculatePrecommitExpiration(
+				testPrecommitHead, ticketEpoch, 0, maxExtension, sql.NullInt64{}, test.pieces)
+
+			if test.wantFailure != "" {
+				require.Zero(t, expiration)
+				require.NotNil(t, failure)
+				require.Equal(t, test.wantFailure, failure.reason)
+			} else {
+				require.Nil(t, failure)
+				require.Equal(t, test.want, expiration)
+			}
+			require.Equal(t, originalPieces, test.pieces, "expiration calculation must not mutate stored piece epochs")
+		})
+	}
+}
+
+func TestCalculatePrecommitExpirationNoPieceDurations(t *testing.T) {
+	_, maxExtension := currentProtocolMaxExpiration(t)
+	const ticketEpoch = abi.ChainEpoch(900)
+
+	tests := []struct {
+		name         string
+		userDuration sql.NullInt64
+		want         abi.ChainEpoch
+		wantFailure  string
+	}{
+		{
+			name: "CC default duration",
+			want: ticketEpoch + maxExtension,
+		},
+		{
+			name:         "existing user duration",
+			userDuration: sql.NullInt64{Int64: 700000, Valid: true},
+			want:         ticketEpoch + 700000,
+		},
+		{
+			name:         "user duration above protocol maximum",
+			userDuration: sql.NullInt64{Int64: int64(testPrecommitHead + maxExtension - ticketEpoch + 1), Valid: true},
+			wantFailure:  "precommit-expiration",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			expiration, failure := calculatePrecommitExpiration(
+				testPrecommitHead, ticketEpoch, 0, maxExtension, test.userDuration, nil)
+			if test.wantFailure != "" {
+				require.Zero(t, expiration)
+				require.NotNil(t, failure)
+				require.Equal(t, test.wantFailure, failure.reason)
+				return
+			}
+			require.Nil(t, failure)
+			require.Equal(t, test.want, expiration)
+		})
+	}
+}
+
+func TestSubmitPrecommitExpirationByPieceType(t *testing.T) {
+	protocolMax, _ := currentProtocolMaxExpiration(t)
+	directUnderMax := testPrecommitHead + 365*builtin.EpochsInDay
+	f05UnderMax := testPrecommitHead + 300*builtin.EpochsInDay
+	start := testPrecommitHead + 100
+
+	tests := []struct {
+		name       string
+		pieces     []precommitPiece
+		expiration abi.ChainEpoch
+	}{
+		{
+			name:       "direct below maximum",
+			pieces:     []precommitPiece{makeDirectPrecommitPiece(start, directUnderMax)},
+			expiration: directUnderMax,
+		},
+		{
+			name:       "five-year direct uses protocol maximum",
+			pieces:     []precommitPiece{makeDirectPrecommitPiece(start, testPrecommitHead+builtin.EpochsInFiveYears)},
+			expiration: protocolMax,
+		},
+		{
+			name:       "direct exactly at maximum",
+			pieces:     []precommitPiece{makeDirectPrecommitPiece(start, protocolMax)},
+			expiration: protocolMax,
+		},
+		{
+			name:       "F05 below maximum",
+			pieces:     []precommitPiece{makeF05PrecommitPiece(start, f05UnderMax)},
+			expiration: f05UnderMax,
+		},
+		{
+			name:       "F05 exactly at maximum",
+			pieces:     []precommitPiece{makeF05PrecommitPiece(start, protocolMax)},
+			expiration: protocolMax,
+		},
+		{
+			name: "mixed F05 and direct",
+			pieces: []precommitPiece{
+				makeF05PrecommitPiece(start, f05UnderMax),
+				makeDirectPrecommitPiece(start, testPrecommitHead+builtin.EpochsInFiveYears),
+			},
+			expiration: protocolMax,
+		},
+	}
+
+	for i, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sector := makePrecommitSector(int64(800 + i))
+			key := precommitSectorKey{spID: sector.SpID, sectorNumber: sector.SectorNumber}
+			originalPieces := append([]precommitPiece(nil), test.pieces...)
+			task, store, sender, _ := makeSubmitPrecommitTaskForTest(t,
+				[]precommitSectorParams{sector},
+				map[precommitSectorKey][]precommitPiece{key: test.pieces})
+
+			done, err := task.Do(t.Context(), harmonytask.TaskID(80+i), func() bool { return true })
+			require.NoError(t, err)
+			require.True(t, done)
+			require.Empty(t, store.failures)
+			require.Len(t, sender.messages, 1)
+			params := decodePrecommitParams(t, sender.messages[0])
+			require.Len(t, params.Sectors, 1)
+			require.Equal(t, test.expiration, params.Sectors[0].Expiration)
+			require.Equal(t, []int64{sector.SectorNumber}, store.messageSectors)
+			require.Equal(t, originalPieces, store.pieces[key], "precommit calculation must not mutate requested schedules")
+		})
+	}
+}
+
+func TestSubmitPrecommitNoPieceDurations(t *testing.T) {
+	_, maxExtension := currentProtocolMaxExpiration(t)
+
+	for i, test := range []struct {
+		name         string
+		userDuration sql.NullInt64
+		want         abi.ChainEpoch
+	}{
+		{
+			name: "CC default duration",
+			want: abi.ChainEpoch(900) + maxExtension,
+		},
+		{
+			name:         "existing user duration",
+			userDuration: sql.NullInt64{Int64: 700000, Valid: true},
+			want:         700900,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sector := makePrecommitSector(int64(880 + i))
+			sector.UserSectorDurationEpochs = test.userDuration
+			task, store, sender, _ := makeSubmitPrecommitTaskForTest(t, []precommitSectorParams{sector}, nil)
+
+			done, err := task.Do(t.Context(), harmonytask.TaskID(88+i), func() bool { return true })
+			require.NoError(t, err)
+			require.True(t, done)
+			require.Empty(t, store.failures)
+			require.Len(t, sender.messages, 1)
+			params := decodePrecommitParams(t, sender.messages[0])
+			require.Len(t, params.Sectors, 1)
+			require.Equal(t, test.want, params.Sectors[0].Expiration)
+		})
+	}
+}
+
+func TestSubmitPrecommitUsesNetworkAwareMaxExtension(t *testing.T) {
+	for _, nv := range []network.Version{network.Version18, network.Version21} {
+		t.Run(fmt.Sprintf("network-%d", nv), func(t *testing.T) {
+			maxExtension, err := policy.GetMaxSectorExpirationExtension(nv)
+			require.NoError(t, err)
+
+			sector := makePrecommitSector(int64(900 + nv))
+			key := precommitSectorKey{spID: sector.SpID, sectorNumber: sector.SectorNumber}
+			task, store, sender, testAPI := makeSubmitPrecommitTaskForTest(t,
+				[]precommitSectorParams{sector},
+				map[precommitSectorKey][]precommitPiece{
+					key: {makeDirectPrecommitPiece(testPrecommitHead+1, testPrecommitHead+builtin.EpochsInFiveYears)},
+				})
+			testAPI.networkVersion = nv
+
+			done, err := task.Do(t.Context(), harmonytask.TaskID(90+nv), func() bool { return true })
+			require.NoError(t, err)
+			require.True(t, done)
+			require.Empty(t, store.failures)
+			require.Len(t, sender.messages, 1)
+			params := decodePrecommitParams(t, sender.messages[0])
+			require.Len(t, params.Sectors, 1)
+			require.Equal(t, testPrecommitHead+maxExtension, params.Sectors[0].Expiration)
+		})
+	}
+}
+
+func TestSubmitPrecommitF05BeyondProtocolMaxIsolated(t *testing.T) {
+	protocolMax, maxExtension := currentProtocolMaxExpiration(t)
+	start := testPrecommitHead + 100
+	validEnd := testPrecommitHead + 365*builtin.EpochsInDay
+
+	for i, test := range []struct {
+		name          string
+		invalidPieces []precommitPiece
+	}{
+		{
+			name:          "F05 only",
+			invalidPieces: []precommitPiece{makeF05PrecommitPiece(start, protocolMax+1)},
+		},
+		{
+			name: "mixed F05 and direct",
+			invalidPieces: []precommitPiece{
+				makeF05PrecommitPiece(start, protocolMax+1),
+				makeDirectPrecommitPiece(start, testPrecommitHead+builtin.EpochsInFiveYears),
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			invalid := makePrecommitSector(int64(1000 + i*2))
+			valid := makePrecommitSector(invalid.SectorNumber + 1)
+			invalidKey := precommitSectorKey{spID: invalid.SpID, sectorNumber: invalid.SectorNumber}
+			validKey := precommitSectorKey{spID: valid.SpID, sectorNumber: valid.SectorNumber}
+			task, store, sender, _ := makeSubmitPrecommitTaskForTest(t,
+				[]precommitSectorParams{invalid, valid},
+				map[precommitSectorKey][]precommitPiece{
+					invalidKey: test.invalidPieces,
+					validKey:   {makeDirectPrecommitPiece(start, validEnd)},
+				})
+
+			done, err := task.Do(t.Context(), harmonytask.TaskID(100+i), func() bool { return true })
+			require.NoError(t, err)
+			require.True(t, done)
+			failure, ok := store.failures[invalidKey]
+			require.True(t, ok)
+			require.Equal(t, "precommit-expiration", failure.reason)
+			require.Equal(t, fmt.Sprintf(
+				"requested F05 end %d exceeds protocol max expiration %d (current head %d, max extension %d)",
+				protocolMax+1, protocolMax, testPrecommitHead, maxExtension), failure.message)
+			require.NotContains(t, store.failures, validKey)
+			require.Len(t, sender.messages, 1)
+			params := decodePrecommitParams(t, sender.messages[0])
+			require.Len(t, params.Sectors, 1)
+			require.Equal(t, abi.SectorNumber(valid.SectorNumber), params.Sectors[0].SectorNumber)
+			require.Equal(t, validEnd, params.Sectors[0].Expiration)
+			require.Equal(t, []int64{valid.SectorNumber}, store.messageSectors)
+		})
+	}
+}
+
+func TestSubmitPrecommitAllF05BeyondProtocolMaxCompletesWithoutMessage(t *testing.T) {
+	protocolMax, _ := currentProtocolMaxExpiration(t)
+	sector := makePrecommitSector(1090)
+	key := precommitSectorKey{spID: sector.SpID, sectorNumber: sector.SectorNumber}
+	task, store, sender, _ := makeSubmitPrecommitTaskForTest(t,
+		[]precommitSectorParams{sector},
+		map[precommitSectorKey][]precommitPiece{
+			key: {makeF05PrecommitPiece(testPrecommitHead+1, protocolMax+1)},
+		})
+
+	done, err := task.Do(t.Context(), harmonytask.TaskID(109), func() bool { return true })
+	require.NoError(t, err)
+	require.True(t, done)
+	require.Equal(t, "precommit-expiration", store.failures[key].reason)
+	require.Empty(t, sender.messages)
+	require.Empty(t, store.messageSectors)
+	require.Empty(t, store.messageWaits)
+}
+
+func TestCalculatePrecommitExpirationRejectsMinimumBeyondProtocolMax(t *testing.T) {
+	const maxExtension = abi.ChainEpoch(100)
+	expiration, failure := calculatePrecommitExpiration(
+		testPrecommitHead,
+		testPrecommitHead,
+		maxExtension,
+		maxExtension,
+		sql.NullInt64{},
+		[]precommitPiece{makeDirectPrecommitPiece(testPrecommitHead+1, testPrecommitHead+50)},
+	)
+
+	require.Zero(t, expiration)
+	require.NotNil(t, failure)
+	require.Equal(t, "precommit-expiration", failure.reason)
+	require.Contains(t, failure.message, "minimum expiration")
+	require.Contains(t, failure.message, fmt.Sprintf("protocol max expiration %d", testPrecommitHead+maxExtension))
+}
+
+func TestSubmitPrecommitMinimumBeyondProtocolMaxFailsSector(t *testing.T) {
+	protocolMax, _ := currentProtocolMaxExpiration(t)
+	sector := makePrecommitSector(1100)
+	sector.TicketEpoch = protocolMax
+	key := precommitSectorKey{spID: sector.SpID, sectorNumber: sector.SectorNumber}
+	task, store, sender, _ := makeSubmitPrecommitTaskForTest(t,
+		[]precommitSectorParams{sector},
+		map[precommitSectorKey][]precommitPiece{
+			key: {makeDirectPrecommitPiece(testPrecommitHead+1, testPrecommitHead+365*builtin.EpochsInDay)},
+		})
+
+	done, err := task.Do(t.Context(), harmonytask.TaskID(110), func() bool { return true })
+	require.NoError(t, err)
+	require.True(t, done)
+	require.Empty(t, sender.messages)
+	require.Empty(t, store.messageSectors)
+	require.Empty(t, store.messageWaits)
+	failure, ok := store.failures[key]
+	require.True(t, ok)
+	require.Equal(t, "precommit-expiration", failure.reason)
+	require.Contains(t, failure.message, "minimum expiration")
+}
+
 func TestSubmitPrecommitSQLScopesValidationFailure(t *testing.T) {
 	normalize := func(query string) string {
 		return strings.ToLower(strings.Join(strings.Fields(query), " "))
@@ -984,4 +1432,8 @@ func TestSubmitPrecommitSQLScopesValidationFailure(t *testing.T) {
 
 	failSQL := normalize(SUBMIT_PRECOMMIT_FAIL_SECTOR_SQL)
 	require.Contains(t, failSQL, "where task_id_precommit_msg = $3 and sp_id = $4 and sector_number = $5 and failed = false")
+
+	pieceSQL := normalize(SUBMIT_PRECOMMIT_LOAD_PIECES_SQL)
+	require.Contains(t, pieceSQL, "f05_deal_start_epoch, f05_deal_end_epoch, direct_start_epoch, direct_end_epoch")
+	require.NotContains(t, pieceSQL, "coalesce(")
 }
