@@ -606,24 +606,31 @@ func TestMK20OffsetDBIndependentConnections(t *testing.T) {
 		var firstResolvedOnce sync.Once
 		releaseFirst := make(chan struct{})
 		var releaseFirstOnce sync.Once
-		t.Cleanup(func() { releaseFirstOnce.Do(func() { close(releaseFirst) }) })
 		firstDone := make(chan mk20OffsetITestTxnResult, 1)
-		secondReturned := make(chan struct{})
-		var secondReturnedOnce sync.Once
-		secondPID := make(chan int, 1)
-		var secondPIDOnce sync.Once
 		secondDone := make(chan mk20OffsetITestTxnResult, 1)
+		holderPIDs := make(chan int, 8)
+		recorder := newMK20OffsetITestContentionRecorder()
+		firstCtx, cancelFirst := context.WithTimeout(context.Background(), mk20OffsetITestTimeout)
+		secondCtx, cancelSecond := context.WithTimeout(context.Background(), mk20OffsetITestTimeout)
+		var participants sync.WaitGroup
+		release := func() { releaseFirstOnce.Do(func() { close(releaseFirst) }) }
+		registerMK20OffsetITestParticipantCleanup(t, &participants, release, cancelFirst, cancelSecond)
 
+		participants.Add(1)
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), mk20OffsetITestTimeout)
-			defer cancel()
-			committed, err := fixture.DB.BeginTransaction(ctx, func(tx *harmonydb.Tx) (bool, error) {
+			defer participants.Done()
+			committed, err := fixture.DB.BeginTransaction(firstCtx, func(tx *harmonydb.Tx) (bool, error) {
+				pid, pidErr := mk20OffsetITestBackendPID(tx)
+				if pidErr != nil {
+					return false, pidErr
+				}
+				holderPIDs <- pid
 				updated, resolveErr := resolveMK20PieceOffset(&harmonyMK20OffsetStore{tx: tx}, target)
 				firstResolvedOnce.Do(func() { close(firstResolved) })
 				select {
 				case <-releaseFirst:
-				case <-ctx.Done():
-					return false, ctx.Err()
+				case <-firstCtx.Done():
+					return false, firstCtx.Err()
 				}
 				return updated, resolveErr
 			}, harmonydb.OptionRetry())
@@ -631,45 +638,52 @@ func TestMK20OffsetDBIndependentConnections(t *testing.T) {
 		}()
 
 		requireSignalBefore(t, firstResolved, mk20OffsetITestTimeout)
+		holderPID := requireIntResult(t, holderPIDs)
+		participants.Add(1)
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), mk20OffsetITestTimeout)
-			defer cancel()
+			defer participants.Done()
 			var finalUpdated bool
-			committed, err := peer.BeginTransaction(ctx, func(tx *harmonydb.Tx) (bool, error) {
+			committed, err := peer.BeginTransaction(secondCtx, func(tx *harmonydb.Tx) (bool, error) {
 				finalUpdated = false
 				pid, pidErr := mk20OffsetITestBackendPID(tx)
 				if pidErr != nil {
 					return false, pidErr
 				}
-				secondPIDOnce.Do(func() { secondPID <- pid })
+				attempt := recorder.beginAttempt(pid)
 				store := &mk20OffsetITestLockProbeStore{
 					harmonyMK20OffsetStore: harmonyMK20OffsetStore{tx: tx},
-					returned:               secondReturned,
-					doneOnce:               &secondReturnedOnce,
+					attempt:                attempt,
+					recorder:               recorder,
 				}
 				updated, resolveErr := resolveMK20PieceOffset(store, target)
 				finalUpdated = updated
 				return updated, resolveErr
 			}, harmonydb.OptionRetry())
-			secondDone <- mk20OffsetITestTxnResult{Committed: committed, Updated: finalUpdated, Err: err}
+			result := mk20OffsetITestTxnResult{Committed: committed, Updated: finalUpdated, Err: err}
+			recorder.recordTransaction(result)
+			secondDone <- result
 		}()
 
-		pid := requireIntResult(t, secondPID)
-		lockObserved, observeErr := observeMK20OffsetITestLockWait(fixture.DB, pid, secondReturned, 2*time.Second)
-		releaseFirstOnce.Do(func() { close(releaseFirst) })
+		attempt := requireMK20OffsetITestAttempt(t, recorder.attemptStarted)
+		observation := observeMK20OffsetITestContention(fixture.DB, fixture.Target.Kind, attempt.PID, holderPID, recorder, 2*time.Second)
+		beforeRelease := recorder.releaseHolder(release)
 
 		first := requireTxnResult(t, firstDone)
+		second := requireTxnResult(t, secondDone)
+		cancelFirst()
+		cancelSecond()
+		require.True(t, waitMK20OffsetITestParticipants(&participants, mk20OffsetITestTimeout), "timed out joining contention participants")
+
 		require.NoError(t, first.Err)
 		require.True(t, first.Committed)
-		second := requireTxnResult(t, secondDone)
 		if second.Err != nil {
 			require.True(t, harmonydb.IsErrSerialization(second.Err), "unexpected second-attempt error: %v", second.Err)
 		} else {
 			require.False(t, second.Committed)
 			require.False(t, second.Updated)
 		}
-		requireMK20OffsetITestLockObservation(t, fixture.Target.Kind, lockObserved, observeErr, "second MK20 target lock")
 		require.Equal(t, sql.NullInt64{Int64: int64(expected), Valid: true}, readMK20OffsetITestOffset(t, fixture.DB, target))
+		requireMK20OffsetITestContention(t, fixture.Target.Kind, "second MK20 target lock", observation, beforeRelease, recorder.snapshot())
 	})
 
 	t.Run("existing retained rows coordinate a content-changing metadata writer", func(t *testing.T) {
@@ -680,30 +694,45 @@ func TestMK20OffsetDBIndependentConnections(t *testing.T) {
 		insertMK20OffsetITestMetadata(t, fixture.DB, target, layout, layout.UnsealedCID)
 		alternatePieces := append([]mk20RetainedPiece(nil), layout.Pieces...)
 		alternatePieces[0].CID = syntheticPieceCID(t, 90)
+		alternatePieces[0].Size = 256
 		alternateLayout := retainedLayout(t, abi.RegisteredSealProof(target.RegSealProof), alternatePieces)
+		alternateOffset, found := findMK20PieceOffset([]mk20SectorPiece{
+			{CID: alternatePieces[0].CID, Size: abi.PaddedPieceSize(alternatePieces[0].Size), Index: alternatePieces[0].Index},
+			{CID: alternatePieces[1].CID, Size: abi.PaddedPieceSize(alternatePieces[1].Size), Index: alternatePieces[1].Index},
+			{CID: alternatePieces[2].CID, Size: abi.PaddedPieceSize(alternatePieces[2].Size), Index: alternatePieces[2].Index},
+		}, target.PieceCID, abi.PaddedPieceSize(target.PieceSize))
+		require.True(t, found)
+		require.NotEqual(t, expected, alternateOffset, "the competing layout must change the target offset")
 
 		resolved := make(chan struct{})
 		var resolvedOnce sync.Once
 		releaseResolver := make(chan struct{})
 		var releaseResolverOnce sync.Once
-		t.Cleanup(func() { releaseResolverOnce.Do(func() { close(releaseResolver) }) })
 		resolverDone := make(chan mk20OffsetITestTxnResult, 1)
-		writerReturned := make(chan struct{})
-		var writerReturnedOnce sync.Once
-		writerPID := make(chan int, 1)
-		var writerPIDOnce sync.Once
-		writerDone := make(chan error, 1)
+		writerDone := make(chan mk20OffsetITestTxnResult, 1)
+		holderPIDs := make(chan int, 8)
+		recorder := newMK20OffsetITestContentionRecorder()
+		resolverCtx, cancelResolver := context.WithTimeout(context.Background(), mk20OffsetITestTimeout)
+		writerCtx, cancelWriter := context.WithTimeout(context.Background(), mk20OffsetITestTimeout)
+		var participants sync.WaitGroup
+		release := func() { releaseResolverOnce.Do(func() { close(releaseResolver) }) }
+		registerMK20OffsetITestParticipantCleanup(t, &participants, release, cancelResolver, cancelWriter)
 
+		participants.Add(1)
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), mk20OffsetITestTimeout)
-			defer cancel()
-			committed, err := fixture.DB.BeginTransaction(ctx, func(tx *harmonydb.Tx) (bool, error) {
+			defer participants.Done()
+			committed, err := fixture.DB.BeginTransaction(resolverCtx, func(tx *harmonydb.Tx) (bool, error) {
+				pid, pidErr := mk20OffsetITestBackendPID(tx)
+				if pidErr != nil {
+					return false, pidErr
+				}
+				holderPIDs <- pid
 				updated, resolveErr := resolveMK20PieceOffset(&harmonyMK20OffsetStore{tx: tx}, target)
 				resolvedOnce.Do(func() { close(resolved) })
 				select {
 				case <-releaseResolver:
-				case <-ctx.Done():
-					return false, ctx.Err()
+				case <-resolverCtx.Done():
+					return false, resolverCtx.Err()
 				}
 				return updated, resolveErr
 			}, harmonydb.OptionRetry())
@@ -711,53 +740,65 @@ func TestMK20OffsetDBIndependentConnections(t *testing.T) {
 		}()
 
 		requireSignalBefore(t, resolved, mk20OffsetITestTimeout)
+		holderPID := requireIntResult(t, holderPIDs)
+		participants.Add(1)
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), mk20OffsetITestTimeout)
-			defer cancel()
-			_, err := peer.BeginTransaction(ctx, func(tx *harmonydb.Tx) (bool, error) {
+			defer participants.Done()
+			committed, err := peer.BeginTransaction(writerCtx, func(tx *harmonydb.Tx) (bool, error) {
 				pid, pidErr := mk20OffsetITestBackendPID(tx)
 				if pidErr != nil {
 					return false, pidErr
 				}
-				writerPIDOnce.Do(func() { writerPID <- pid })
+				attempt := recorder.beginAttempt(pid)
 				n, updateErr := tx.Exec(`UPDATE sectors_meta SET cur_unsealed_cid = $1 WHERE sp_id = $2 AND sector_num = $3`, alternateLayout.UnsealedCID, target.SPID, target.Sector)
-				if updateErr != nil {
-					writerReturnedOnce.Do(func() { close(writerReturned) })
-					return false, updateErr
+				if updateErr == nil && n != 1 {
+					updateErr = errors.New("metadata header writer affected an unexpected number of rows")
 				}
-				if n != 1 {
-					writerReturnedOnce.Do(func() { close(writerReturned) })
-					return false, errors.New("metadata header writer affected an unexpected number of rows")
-				}
-				n, updateErr = tx.Exec(`UPDATE sectors_meta_pieces SET piece_cid = $1 WHERE sp_id = $2 AND sector_num = $3 AND piece_num = 0`, alternateLayout.Pieces[0].CID, target.SPID, target.Sector)
-				writerReturnedOnce.Do(func() { close(writerReturned) })
+				recorder.recordStatement(attempt, updateErr == nil, updateErr)
 				if updateErr != nil {
 					return false, updateErr
 				}
-				return n == 1, nil
+				n, updateErr = tx.Exec(`UPDATE sectors_meta_pieces SET piece_cid = $1, piece_size = $2 WHERE sp_id = $3 AND sector_num = $4 AND piece_num = 0`, alternateLayout.Pieces[0].CID, alternateLayout.Pieces[0].Size, target.SPID, target.Sector)
+				if updateErr == nil && n != 1 {
+					updateErr = errors.New("metadata piece writer affected an unexpected number of rows")
+				}
+				recorder.recordStatement(attempt, updateErr == nil, updateErr)
+				if updateErr != nil {
+					return false, updateErr
+				}
+				return true, nil
 			}, harmonydb.OptionRetry())
-			writerDone <- err
+			result := mk20OffsetITestTxnResult{Committed: committed, Err: err}
+			recorder.recordTransaction(result)
+			writerDone <- result
 		}()
 
-		pid := requireIntResult(t, writerPID)
-		lockObserved, observeErr := observeMK20OffsetITestLockWait(fixture.DB, pid, writerReturned, 2*time.Second)
-		releaseResolverOnce.Do(func() { close(releaseResolver) })
+		attempt := requireMK20OffsetITestAttempt(t, recorder.attemptStarted)
+		observation := observeMK20OffsetITestContention(fixture.DB, fixture.Target.Kind, attempt.PID, holderPID, recorder, 2*time.Second)
+		beforeRelease := recorder.releaseHolder(release)
 
 		resolvedResult := requireTxnResult(t, resolverDone)
+		writerResult := requireTxnResult(t, writerDone)
+		cancelResolver()
+		cancelWriter()
+		require.True(t, waitMK20OffsetITestParticipants(&participants, mk20OffsetITestTimeout), "timed out joining contention participants")
+
 		require.NoError(t, resolvedResult.Err)
 		require.True(t, resolvedResult.Committed)
-		writerErr := requireErrorResult(t, writerDone)
-		if writerErr != nil {
-			require.True(t, harmonydb.IsErrSerialization(writerErr), "unexpected metadata-writer error: %v", writerErr)
+		if writerResult.Err != nil {
+			require.True(t, harmonydb.IsErrSerialization(writerResult.Err), "unexpected metadata-writer error: %v", writerResult.Err)
+			require.False(t, writerResult.Committed)
+		} else {
+			require.True(t, writerResult.Committed)
 		}
-		requireMK20OffsetITestLockObservation(t, fixture.Target.Kind, lockObserved, observeErr, "retained metadata row lock")
 		require.Equal(t, sql.NullInt64{Int64: int64(expected), Valid: true}, readMK20OffsetITestOffset(t, fixture.DB, target))
 		metadata := readMK20OffsetITestMetadataState(t, fixture.DB, target)
-		if writerErr == nil {
-			require.Equal(t, mk20OffsetITestMetadataState{UnsealedCID: alternateLayout.UnsealedCID, FirstPieceCID: alternateLayout.Pieces[0].CID}, metadata)
+		if writerResult.Err == nil {
+			require.Equal(t, mk20OffsetITestMetadataState{UnsealedCID: alternateLayout.UnsealedCID, FirstPieceCID: alternateLayout.Pieces[0].CID, FirstPieceSize: alternateLayout.Pieces[0].Size}, metadata)
 		} else {
-			require.Equal(t, mk20OffsetITestMetadataState{UnsealedCID: layout.UnsealedCID, FirstPieceCID: layout.Pieces[0].CID}, metadata)
+			require.Equal(t, mk20OffsetITestMetadataState{UnsealedCID: layout.UnsealedCID, FirstPieceCID: layout.Pieces[0].CID, FirstPieceSize: layout.Pieces[0].Size}, metadata)
 		}
+		requireMK20OffsetITestContention(t, fixture.Target.Kind, "retained metadata row lock", observation, beforeRelease, recorder.snapshot())
 	})
 
 	t.Run("Snap FK transition waits for retained parent lock", func(t *testing.T) {
@@ -772,23 +813,31 @@ func TestMK20OffsetDBIndependentConnections(t *testing.T) {
 		var resolvedOnce sync.Once
 		releaseResolver := make(chan struct{})
 		var releaseResolverOnce sync.Once
-		t.Cleanup(func() { releaseResolverOnce.Do(func() { close(releaseResolver) }) })
 		resolverDone := make(chan mk20OffsetITestTxnResult, 1)
-		writerReturned := make(chan struct{})
-		var writerReturnedOnce sync.Once
-		writerPID := make(chan int, 1)
-		var writerPIDOnce sync.Once
-		writerDone := make(chan error, 1)
+		writerDone := make(chan mk20OffsetITestTxnResult, 1)
+		holderPIDs := make(chan int, 8)
+		recorder := newMK20OffsetITestContentionRecorder()
+		resolverCtx, cancelResolver := context.WithTimeout(context.Background(), mk20OffsetITestTimeout)
+		writerCtx, cancelWriter := context.WithTimeout(context.Background(), mk20OffsetITestTimeout)
+		var participants sync.WaitGroup
+		release := func() { releaseResolverOnce.Do(func() { close(releaseResolver) }) }
+		registerMK20OffsetITestParticipantCleanup(t, &participants, release, cancelResolver, cancelWriter)
+
+		participants.Add(1)
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), mk20OffsetITestTimeout)
-			defer cancel()
-			committed, err := fixture.DB.BeginTransaction(ctx, func(tx *harmonydb.Tx) (bool, error) {
+			defer participants.Done()
+			committed, err := fixture.DB.BeginTransaction(resolverCtx, func(tx *harmonydb.Tx) (bool, error) {
+				pid, pidErr := mk20OffsetITestBackendPID(tx)
+				if pidErr != nil {
+					return false, pidErr
+				}
+				holderPIDs <- pid
 				updated, resolveErr := resolveMK20PieceOffset(&harmonyMK20OffsetStore{tx: tx}, target)
 				resolvedOnce.Do(func() { close(resolved) })
 				select {
 				case <-releaseResolver:
-				case <-ctx.Done():
-					return false, ctx.Err()
+				case <-resolverCtx.Done():
+					return false, resolverCtx.Err()
 				}
 				return updated, resolveErr
 			}, harmonydb.OptionRetry())
@@ -796,41 +845,53 @@ func TestMK20OffsetDBIndependentConnections(t *testing.T) {
 		}()
 
 		requireSignalBefore(t, resolved, mk20OffsetITestTimeout)
+		holderPID := requireIntResult(t, holderPIDs)
+		participants.Add(1)
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), mk20OffsetITestTimeout)
-			defer cancel()
-			_, err := peer.BeginTransaction(ctx, func(tx *harmonydb.Tx) (bool, error) {
+			defer participants.Done()
+			committed, err := peer.BeginTransaction(writerCtx, func(tx *harmonydb.Tx) (bool, error) {
 				pid, pidErr := mk20OffsetITestBackendPID(tx)
 				if pidErr != nil {
 					return false, pidErr
 				}
-				writerPIDOnce.Do(func() { writerPID <- pid })
+				attempt := recorder.beginAttempt(pid)
 				n, insertErr := tx.Exec(`INSERT INTO sectors_snap_pipeline (sp_id, sector_number, upgrade_proof) VALUES ($1, $2, $3)`, target.SPID, target.Sector, updateProof)
-				writerReturnedOnce.Do(func() { close(writerReturned) })
+				if insertErr == nil && n != 1 {
+					insertErr = errors.New("Snap pipeline writer affected an unexpected number of rows")
+				}
+				recorder.recordStatement(attempt, insertErr == nil, insertErr)
 				if insertErr != nil {
 					return false, insertErr
 				}
-				return n == 1, nil
+				return true, nil
 			}, harmonydb.OptionRetry())
-			writerDone <- err
+			result := mk20OffsetITestTxnResult{Committed: committed, Err: err}
+			recorder.recordTransaction(result)
+			writerDone <- result
 		}()
 
-		pid := requireIntResult(t, writerPID)
-		lockObserved, observeErr := observeMK20OffsetITestLockWait(fixture.DB, pid, writerReturned, 2*time.Second)
-		releaseResolverOnce.Do(func() { close(releaseResolver) })
+		attempt := requireMK20OffsetITestAttempt(t, recorder.attemptStarted)
+		observation := observeMK20OffsetITestContention(fixture.DB, fixture.Target.Kind, attempt.PID, holderPID, recorder, 2*time.Second)
+		beforeRelease := recorder.releaseHolder(release)
 
 		resolvedResult := requireTxnResult(t, resolverDone)
+		writerResult := requireTxnResult(t, writerDone)
+		cancelResolver()
+		cancelWriter()
+		require.True(t, waitMK20OffsetITestParticipants(&participants, mk20OffsetITestTimeout), "timed out joining contention participants")
+
 		require.NoError(t, resolvedResult.Err)
 		require.True(t, resolvedResult.Committed)
-		writerErr := requireErrorResult(t, writerDone)
-		if writerErr != nil {
-			require.True(t, harmonydb.IsErrSerialization(writerErr), "unexpected Snap-writer error: %v", writerErr)
+		if writerResult.Err != nil {
+			require.True(t, harmonydb.IsErrSerialization(writerResult.Err), "unexpected Snap-writer error: %v", writerResult.Err)
+			require.False(t, writerResult.Committed)
 			require.Zero(t, countMK20OffsetITestSnapRows(t, fixture.DB, target))
 		} else {
+			require.True(t, writerResult.Committed)
 			require.Equal(t, 1, countMK20OffsetITestSnapRows(t, fixture.DB, target))
 		}
-		requireMK20OffsetITestLockObservation(t, fixture.Target.Kind, lockObserved, observeErr, "Snap metadata foreign-key lock")
 		require.Equal(t, sql.NullInt64{Int64: int64(expected), Valid: true}, readMK20OffsetITestOffset(t, fixture.DB, target))
+		requireMK20OffsetITestContention(t, fixture.Target.Kind, "Snap metadata foreign-key lock", observation, beforeRelease, recorder.snapshot())
 	})
 }
 
@@ -840,15 +901,177 @@ type mk20OffsetITestTxnResult struct {
 	Err       error
 }
 
+type mk20OffsetITestAttempt struct {
+	Number int
+	PID    int
+}
+
+type mk20OffsetITestAttemptEvidence struct {
+	Number                      int
+	PID                         int
+	StatementReturned           bool
+	StatementSucceeded          bool
+	RecognizedConflict          bool
+	ConflictAtRetryBoundary     bool
+	ConflictAtTransactionReturn bool
+}
+
+type mk20OffsetITestContentionSnapshot struct {
+	Attempts                         []mk20OffsetITestAttemptEvidence
+	HolderReleased                   bool
+	TransactionDone                  bool
+	TransactionFinishedBeforeRelease bool
+	TransactionFinalAttempt          int
+	TransactionResult                mk20OffsetITestTxnResult
+}
+
+func (s mk20OffsetITestContentionSnapshot) recognizedConflict() bool {
+	for _, attempt := range s.Attempts {
+		if attempt.RecognizedConflict {
+			return true
+		}
+	}
+	return false
+}
+
+func (s mk20OffsetITestContentionSnapshot) statementReturned() bool {
+	for _, attempt := range s.Attempts {
+		if attempt.StatementReturned {
+			return true
+		}
+	}
+	return false
+}
+
+func (s mk20OffsetITestContentionSnapshot) statementSucceeded() bool {
+	for _, attempt := range s.Attempts {
+		if attempt.StatementSucceeded {
+			return true
+		}
+	}
+	return false
+}
+
+type mk20OffsetITestContentionRecorder struct {
+	mu sync.Mutex
+
+	attempts                         []mk20OffsetITestAttemptEvidence
+	holderReleased                   bool
+	transactionDone                  bool
+	transactionFinishedBeforeRelease bool
+	transactionFinalAttempt          int
+	transactionResult                mk20OffsetITestTxnResult
+
+	attemptStarted chan mk20OffsetITestAttempt
+	changed        chan struct{}
+}
+
+func newMK20OffsetITestContentionRecorder() *mk20OffsetITestContentionRecorder {
+	return &mk20OffsetITestContentionRecorder{
+		// HarmonyDB currently makes at most seven OptionRetry attempts. Keep
+		// every attempt observable without allowing the transaction callback to
+		// block on test coordination.
+		attemptStarted: make(chan mk20OffsetITestAttempt, 16),
+		changed:        make(chan struct{}, 1),
+	}
+}
+
+func (r *mk20OffsetITestContentionRecorder) beginAttempt(pid int) int {
+	r.mu.Lock()
+	if len(r.attempts) > 0 {
+		previous := &r.attempts[len(r.attempts)-1]
+		if !previous.RecognizedConflict {
+			// HarmonyDB's OptionRetry starts another callback only after a
+			// recognized SQLSTATE 40001. The resolver probe does not wrap every
+			// later statement, so record the retry boundary without guessing
+			// whether the conflict came from an unobserved statement or commit.
+			previous.RecognizedConflict = true
+			previous.ConflictAtRetryBoundary = true
+		}
+	}
+	attempt := len(r.attempts) + 1
+	r.attempts = append(r.attempts, mk20OffsetITestAttemptEvidence{Number: attempt, PID: pid})
+	r.mu.Unlock()
+
+	r.attemptStarted <- mk20OffsetITestAttempt{Number: attempt, PID: pid}
+	r.signalChange()
+	return attempt
+}
+
+func (r *mk20OffsetITestContentionRecorder) recordStatement(attempt int, succeeded bool, err error) {
+	r.mu.Lock()
+	current := &r.attempts[attempt-1]
+	current.StatementReturned = true
+	current.StatementSucceeded = current.StatementSucceeded || succeeded
+	if harmonydb.IsErrSerialization(err) {
+		current.RecognizedConflict = true
+	}
+	r.mu.Unlock()
+	r.signalChange()
+}
+
+func (r *mk20OffsetITestContentionRecorder) recordTransaction(result mk20OffsetITestTxnResult) {
+	r.mu.Lock()
+	if harmonydb.IsErrSerialization(result.Err) && len(r.attempts) > 0 {
+		last := &r.attempts[len(r.attempts)-1]
+		if !last.RecognizedConflict {
+			last.RecognizedConflict = true
+			last.ConflictAtTransactionReturn = true
+		}
+	}
+	r.transactionDone = true
+	r.transactionFinishedBeforeRelease = !r.holderReleased
+	r.transactionFinalAttempt = len(r.attempts)
+	r.transactionResult = result
+	r.mu.Unlock()
+	r.signalChange()
+}
+
+func (r *mk20OffsetITestContentionRecorder) snapshot() mk20OffsetITestContentionSnapshot {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.snapshotLocked()
+}
+
+func (r *mk20OffsetITestContentionRecorder) releaseHolder(release func()) mk20OffsetITestContentionSnapshot {
+	r.mu.Lock()
+	// Keep the pre-release evidence, release marker, and channel close on one
+	// synchronization boundary with recordTransaction.
+	snapshot := r.snapshotLocked()
+	r.holderReleased = true
+	release()
+	r.mu.Unlock()
+	return snapshot
+}
+
+func (r *mk20OffsetITestContentionRecorder) snapshotLocked() mk20OffsetITestContentionSnapshot {
+	attempts := append([]mk20OffsetITestAttemptEvidence(nil), r.attempts...)
+	return mk20OffsetITestContentionSnapshot{
+		Attempts:                         attempts,
+		HolderReleased:                   r.holderReleased,
+		TransactionDone:                  r.transactionDone,
+		TransactionFinishedBeforeRelease: r.transactionFinishedBeforeRelease,
+		TransactionFinalAttempt:          r.transactionFinalAttempt,
+		TransactionResult:                r.transactionResult,
+	}
+}
+
+func (r *mk20OffsetITestContentionRecorder) signalChange() {
+	select {
+	case r.changed <- struct{}{}:
+	default:
+	}
+}
+
 type mk20OffsetITestLockProbeStore struct {
 	harmonyMK20OffsetStore
-	returned chan struct{}
-	doneOnce *sync.Once
+	attempt  int
+	recorder *mk20OffsetITestContentionRecorder
 }
 
 func (s *mk20OffsetITestLockProbeStore) lockTarget(target mk20OffsetTarget) (bool, error) {
 	locked, err := s.harmonyMK20OffsetStore.lockTarget(target)
-	s.doneOnce.Do(func() { close(s.returned) })
+	s.recorder.recordStatement(s.attempt, err == nil, err)
 	return locked, err
 }
 
@@ -1014,8 +1237,9 @@ func readMK20OffsetITestOffset(t *testing.T, db *harmonydb.DB, target mk20Offset
 }
 
 type mk20OffsetITestMetadataState struct {
-	UnsealedCID   string `db:"cur_unsealed_cid"`
-	FirstPieceCID string `db:"piece_cid"`
+	UnsealedCID    string `db:"cur_unsealed_cid"`
+	FirstPieceCID  string `db:"piece_cid"`
+	FirstPieceSize int64  `db:"piece_size"`
 }
 
 func readMK20OffsetITestMetadataState(t *testing.T, db *harmonydb.DB, target mk20OffsetTarget) mk20OffsetITestMetadataState {
@@ -1023,7 +1247,7 @@ func readMK20OffsetITestMetadataState(t *testing.T, db *harmonydb.DB, target mk2
 	ctx, cancel := context.WithTimeout(context.Background(), mk20OffsetITestTimeout)
 	defer cancel()
 	var rows []mk20OffsetITestMetadataState
-	require.NoError(t, db.Select(ctx, &rows, `SELECT sm.cur_unsealed_cid, smp.piece_cid
+	require.NoError(t, db.Select(ctx, &rows, `SELECT sm.cur_unsealed_cid, smp.piece_cid, smp.piece_size
 		FROM sectors_meta sm
 		JOIN sectors_meta_pieces smp ON smp.sp_id = sm.sp_id AND smp.sector_num = sm.sector_num
 		WHERE sm.sp_id = $1 AND sm.sector_num = $2 AND smp.piece_num = 0`, target.SPID, target.Sector))
@@ -1104,6 +1328,45 @@ func requireIntResult(t *testing.T, result <-chan int) int {
 	}
 }
 
+func requireMK20OffsetITestAttempt(t *testing.T, attempts <-chan mk20OffsetITestAttempt) mk20OffsetITestAttempt {
+	t.Helper()
+	select {
+	case attempt := <-attempts:
+		return attempt
+	case <-time.After(mk20OffsetITestTimeout):
+		t.Fatal("timed out waiting for a contention transaction attempt")
+		return mk20OffsetITestAttempt{}
+	}
+}
+
+func registerMK20OffsetITestParticipantCleanup(t *testing.T, participants *sync.WaitGroup, release func(), cancels ...context.CancelFunc) {
+	t.Helper()
+	t.Cleanup(func() {
+		release()
+		for _, cancel := range cancels {
+			cancel()
+		}
+		if !waitMK20OffsetITestParticipants(participants, mk20OffsetITestTimeout) {
+			t.Errorf("timed out joining test-owned contention participants during cleanup")
+		}
+	})
+}
+
+func waitMK20OffsetITestParticipants(participants *sync.WaitGroup, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		participants.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 func mk20OffsetITestBackendPID(tx *harmonydb.Tx) (int, error) {
 	var rows []struct {
 		PID int `db:"pid"`
@@ -1117,56 +1380,80 @@ func mk20OffsetITestBackendPID(tx *harmonydb.Tx) (int, error) {
 	return rows[0].PID, nil
 }
 
-func observeMK20OffsetITestLockWait(db *harmonydb.DB, pid int, statementReturned <-chan struct{}, timeout time.Duration) (bool, error) {
+type mk20OffsetITestLockObservation struct {
+	Observed bool
+	Err      error
+}
+
+func observeMK20OffsetITestContention(db *harmonydb.DB, kind string, waiterPID, holderPID int, recorder *mk20OffsetITestContentionRecorder, timeout time.Duration) mk20OffsetITestLockObservation {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
+	canObserveLinkedWait := kind == "postgresql"
+	var observationErr error
+	if !canObserveLinkedWait {
+		observationErr = errors.New("linked lock observation is not established for this Yugabyte version; a recognized serialization conflict is required")
+	}
+
 	for {
-		select {
-		case <-statementReturned:
-			return false, nil
-		default:
+		snapshot := recorder.snapshot()
+		if snapshot.recognizedConflict() || snapshot.TransactionDone {
+			return mk20OffsetITestLockObservation{Err: observationErr}
 		}
 
-		var rows []struct {
-			Waiting bool `db:"waiting"`
-		}
-		if err := db.Select(ctx, &rows, `SELECT EXISTS (
-			SELECT 1 FROM pg_locks WHERE pid = $1 AND NOT granted
-		) AS waiting`, pid); err != nil {
-			return false, err
-		}
-		if len(rows) != 1 {
-			return false, errors.New("expected one lock-observation row")
-		}
-		if rows[0].Waiting {
-			return true, nil
+		if canObserveLinkedWait {
+			var rows []struct {
+				Waiting bool `db:"waiting"`
+			}
+			if err := db.Select(ctx, &rows, `SELECT $2 = ANY(pg_blocking_pids($1)) AS waiting`, waiterPID, holderPID); err != nil {
+				observationErr = err
+				canObserveLinkedWait = false
+			} else if len(rows) != 1 {
+				observationErr = errors.New("expected one linked lock-observation row")
+				canObserveLinkedWait = false
+			} else if rows[0].Waiting {
+				return mk20OffsetITestLockObservation{Observed: true}
+			}
 		}
 
 		select {
-		case <-statementReturned:
-			return false, nil
+		case <-recorder.changed:
 		case <-ticker.C:
 		case <-ctx.Done():
-			return false, ctx.Err()
+			if observationErr == nil {
+				observationErr = errors.New("timed out without observing the expected holder as blocker")
+			}
+			return mk20OffsetITestLockObservation{Err: observationErr}
 		}
 	}
 }
 
-func requireMK20OffsetITestLockObservation(t *testing.T, kind string, observed bool, err error, operation string) {
+func requireMK20OffsetITestContention(t *testing.T, kind, operation string, observation mk20OffsetITestLockObservation, beforeRelease, final mk20OffsetITestContentionSnapshot) {
 	t.Helper()
-	if kind == "postgresql" {
-		require.NoError(t, err)
-		require.True(t, observed, "%s was not observed waiting in pg_locks", operation)
-		return
+	evidence := mk20OffsetContentionEvidence{
+		WaitObserved:                      observation.Observed,
+		ObservationFailed:                 observation.Err != nil,
+		RecognizedConflict:                final.recognizedConflict(),
+		StatementReturnedBeforeRelease:    beforeRelease.statementReturned(),
+		StatementSucceededBeforeRelease:   beforeRelease.statementSucceeded(),
+		TransactionFinished:               final.TransactionDone,
+		TransactionCommitted:              final.TransactionDone && final.TransactionResult.Err == nil && final.TransactionResult.Committed,
+		TransactionFinishedBeforeRelease:  final.TransactionFinishedBeforeRelease,
+		TransactionCommittedBeforeRelease: final.TransactionFinishedBeforeRelease && final.TransactionResult.Err == nil && final.TransactionResult.Committed,
 	}
-	if err != nil {
-		t.Logf("%s lock observation unavailable on Yugabyte: %v", operation, err)
-		return
+
+	verdict := classifyMK20OffsetContention(evidence)
+	detail := "kind=%s attempts=%+v final_attempt=%d wait_observed=%t observation_error=%v statement_returned_before_release=%t statement_succeeded_before_release=%t transaction_finished=%t transaction_committed=%t transaction_finished_before_release=%t transaction_committed_before_release=%t"
+	switch verdict {
+	case mk20OffsetContentionObservedBlocking, mk20OffsetContentionRecognizedConflict:
+		t.Logf("%s contention evidence=%s: "+detail, operation, verdict, kind, final.Attempts, final.TransactionFinalAttempt, observation.Observed, observation.Err, evidence.StatementReturnedBeforeRelease, evidence.StatementSucceededBeforeRelease, evidence.TransactionFinished, evidence.TransactionCommitted, evidence.TransactionFinishedBeforeRelease, evidence.TransactionCommittedBeforeRelease)
+	case mk20OffsetContentionOrderingViolation:
+		require.Failf(t, "contention ordering violation", "%s completed successfully before the held resolver was released: "+detail, operation, kind, final.Attempts, final.TransactionFinalAttempt, observation.Observed, observation.Err, evidence.StatementReturnedBeforeRelease, evidence.StatementSucceededBeforeRelease, evidence.TransactionFinished, evidence.TransactionCommitted, evidence.TransactionFinishedBeforeRelease, evidence.TransactionCommittedBeforeRelease)
+	case mk20OffsetContentionInconclusive:
+		require.Failf(t, "contention not established", "%s produced neither a linked database wait nor a recognized serialization conflict: "+detail, operation, kind, final.Attempts, final.TransactionFinalAttempt, observation.Observed, observation.Err, evidence.StatementReturnedBeforeRelease, evidence.StatementSucceededBeforeRelease, evidence.TransactionFinished, evidence.TransactionCommitted, evidence.TransactionFinishedBeforeRelease, evidence.TransactionCommittedBeforeRelease)
 	}
-	t.Logf("%s pg_locks wait observed=%t; Yugabyte effective isolation remains UNVERIFIED", operation, observed)
 }
 
 func mk20OffsetITestUpdateProof(t *testing.T, target mk20OffsetTarget) int64 {
@@ -1201,16 +1488,5 @@ func requireTxnResult(t *testing.T, result <-chan mk20OffsetITestTxnResult) mk20
 	case <-time.After(mk20OffsetITestTimeout):
 		t.Fatal("timed out waiting for transaction result")
 		return mk20OffsetITestTxnResult{}
-	}
-}
-
-func requireErrorResult(t *testing.T, result <-chan error) error {
-	t.Helper()
-	select {
-	case err := <-result:
-		return err
-	case <-time.After(mk20OffsetITestTimeout):
-		t.Fatal("timed out waiting for transaction result")
-		return errors.New("unreachable")
 	}
 }
