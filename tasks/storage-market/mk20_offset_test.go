@@ -7,7 +7,6 @@ import (
 	"go/token"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -124,46 +123,38 @@ func TestAddDealOffsetUsesTestedCalculation(t *testing.T) {
 	}
 	require.NotNil(t, addDealOffset)
 
-	helperCalls := 0
+	resolverCalls := 0
 	paddingCalls := 0
-	orderedPieceQuery := false
-	offsetUpdateCalls := 0
-	offsetUpdateUsesHelperResult := false
+	storeConstructions := 0
 	ast.Inspect(addDealOffset.Body, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
 		if !ok {
 			return true
 		}
-		for _, argument := range call.Args {
-			literal, ok := argument.(*ast.BasicLit)
-			if ok && strings.Contains(literal.Value, "ORDER BY piece_index ASC") {
-				orderedPieceQuery = true
-			}
-		}
-		if function, ok := call.Fun.(*ast.Ident); ok && function.Name == "findMK20PieceOffset" {
-			helperCalls++
+		if function, ok := call.Fun.(*ast.Ident); ok && function.Name == "resolveMK20PieceOffset" {
+			resolverCalls++
 		}
 		if selector, ok := call.Fun.(*ast.SelectorExpr); ok {
 			if selector.Sel.Name == "GetRequiredPadding" {
 				paddingCalls++
 			}
-			if selector.Sel.Name == "Exec" && len(call.Args) > 1 {
-				query, ok := call.Args[0].(*ast.BasicLit)
-				if ok && strings.Contains(query.Value, "SET sector_offset = $1") {
-					offsetUpdateCalls++
-					argument, ok := call.Args[1].(*ast.Ident)
-					offsetUpdateUsesHelperResult = ok && argument.Name == "offset"
-				}
+		}
+		return true
+	})
+	ast.Inspect(addDealOffset.Body, func(node ast.Node) bool {
+		literal, ok := node.(*ast.CompositeLit)
+		if ok {
+			selector, ok := literal.Type.(*ast.Ident)
+			if ok && selector.Name == "harmonyMK20OffsetStore" {
+				storeConstructions++
 			}
 		}
 		return true
 	})
 
-	require.Equal(t, 1, helperCalls, "addDealOffset must use the tested offset calculation")
+	require.Equal(t, 1, resolverCalls, "addDealOffset must use the tested source-selection and offset resolver")
+	require.Equal(t, 1, storeConstructions, "addDealOffset must run the resolver through its transaction-backed store")
 	require.Zero(t, paddingCalls, "addDealOffset must not retain a separate padding loop")
-	require.True(t, orderedPieceQuery, "addDealOffset must preserve authoritative piece_index order")
-	require.Equal(t, 1, offsetUpdateCalls, "addDealOffset must retain one conditional offset update")
-	require.True(t, offsetUpdateUsesHelperResult, "addDealOffset must persist the tested helper result")
 }
 
 func syntheticPieceCID(t *testing.T, marker byte) string {
