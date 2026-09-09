@@ -159,12 +159,12 @@ func TestNormalizeClusterTaskSummaryRequest(t *testing.T) {
 	}{
 		{name: "omitted defaults", wantMaxTasks: 500, wantMaxPending: 30},
 		{name: "explicit zero tasks clamps to one", request: ClusterTaskSummaryLimitedRequest{MaxTasks: clusterTaskTestInt(0)}, wantMaxTasks: 1, wantMaxPending: 1},
-		{name: "tasks above hard cap", request: ClusterTaskSummaryLimitedRequest{MaxTasks: clusterTaskTestInt(10_000)}, wantMaxTasks: 500, wantMaxPending: 500},
+		{name: "tasks above hard cap", request: ClusterTaskSummaryLimitedRequest{MaxTasks: clusterTaskTestInt(10_000)}, wantMaxTasks: 500, wantMaxPending: 30},
 		{name: "explicit zero pending", request: ClusterTaskSummaryLimitedRequest{MaxPending: clusterTaskTestInt(0)}, wantMaxTasks: 500, wantMaxPending: 0},
 		{name: "negative pending", request: ClusterTaskSummaryLimitedRequest{MaxPending: clusterTaskTestInt(-5)}, wantMaxTasks: 500, wantMaxPending: 0},
 		{name: "pending constrained by tasks", request: ClusterTaskSummaryLimitedRequest{MaxTasks: clusterTaskTestInt(20), MaxPending: clusterTaskTestInt(100)}, wantMaxTasks: 20, wantMaxPending: 20},
-		{name: "empty exact task name retained", request: ClusterTaskSummaryLimitedRequest{TaskName: &empty}, wantMaxTasks: 500, wantMaxPending: 500, wantTaskName: &empty},
-		{name: "background retained", request: ClusterTaskSummaryLimitedRequest{IncludeBackground: true}, wantMaxTasks: 500, wantMaxPending: 500, wantIncludeBacklog: true},
+		{name: "empty exact task name retained", request: ClusterTaskSummaryLimitedRequest{TaskName: &empty}, wantMaxTasks: 500, wantMaxPending: 30, wantTaskName: &empty},
+		{name: "background retained", request: ClusterTaskSummaryLimitedRequest{IncludeBackground: true}, wantMaxTasks: 500, wantMaxPending: 30, wantIncludeBacklog: true},
 	}
 
 	for _, test := range tests {
