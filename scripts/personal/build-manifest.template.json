@@ -1,0 +1,16 @@
+{
+  "source": {"head": "FULL_COMMIT", "tree": "FULL_TREE", "submodules": {}, "build_inputs": {}},
+  "profile": "sdisk-4slot OR sdisk-sm",
+  "requested": {"FFI_USE_CUDA": "1", "FFI_USE_CUDA_SUPRASEAL": "0", "FFI_BUILD_FROM_SOURCE": "1", "RUSTFLAGS": "-C target-cpu=native -g"},
+  "make_settings": {},
+  "effective_go_tags": "VERIFY cunative",
+  "effective_goamd64": "VERIFY v3",
+  "effective_ffi_features": "VERIFY multicore-sdr,cuda,fvm from native build log",
+  "effective_rust_flags": "RECORD install-filcrypto CPU features and build-release command",
+  "effective_supraseal": "VERIFY enabled; record native CPU flags and compiler selection",
+  "native_receipt_sha256": null,
+  "linux_effective_build": "NOT_RUN",
+  "binary_sha256": null,
+  "installed_sha256_before": null,
+  "installed_sha256_after": null
+}
