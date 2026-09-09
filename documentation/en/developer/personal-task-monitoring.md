@@ -25,6 +25,8 @@ and NULL start. No backfill, claim timestamp, posted time or old History row is
 used as execution start. Pending rows retain a separate Waiting column; claimed
 but unconfirmed rows show a dash. Missing provenance or a future timestamp shows
 unknown, not fabricated runtime. Existing API age fields retain their meaning.
+Worker and database wall clocks must be synchronized: future starts are rejected,
+but an arbitrary past worker-clock skew cannot be detected from these fields.
 
 At the one final Do-entry gate, cancellation is checked before an optional start
 reservation hook. After a successful hook, the start is captured and Do is invoked
