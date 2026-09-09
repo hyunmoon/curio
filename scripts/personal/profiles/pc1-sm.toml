@@ -1,0 +1,5 @@
+# PERSONAL_ONLY operator-supplied layer fragment. Not applied by a build.
+[Subsystems]
+SealSDRMaxTasks = 6
+SealSDRMinStartInterval = "25m20s"
+SealSDRStartJitter = true

@@ -31,6 +31,9 @@ func TestSDRPacingConfiguration(t *testing.T) {
 		}
 	}
 	var s SDRTask
+	if err := s.ConfigureStartPacing(time.Minute, true, "", "loopback-instance"); err == nil {
+		t.Fatal("missing CURIO_NODE_NAME accepted")
+	}
 	if err := s.ConfigureStartPacing(time.Minute, true, "node", ""); err == nil {
 		t.Fatal("missing per-instance identity accepted")
 	}

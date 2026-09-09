@@ -33,7 +33,7 @@ logging, or waiting; no scheduler sleep is added.
 When jitter is enabled, a first start or a start after more than twice the
 interval of inactivity waits for the next stable phase in that interval. Phase
 is the existing SHA-256 construction, now keyed by `CURIO_NODE_NAME`, a separator,
-and the instance's advertised listen identity. The listen identity is required
+and the instance's advertised listen identity. Both inputs are required
 and distinguishes instances sharing the same host or node name. Keep it stable
 across restarts. Changing this identity changes phase; hashes can still collide.
 Different phases do not guarantee collision-free starts across the cluster.
@@ -80,8 +80,13 @@ ordering. These unit tests do not execute PostgreSQL/Yugabyte or prove distribut
 claim behavior. Real scheduler/database integration and role-specific native
 builds remain separate validation gates.
 
-The available original source contains the two config keys and their disabled
-defaults, but no committed active instance profiles establishing the currently
-deployed interval or identity. Those values are a source gap, not inferred from
-screenshots or task durations. Existing personal profile values must be supplied
-and reviewed before any deployment; no operator values are selected here.
+The operator-supplied active values are recorded in
+`scripts/personal/profiles/pc1.toml` (4 tasks, 43m45s, jitter enabled) and
+`scripts/personal/profiles/pc1-sm.toml` (6 tasks, 25m20s, jitter enabled).
+These are PERSONAL_ONLY configuration fragments, not public defaults, and are
+not applied by a build. They resolve the earlier active-profile source gap.
+`CURIO_NODE_NAME` must be explicitly set to a stable per-instance name alongside
+the existing stable advertised listen identity. Empty inputs fail construction
+when positive-interval jitter is enabled. Do not copy another instance's name.
+The supplied native SDR producer setting remains an independent operator input;
+this topic does not change it, CPU accounting, or maximum SDR parallelism.

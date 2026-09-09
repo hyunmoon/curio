@@ -129,8 +129,8 @@ func nextSDRPhaseDelay(now time.Time, interval, offset time.Duration) time.Durat
 // across restarts. No live config mutation API is introduced.
 func (s *SDRTask) ConfigureStartPacing(interval time.Duration, jitter bool, nodeName, listenIdentity string) error {
 	identity := strings.TrimSpace(nodeName) + "\x00" + strings.TrimSpace(listenIdentity)
-	if jitter && interval > 0 && strings.TrimSpace(listenIdentity) == "" {
-		return fmt.Errorf("SDR start jitter requires a stable instance listen identity")
+	if jitter && interval > 0 && (strings.TrimSpace(nodeName) == "" || strings.TrimSpace(listenIdentity) == "") {
+		return fmt.Errorf("SDR start jitter requires CURIO_NODE_NAME and a stable instance listen identity")
 	}
 	p, err := newSDRStartPacer(interval, jitter, identity, nil)
 	if err != nil {
