@@ -13,13 +13,51 @@ import (
 	"github.com/filecoin-project/go-address"
 
 	"github.com/filecoin-project/curio/harmony/harmonydb"
+	"github.com/filecoin-project/curio/tasks/tasknames"
 )
 
 const (
 	CLUSTER_TASK_SUMMARY_DEFAULT_MAX_TASKS   = 500
-	CLUSTER_TASK_SUMMARY_DEFAULT_MAX_PENDING = 500
+	CLUSTER_TASK_SUMMARY_DEFAULT_MAX_PENDING = 30
 	CLUSTER_TASK_SUMMARY_MAX_TASKS           = 500
 )
+
+const (
+	CLUSTER_TASK_DISPLAY_PRIORITY_HIGH     = 0
+	CLUSTER_TASK_DISPLAY_PRIORITY_STANDARD = 1
+)
+
+var clusterTaskHighPriorityNames = []string{
+	tasknames.SDR,
+	tasknames.TreeD,
+	tasknames.TreeRC,
+	tasknames.SyntheticProofs,
+	tasknames.PreCommitBatch,
+	tasknames.PoRep,
+	tasknames.Finalize,
+	tasknames.MoveStorage,
+	tasknames.CommitBatch,
+	tasknames.UpdateEncode,
+	tasknames.UpdateProve,
+	tasknames.UpdateBatch,
+	tasknames.UpdateStore,
+	tasknames.WdPost,
+	tasknames.WdPostSubmit,
+	tasknames.WdPostRecover,
+	tasknames.WinPost,
+	tasknames.WinInclCheck,
+	tasknames.UnsealDecode,
+	tasknames.SDRKeyRegen,
+}
+
+func clusterTaskDisplayPriority(name string) int {
+	for _, highPriorityName := range clusterTaskHighPriorityNames {
+		if name == highPriorityName {
+			return CLUSTER_TASK_DISPLAY_PRIORITY_HIGH
+		}
+	}
+	return CLUSTER_TASK_DISPLAY_PRIORITY_STANDARD
+}
 
 type ClusterTaskSummaryLimitedRequest struct {
 	MaxTasks          *int
@@ -85,6 +123,7 @@ type clusterTaskSummaryLimitedRow struct {
 	Owner           *string
 	OwnerID         *int64
 	State           string
+	DisplayPriority int
 }
 
 type clusterTaskSummarySnapshot struct {
@@ -112,6 +151,7 @@ type clusterTaskSummaryDBRow struct {
 	Owner           sql.NullString `db:"owner"`
 	OwnerID         sql.NullInt64  `db:"owner_id"`
 	State           sql.NullString `db:"state"`
+	DisplayPriority sql.NullInt64  `db:"display_priority"`
 	RunningTotal    int64          `db:"running_total"`
 	PendingTotal    int64          `db:"pending_total"`
 	ObservedAt      time.Time      `db:"observed_at"`
@@ -125,7 +165,8 @@ WITH matching AS (
 		t.posted_time,
 		t.work_start,
 		t.work_start_source,
-		t.owner_id
+		t.owner_id,
+		CASE WHEN t.name::TEXT = ANY($5::TEXT[]) THEN 0 ELSE 1 END AS display_priority
 	FROM harmony_task t
 	WHERE ($1::BOOLEAN OR t.name NOT LIKE 'bg:%')
 		AND ($2::TEXT IS NULL OR t.name = $2)
@@ -140,7 +181,7 @@ running AS (
 	SELECT *, 'running'::TEXT AS state, 0::BIGINT AS section_order
 	FROM matching
 	WHERE owner_id IS NOT NULL
-	ORDER BY work_start ASC NULLS FIRST, id ASC
+	ORDER BY display_priority ASC, work_start ASC NULLS FIRST, id ASC
 	LIMIT $3
 ),
 remaining AS (
@@ -151,7 +192,7 @@ pending AS (
 	SELECT *, 'pending'::TEXT AS state, 1::BIGINT AS section_order
 	FROM matching
 	WHERE owner_id IS NULL
-	ORDER BY posted_time ASC, id ASC
+	ORDER BY display_priority ASC, posted_time ASC, id ASC
 	LIMIT (SELECT LEAST($4::BIGINT, pending_slots) FROM remaining)
 ),
 selected AS (
@@ -171,6 +212,7 @@ SELECT
 	hm.host_and_port AS owner,
 	s.owner_id,
 	s.state,
+	s.display_priority,
 	c.running_total,
 	c.pending_total,
 	o.observed_at
@@ -180,6 +222,7 @@ LEFT JOIN selected s ON TRUE
 LEFT JOIN harmony_machines hm ON hm.id = s.owner_id
 ORDER BY
 	s.section_order ASC NULLS LAST,
+	s.display_priority ASC NULLS LAST,
 	CASE WHEN s.section_order = 0 THEN s.work_start ELSE s.posted_time END ASC NULLS FIRST,
 	s.id ASC`
 
@@ -203,7 +246,7 @@ func (s harmonyClusterTaskSummarySource) LoadSnapshot(ctx context.Context, appli
 		if !row.ID.Valid {
 			continue
 		}
-		if !row.Name.Valid || !row.PostedTime.Valid || !row.State.Valid {
+		if !row.Name.Valid || !row.PostedTime.Valid || !row.State.Valid || !row.DisplayPriority.Valid {
 			return clusterTaskSummarySnapshot{}, fmt.Errorf("cluster task summary row %d is missing required data", row.ID.Int64)
 		}
 
@@ -227,6 +270,7 @@ func (s harmonyClusterTaskSummarySource) LoadSnapshot(ctx context.Context, appli
 			Owner:           owner,
 			OwnerID:         ownerID,
 			State:           row.State.String,
+			DisplayPriority: int(row.DisplayPriority.Int64),
 		})
 	}
 
@@ -243,6 +287,7 @@ func clusterTaskSummaryLimitedQueryArgs(applied ClusterTaskSummaryApplied) []any
 		taskName,
 		applied.MaxTasks,
 		applied.MaxPending,
+		clusterTaskHighPriorityNames,
 	}
 }
 
@@ -262,6 +307,10 @@ func (s harmonyClusterTaskSummarySource) LoadTaskTypes(ctx context.Context, incl
 		return nil, err
 	}
 	sort.Slice(taskTypes, func(i, j int) bool {
+		left, right := clusterTaskDisplayPriority(taskTypes[i].Name), clusterTaskDisplayPriority(taskTypes[j].Name)
+		if left != right {
+			return left < right
+		}
 		return taskTypes[i].Name < taskTypes[j].Name
 	})
 	return taskTypes, nil

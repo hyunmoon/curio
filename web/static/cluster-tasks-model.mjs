@@ -2,14 +2,14 @@ import {groupConsecutiveTasks} from './cluster-tasks-grouping.mjs';
 
 export const CLUSTER_TASK_DEFAULTS = Object.freeze({
   maxTasks: 500,
-  maxPending: 500,
+  maxPending: 30,
   includeBackground: false,
   taskName: '',
-  coalesceEntries: true,
+  coalesceEntries: false,
 });
 
 export const CLUSTER_TASK_ORDER_POLICY =
-  'Current ownership age first; task ID breaks ties';
+  'Sealing/proof first; longest ownership age first within each group';
 export const RUNNING_AGE_TOOLTIP =
   'Ownership age starts when the current owner claimed the task; it is not execution runtime.';
 export const PENDING_AGE_TOOLTIP =

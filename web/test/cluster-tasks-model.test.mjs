@@ -29,15 +29,15 @@ import {
 test('controls use bounded defaults and the limited-RPC request shape', () => {
   assert.deepEqual(CLUSTER_TASK_DEFAULTS, {
     maxTasks: 500,
-    maxPending: 500,
+    maxPending: 30,
     includeBackground: false,
     taskName: '',
-    coalesceEntries: true,
+    coalesceEntries: false,
   });
 
   assert.deepEqual(buildClusterTaskRequest(CLUSTER_TASK_DEFAULTS), {
     MaxTasks: 500,
-    MaxPending: 500,
+    MaxPending: 30,
     IncludeBackground: false,
     TaskName: null,
   });
@@ -394,7 +394,7 @@ test('sections are Running then Pending and coalesce only inside each section', 
   assert.match(PENDING_AGE_TOOLTIP, /posted/);
   assert.equal(
       CLUSTER_TASK_ORDER_POLICY,
-      'Current ownership age first; task ID breaks ties',
+      'Sealing/proof first; longest ownership age first within each group',
   );
 });
 

@@ -43,6 +43,7 @@ func (m *memoryClusterTaskSummarySource) LoadSnapshot(ctx context.Context, appli
 			continue
 		}
 
+		row.DisplayPriority = clusterTaskDisplayPriority(row.Name)
 		if row.OwnerID != nil {
 			row.State = "running"
 			running = append(running, row)
@@ -54,6 +55,9 @@ func (m *memoryClusterTaskSummarySource) LoadSnapshot(ctx context.Context, appli
 
 	sort.Slice(running, func(i, j int) bool {
 		left, right := running[i], running[j]
+		if left.DisplayPriority != right.DisplayPriority {
+			return left.DisplayPriority < right.DisplayPriority
+		}
 		if left.WorkStart.Valid != right.WorkStart.Valid {
 			return !left.WorkStart.Valid
 		}
@@ -64,6 +68,9 @@ func (m *memoryClusterTaskSummarySource) LoadSnapshot(ctx context.Context, appli
 	})
 	sort.Slice(pending, func(i, j int) bool {
 		left, right := pending[i], pending[j]
+		if left.DisplayPriority != right.DisplayPriority {
+			return left.DisplayPriority < right.DisplayPriority
+		}
 		if !left.PostedTime.Equal(right.PostedTime) {
 			return left.PostedTime.Before(right.PostedTime)
 		}
@@ -150,7 +157,7 @@ func TestNormalizeClusterTaskSummaryRequest(t *testing.T) {
 		wantTaskName       *string
 		wantIncludeBacklog bool
 	}{
-		{name: "omitted defaults", wantMaxTasks: 500, wantMaxPending: 500},
+		{name: "omitted defaults", wantMaxTasks: 500, wantMaxPending: 30},
 		{name: "explicit zero tasks clamps to one", request: ClusterTaskSummaryLimitedRequest{MaxTasks: clusterTaskTestInt(0)}, wantMaxTasks: 1, wantMaxPending: 1},
 		{name: "tasks above hard cap", request: ClusterTaskSummaryLimitedRequest{MaxTasks: clusterTaskTestInt(10_000)}, wantMaxTasks: 500, wantMaxPending: 500},
 		{name: "explicit zero pending", request: ClusterTaskSummaryLimitedRequest{MaxPending: clusterTaskTestInt(0)}, wantMaxTasks: 500, wantMaxPending: 0},
@@ -203,7 +210,7 @@ func TestClusterTaskSummaryLimitedQueryIsBoundedAndParameterized(t *testing.T) {
 	name := tasknames.SDR
 	applied := ClusterTaskSummaryApplied{MaxTasks: 123, MaxPending: 12, IncludeBackground: true, TaskName: &name}
 	args := clusterTaskSummaryLimitedQueryArgs(applied)
-	if len(args) != 4 || args[0] != true || args[1] != name || args[2] != 123 || args[3] != 12 {
+	if len(args) != 5 || args[0] != true || args[1] != name || args[2] != 123 || args[3] != 12 {
 		t.Fatalf("unexpected query args: %#v", args)
 	}
 }
@@ -226,7 +233,7 @@ func TestClusterTaskSummaryLimitedSelectionRules(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wantRunning := []int64{4, 10, 2, 3, 5}
+	wantRunning := []int64{4, 2, 3, 5, 10}
 	for i, id := range wantRunning {
 		if response.Running[i].ID != id {
 			t.Fatalf("running[%d] = %d, want %d", i, response.Running[i].ID, id)
