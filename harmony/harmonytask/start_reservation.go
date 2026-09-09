@@ -35,3 +35,12 @@ func reserveTaskStart(impl TaskInterface, ids []TaskID) ([]TaskID, *taskStartRes
 	}
 	return ids[:1], &taskStartReservation{start: start, cancel: cancel}
 }
+
+// Release an unstarted reservation before the caller begins completion
+// persistence, which can retry indefinitely. This adds no second entry gate.
+func withStartReservationCleanup(reservation *taskStartReservation, run func() (bool, error)) (bool, error) {
+	if reservation != nil {
+		defer reservation.cancel()
+	}
+	return run()
+}

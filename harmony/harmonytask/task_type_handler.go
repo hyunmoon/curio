@@ -342,37 +342,39 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 			if startReservation != nil {
 				beforeStart = startReservation.start
 			}
-			done, doErr = runWithAttemptStart(taskCtx, attemptStore, tID, attemptTokens[tID], beforeStart, time.Now, func(start time.Time) {
-				workStart = start
-			}, func() (bool, error) {
-				return h.Do(taskCtx, tID, func() bool {
-					if taskCtx.Err() != nil {
-						return false
-					}
-					if taskhelp.IsBackgroundTask(h.Name) || h.CanYield {
-						if h.TaskEngine.atomics.yieldBackground.Load() {
-							log.Infow("yielding background task", "name", h.Name, "id", tID)
+			done, doErr = withStartReservationCleanup(startReservation, func() (bool, error) {
+				return runWithAttemptStart(taskCtx, attemptStore, tID, attemptTokens[tID], beforeStart, time.Now, func(start time.Time) {
+					workStart = start
+				}, func() (bool, error) {
+					return h.Do(taskCtx, tID, func() bool {
+						if taskCtx.Err() != nil {
 							return false
 						}
-					}
-					// Uninterruptible work (e.g. Send*) calls stillOwned before
-					// taking a per-sender lock. During shutdown drain, fail that
-					// check so hundreds of waiters can exit without starting a new
-					// critical section; in-flight holders do not call stillOwned
-					// and are waited on via Active() in GracefullyTerminate.
-					if h.Uninterruptible && h.TaskEngine.atomics.draining.Load() {
-						log.Infow("yielding uninterruptible task during shutdown drain", "name", h.Name, "id", tID)
-						return false
-					}
+						if taskhelp.IsBackgroundTask(h.Name) || h.CanYield {
+							if h.TaskEngine.atomics.yieldBackground.Load() {
+								log.Infow("yielding background task", "name", h.Name, "id", tID)
+								return false
+							}
+						}
+						// Uninterruptible work (e.g. Send*) calls stillOwned before
+						// taking a per-sender lock. During shutdown drain, fail that
+						// check so hundreds of waiters can exit without starting a new
+						// critical section; in-flight holders do not call stillOwned
+						// and are waited on via Active() in GracefullyTerminate.
+						if h.Uninterruptible && h.TaskEngine.atomics.draining.Load() {
+							log.Infow("yielding uninterruptible task during shutdown drain", "name", h.Name, "id", tID)
+							return false
+						}
 
-					var owner int
-					err := h.TaskEngine.cfg.db.QueryRow(taskCtx,
-						`SELECT owner_id FROM harmony_task WHERE id=$1`, tID).Scan(&owner)
-					if err != nil {
-						log.Error("Cannot determine ownership: ", err)
-						return false
-					}
-					return owner == h.TaskEngine.cfg.ownerID
+						var owner int
+						err := h.TaskEngine.cfg.db.QueryRow(taskCtx,
+							`SELECT owner_id FROM harmony_task WHERE id=$1`, tID).Scan(&owner)
+						if err != nil {
+							log.Error("Cannot determine ownership: ", err)
+							return false
+						}
+						return owner == h.TaskEngine.cfg.ownerID
+					})
 				})
 			})
 			if doErr != nil {

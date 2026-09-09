@@ -6,6 +6,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -67,22 +68,99 @@ func TestStartReservationExecutionAndCancellation(t *testing.T) {
 			}
 			store := newMemoryAttemptStore()
 			_, tokens := prepareTaskAttempts(context.Background(), store, []TaskID{1})
-			done, err := runWithAttemptStart(ctx, store, 1, tokens[1], r.start, time.Now, func(time.Time) {}, func() (bool, error) {
-				ran++
-				if started != 1 {
-					t.Fatal("Do entered before reservation commit")
-				}
-				if mode == "do-error" {
-					return false, boom
-				}
-				return true, nil
+			done, err := withStartReservationCleanup(r, func() (bool, error) {
+				return runWithAttemptStart(ctx, store, 1, tokens[1], r.start, time.Now, func(time.Time) {}, func() (bool, error) {
+					ran++
+					if started != 1 {
+						t.Fatal("Do entered before reservation commit")
+					}
+					if mode == "do-error" {
+						return false, boom
+					}
+					return true, nil
+				})
 			})
-			r.cancel()
 			if cancelled != 1 || done != (mode == "success") || (err == nil) != (mode == "success") {
 				t.Fatalf("done=%v error=%v cancelled=%d", done, err, cancelled)
 			}
 			if (mode == "cancelled" && started != 0) || ((mode == "cancelled" || mode == "start-error") && ran != 0) {
 				t.Fatal("pre-execution failure entered task")
+			}
+		})
+	}
+}
+
+func TestStartReservationCleanupPrecedesCompletion(t *testing.T) {
+	for _, mode := range []string{"cancelled-before-entry", "panic-before-entry"} {
+		t.Run(mode, func(t *testing.T) {
+			var reserved atomic.Bool
+			reserved.Store(true)
+			r := &taskStartReservation{
+				start:  func(context.Context) error { panic("synthetic entry panic") },
+				cancel: func() { reserved.Store(false) },
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if mode == "cancelled-before-entry" {
+				cancel()
+			}
+			store := newMemoryAttemptStore()
+			_, tokens := prepareTaskAttempts(context.Background(), store, []TaskID{1})
+			type completionState struct {
+				reserved bool
+				panic    any
+				err      error
+				ran      bool
+			}
+			completion := make(chan completionState, 1)
+			releaseCompletion := make(chan struct{})
+			joined := make(chan struct{})
+			watchdog, stop := context.WithTimeout(context.Background(), 5*time.Second)
+			defer stop()
+			defer func() {
+				close(releaseCompletion)
+				select {
+				case <-joined:
+				case <-watchdog.Done():
+					t.Error("test-owned completion participant did not exit")
+				}
+			}()
+			go func() {
+				defer close(joined)
+				// Match the production safety-net defer, registered before
+				// completion. It cannot free the token while completion waits.
+				defer r.cancel()
+				var result completionState
+				defer func() {
+					result.panic = recover()
+					result.reserved = reserved.Load()
+					completion <- result
+					select {
+					case <-releaseCompletion:
+					case <-watchdog.Done():
+					}
+				}()
+				_, result.err = withStartReservationCleanup(r, func() (bool, error) {
+					return runWithAttemptStart(ctx, store, 1, tokens[1], r.start, time.Now, func(time.Time) {}, func() (bool, error) {
+						result.ran = true
+						return true, nil
+					})
+				})
+			}()
+			select {
+			case result := <-completion:
+				if result.reserved {
+					t.Fatal("reservation still held when completion persistence begins")
+				}
+				if result.ran || (mode == "cancelled-before-entry" && (!errors.Is(result.err, context.Canceled) || result.panic != nil)) ||
+					(mode == "panic-before-entry" && result.panic != "synthetic entry panic") {
+					t.Fatalf("unexpected entry outcome: %+v", result)
+				}
+			case <-watchdog.Done():
+				t.Fatal("entry did not reach bounded completion wait")
+			}
+			if len(store.recordCalled) != 0 {
+				t.Fatal("unstarted task recorded a live attempt")
 			}
 		})
 	}
@@ -200,7 +278,7 @@ func TestStartReservationProductionCallSites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var reserve, claim, storage, run token.Pos
+	var reserve, claim, storage, run, cleanup, cleanupEnd token.Pos
 	ast.Inspect(f, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
@@ -215,6 +293,8 @@ func TestStartReservationProductionCallSites(t *testing.T) {
 				claim = call.Pos()
 			case "runWithAttemptStart":
 				run = call.Pos()
+			case "withStartReservationCleanup":
+				cleanup, cleanupEnd = call.Pos(), call.End()
 			}
 		case *ast.SelectorExpr:
 			if fun.Sel.Name == "Claim" {
@@ -225,5 +305,8 @@ func TestStartReservationProductionCallSites(t *testing.T) {
 	})
 	if reserve == token.NoPos || reserve >= claim || claim >= storage || storage >= run {
 		t.Fatalf("production reserve/claim/storage/Do order not protected: %v %v %v %v", reserve, claim, storage, run)
+	}
+	if cleanup == token.NoPos || cleanup >= run || run >= cleanupEnd {
+		t.Fatal("production entry is not scoped by immediate reservation cleanup")
 	}
 }
