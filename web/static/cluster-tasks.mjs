@@ -249,7 +249,7 @@ class ClusterTasks extends LitElement {
       }
 
       .age-column {
-        text-align: right;
+        text-align: start;
         font-variant-numeric: tabular-nums;
       }
 
