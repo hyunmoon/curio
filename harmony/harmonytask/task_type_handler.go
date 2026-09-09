@@ -99,8 +99,7 @@ const (
 // availability, but that's safe — resources can only increase, never
 // invalidating a "fits" decision made moments earlier.
 func (h *taskTypeHandler) considerWork(from string, tasks []task, eventEmitter eventEmitter) (workAccepted bool) {
-	return h.considerWorkWithOwnership(from, tasks, eventEmitter, h.claimTaskOwnership, h.releaseTaskOwnership,
-		harmonyTaskAttemptStore{db: h.TaskEngine.cfg.db, owner: int(h.TaskEngine.cfg.ownerID)})
+	return h.considerWorkWithOwnership(from, tasks, eventEmitter, h.claimTaskOwnership, h.releaseTaskOwnership, nil)
 }
 
 // The ownership callbacks keep failure paths testable without changing the
@@ -202,6 +201,9 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 		}
 	}
 
+	if attemptStore == nil {
+		attemptStore = harmonyTaskAttemptStore{db: h.TaskEngine.cfg.db, owner: int(h.TaskEngine.cfg.ownerID)}
+	}
 	tIDs, attemptTokens := prepareTaskAttempts(h.TaskEngine.cfg.ctx, attemptStore, tIDs)
 	if len(tIDs) == 0 {
 		return false
