@@ -74,8 +74,9 @@ type BatchMeta struct {
 }
 
 type Local struct {
-	localStorage LocalStorage
-	index        SectorIndex
+	localStorage     LocalStorage
+	index            SectorIndex
+	personalCapacity *personalCapacityProfile
 
 	// URL which serves this storage, pointing at /remote
 	// http://[...]/remote
@@ -106,8 +107,9 @@ func ft(s string) *sectorFile {
 }
 
 type path struct {
-	Local      string // absolute local path
-	MaxStorage uint64
+	Local            string // absolute local path
+	MaxStorage       uint64
+	personalCapacity *personalCapacityProfile
 
 	Reserved     int64
 	Reservations map[string]int64
@@ -216,7 +218,12 @@ func (p *path) stat(ls LocalStorage, newReserve ...statExistingSectorForReservat
 		stat.Available = 0
 	}
 
-	if p.MaxStorage > 0 {
+	if p.personalCapacity.matches(p.Local) {
+		stat, err = p.personalCapacity.stat(p.Local, stat, ls.DiskUsage)
+		if err != nil {
+			return fsutil.FsStat{}, 0, err
+		}
+	} else if p.MaxStorage > 0 {
 		used, err := ls.DiskUsage(p.Local)
 		if err != nil {
 			return fsutil.FsStat{}, 0, err
@@ -294,10 +301,18 @@ func init() {
 }
 
 func NewLocal(ctx context.Context, ls LocalStorage, index SectorIndex, url string) (*Local, error) {
+	profile, err := parsePersonalCapacityProfile(os.Getenv(PERSONAL_STORAGE_PROFILE_ENV))
+	if err != nil {
+		return nil, err
+	}
+	if profile != nil {
+		log.Warnw("Personal virtual storage accounting enabled", "profile", profile.name, "virtualCapacity", profile.capacity)
+	}
 	l := &Local{
-		localStorage: newCachedLocalStorage(ls),
-		index:        index,
-		url:          url,
+		localStorage:     newCachedLocalStorage(ls),
+		index:            index,
+		personalCapacity: profile,
+		url:              url,
 
 		paths: map[storiface.ID]*path{},
 	}
@@ -346,7 +361,8 @@ func (st *Local) openPath(ctx context.Context, p string, declare bool) (storifac
 	}
 
 	out := &path{
-		Local: p,
+		Local:            p,
+		personalCapacity: st.personalCapacity,
 
 		MaxStorage:   meta.MaxStorage,
 		Reserved:     0,
