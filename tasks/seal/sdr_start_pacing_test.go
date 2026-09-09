@@ -171,7 +171,7 @@ func TestSDRPacingPhaseRestartIdleClockAndIntervals(t *testing.T) {
 			if !ok {
 				t.Fatal("monotonic phase wait did not expire")
 			}
-			if err := p.start(context.Background(), token); err != nil {
+			if err := p.start(context.Background(), token, 1); err != nil {
 				t.Fatal(err)
 			}
 			n.wall = n.wall.Add(48 * time.Hour)

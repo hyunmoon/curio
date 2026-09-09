@@ -32,6 +32,7 @@ type sdrStartPacer struct {
 	phaseSet   bool
 	sequence   uint64
 	reserved   uint64
+	observer   sdrPacingObserver
 }
 
 func newSDRStartPacer(interval time.Duration, jitter bool, identity string, now func() sdrPacingTime) (*sdrStartPacer, error) {
@@ -60,14 +61,22 @@ func newSDRStartPacer(interval time.Duration, jitter bool, identity string, now 
 }
 
 func (p *sdrStartPacer) reserve() (uint64, bool) {
+	token, ok, snapshot := p.reserveSnapshot()
+	if !ok {
+		p.observer.blocked(snapshot)
+	}
+	return token, ok
+}
+
+func (p *sdrStartPacer) reserveSnapshot() (uint64, bool, sdrPacingSnapshot) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.reserved != 0 {
-		return 0, false
+		return 0, false, p.snapshotLocked(p.now())
 	}
 	n := p.now()
 	if p.started && n.elapsed-p.lastStart < p.interval {
-		return 0, false
+		return 0, false, p.snapshotLocked(n)
 	}
 	// Subtraction avoids overflow for large configured durations.
 	idle := !p.started || (n.elapsed-p.lastStart > p.interval && n.elapsed-p.lastStart-p.interval > p.interval)
@@ -77,31 +86,40 @@ func (p *sdrStartPacer) reserve() (uint64, bool) {
 		p.phaseSet = true
 	}
 	if p.phaseSet && n.elapsed-p.phaseStart < p.phaseWait {
-		return 0, false
+		return 0, false, p.snapshotLocked(n)
 	}
 	p.sequence++
 	if p.sequence == 0 {
 		p.sequence++
 	}
 	p.reserved = p.sequence
-	return p.reserved, true
+	return p.reserved, true, sdrPacingSnapshot{}
 }
 
-func (p *sdrStartPacer) start(ctx context.Context, token uint64) error {
+func (p *sdrStartPacer) start(ctx context.Context, token uint64, taskID harmonytask.TaskID) error {
+	snapshot, err := p.startSnapshot(ctx, token)
+	if err == nil {
+		p.observer.emit(sdrPacingEvent{kind: sdrPacingStarted, snapshot: snapshot, token: token, taskID: taskID})
+	}
+	return err
+}
+
+func (p *sdrStartPacer) startSnapshot(ctx context.Context, token uint64) (sdrPacingSnapshot, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if token == 0 || p.reserved != token {
-		return fmt.Errorf("SDR start reservation no longer belongs to this attempt")
+		return sdrPacingSnapshot{}, fmt.Errorf("SDR start reservation no longer belongs to this attempt")
 	}
 	if err := ctx.Err(); err != nil {
 		p.reserved = 0
-		return err
+		return sdrPacingSnapshot{}, err
 	}
-	p.lastStart = p.now().elapsed
+	n := p.now()
+	p.lastStart = n.elapsed
 	p.started = true
 	p.phaseSet = false
 	p.reserved = 0
-	return nil
+	return p.snapshotLocked(n), nil
 }
 
 func (p *sdrStartPacer) cancel(token uint64) {
@@ -137,10 +155,11 @@ func (s *SDRTask) ConfigureStartPacing(interval time.Duration, jitter bool, node
 		return err
 	}
 	s.startPacer = p
+	p.logConfiguration(interval, jitter)
 	return nil
 }
 
-func (s *SDRTask) ReserveTaskStart(_ harmonytask.TaskID) (func(context.Context) error, func(), bool) {
+func (s *SDRTask) ReserveTaskStart(taskID harmonytask.TaskID) (func(context.Context) error, func(), bool) {
 	if s.startPacer == nil {
 		return nil, nil, true
 	}
@@ -148,5 +167,5 @@ func (s *SDRTask) ReserveTaskStart(_ harmonytask.TaskID) (func(context.Context) 
 	if !ok {
 		return nil, nil, false
 	}
-	return func(ctx context.Context) error { return s.startPacer.start(ctx, token) }, func() { s.startPacer.cancel(token) }, true
+	return func(ctx context.Context) error { return s.startPacer.start(ctx, token, taskID) }, func() { s.startPacer.cancel(token) }, true
 }
