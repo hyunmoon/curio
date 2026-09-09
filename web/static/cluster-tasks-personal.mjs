@@ -11,4 +11,3 @@ export function personalTaskAge(entry, clock) {
   if (entry.TookState === 'awaiting-start') return {seconds:null, text:'—', title:'No current attempt execution start has been confirmed; ownership alone is not execution.'};
   return {seconds:null, text:'unknown', title:entry.TookState === 'future-start' ? 'The recorded start is ahead of the server snapshot; check clock synchronization.' : 'The current attempt start is unknown. Posted, claim and migration times are not used as Took.'};
 }
-
