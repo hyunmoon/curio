@@ -699,6 +699,22 @@ In lotus-miner this was run as part of PreCommit1. (Default: false)`,
 also be bounded by resources available on the machine. (Default: 0 - unlimited)`,
 		},
 		{
+			Name: "SealSDRMinStartInterval",
+			Type: "time.Duration",
+
+			Comment: `Minimum interval between SDR Do entries on this instance. Zero disables
+pacing. Negative values reject task construction. Requires restart.`,
+		},
+		{
+			Name: "SealSDRStartJitter",
+			Type: "bool",
+
+			Comment: `On first start or after a long idle, wait for a stable instance phase
+within SealSDRMinStartInterval. This is not a cluster-wide rate limit.
+Identity combines CURIO_NODE_NAME and the instance listen identity.
+Disabled by default; interval zero preserves unpaced scheduling.`,
+		},
+		{
 			Name: "SealSDRMinTasks",
 			Type: "int",
 
