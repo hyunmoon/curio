@@ -35,16 +35,3 @@ func reserveTaskStart(impl TaskInterface, ids []TaskID) ([]TaskID, *taskStartRes
 	}
 	return ids[:1], &taskStartReservation{start: start, cancel: cancel}
 }
-
-func runWithStartReservation(ctx context.Context, reservation *taskStartReservation, run func() (bool, error)) (bool, error) {
-	if reservation != nil {
-		defer reservation.cancel()
-		if err := ctx.Err(); err != nil {
-			return false, err
-		}
-		if err := reservation.start(ctx); err != nil {
-			return false, err
-		}
-	}
-	return run()
-}

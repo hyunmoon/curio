@@ -1,4 +1,5 @@
 import {LitElement, html, css} from 'https://cdn.jsdelivr.net/gh/lit/dist@3/all/lit-all.min.js';
+import {personalTaskAge} from './cluster-tasks-personal.mjs';
 import {RPCCallHTTP} from '/lib/jsonrpc.mjs';
 import {
   ClusterTaskFreshnessTicker,
@@ -777,14 +778,9 @@ class ClusterTasks extends LitElement {
     const hasOwner = entry.OwnerID !== null && entry.OwnerID !== undefined;
     const state = entry.State || (hasOwner ? 'running' : 'pending');
     const miner = entry.Miners?.length ? entry.Miners.join(', ') : entry.SpID ? entry.Miner : 'n/a';
-    const age = formatTaskAgeSeconds(
-        interpolateClusterTaskAgeSeconds(entry.AgeSeconds, this.displayClock),
-    );
-    const ageTitle = age === 'unknown'
-      ? state === 'running'
-        ? UNKNOWN_RUNNING_AGE_TOOLTIP
-        : 'Waiting time is unavailable.'
-      : age;
+    const ageValue = personalTaskAge(entry, this.displayClock);
+    const age = ageValue.text ?? formatTaskAgeSeconds(ageValue.seconds);
+    const ageTitle = ageValue.title;
     return html`
       <tr>
         <td title=${miner}>${miner}</td>

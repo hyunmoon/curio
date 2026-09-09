@@ -99,13 +99,14 @@ const (
 // availability, but that's safe — resources can only increase, never
 // invalidating a "fits" decision made moments earlier.
 func (h *taskTypeHandler) considerWork(from string, tasks []task, eventEmitter eventEmitter) (workAccepted bool) {
-	return h.considerWorkWithOwnership(from, tasks, eventEmitter, h.claimTaskOwnership, h.releaseTaskOwnership)
+	return h.considerWorkWithOwnership(from, tasks, eventEmitter, h.claimTaskOwnership, h.releaseTaskOwnership,
+		harmonyTaskAttemptStore{db: h.TaskEngine.cfg.db, owner: int(h.TaskEngine.cfg.ownerID)})
 }
 
 // The ownership callbacks keep failure paths testable without changing the
 // production SQL or requiring a live database for admission lifecycle tests.
 func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, eventEmitter eventEmitter,
-	claim func([]TaskID, int) ([]TaskID, error), release func([]TaskID) error) (workAccepted bool) {
+	claim func([]TaskID, int) ([]TaskID, error), release func([]TaskID) error, attemptStore taskAttemptStore) (workAccepted bool) {
 	if len(tasks) == 0 {
 		return true
 	}
@@ -199,6 +200,11 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 			h.accept.Add(toInt64s(remainder))
 			tIDs = tasksAccepted
 		}
+	}
+
+	tIDs, attemptTokens := prepareTaskAttempts(h.TaskEngine.cfg.ctx, attemptStore, tIDs)
+	if len(tIDs) == 0 {
+		return false
 	}
 
 	releaseStorage := make([]func(), len(tIDs))
@@ -330,7 +336,13 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 
 			defer taskCancel()
 
-			done, doErr = runWithStartReservation(taskCtx, startReservation, func() (bool, error) {
+			var beforeStart func(context.Context) error
+			if startReservation != nil {
+				beforeStart = startReservation.start
+			}
+			done, doErr = runWithAttemptStart(taskCtx, attemptStore, tID, attemptTokens[tID], beforeStart, time.Now, func(start time.Time) {
+				workStart = start
+			}, func() (bool, error) {
 				return h.Do(taskCtx, tID, func() bool {
 					if taskCtx.Err() != nil {
 						return false

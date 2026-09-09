@@ -65,7 +65,9 @@ func TestStartReservationExecutionAndCancellation(t *testing.T) {
 			if mode == "cancelled" {
 				cancel()
 			}
-			done, err := runWithStartReservation(ctx, r, func() (bool, error) {
+			store := newMemoryAttemptStore()
+			_, tokens := prepareTaskAttempts(context.Background(), store, []TaskID{1})
+			done, err := runWithAttemptStart(ctx, store, 1, tokens[1], r.start, time.Now, func(time.Time) {}, func() (bool, error) {
 				ran++
 				if started != 1 {
 					t.Fatal("Do entered before reservation commit")
@@ -75,6 +77,7 @@ func TestStartReservationExecutionAndCancellation(t *testing.T) {
 				}
 				return true, nil
 			})
+			r.cancel()
 			if cancelled != 1 || done != (mode == "success") || (err == nil) != (mode == "success") {
 				t.Fatalf("done=%v error=%v cancelled=%d", done, err, cancelled)
 			}
@@ -129,7 +132,7 @@ func (s *startReservationStorage) Claim(int) (func() error, error) {
 }
 
 func TestStartReservationRealClaimAndStorageFailures(t *testing.T) {
-	for _, mode := range []string{"claim-lost", "claim-error", "context-cancelled", "storage-error", "release-error", "recovery-storage-error"} {
+	for _, mode := range []string{"claim-lost", "claim-error", "context-cancelled", "attempt-prepare-error", "storage-error", "release-error", "recovery-storage-error"} {
 		t.Run(mode, func(t *testing.T) {
 			reserved, started, cancelled, claims, releases := 0, 0, 0, 0, 0
 			storage := &startReservationStorage{}
@@ -146,6 +149,10 @@ func TestStartReservationRealClaimAndStorageFailures(t *testing.T) {
 			source := workSourcePoller
 			if mode == "recovery-storage-error" {
 				source = workSourceRecover
+			}
+			store := newMemoryAttemptStore()
+			if mode == "attempt-prepare-error" {
+				store.prepareErr = errors.New("synthetic preparation failure")
 			}
 			ok := h.considerWorkWithOwnership(source, []task{{ID: 1}, {ID: 2}}, eventEmitter{},
 				func(ids []TaskID, _ int) ([]TaskID, error) {
@@ -172,7 +179,7 @@ func TestStartReservationRealClaimAndStorageFailures(t *testing.T) {
 						return errors.New("synthetic ownership release error")
 					}
 					return nil
-				})
+				}, store)
 			if ok || reserved != 1 || started != 0 || cancelled != 1 || h.Max.Active() != 0 {
 				t.Fatalf("accepted=%v reserved=%d started=%d cancelled=%d active=%d", ok, reserved, started, cancelled, h.Max.Active())
 			}
@@ -206,7 +213,7 @@ func TestStartReservationProductionCallSites(t *testing.T) {
 				reserve = call.Pos()
 			case "claim":
 				claim = call.Pos()
-			case "runWithStartReservation":
+			case "runWithAttemptStart":
 				run = call.Pos()
 			}
 		case *ast.SelectorExpr:
