@@ -4,8 +4,8 @@ This follow-up adds executable SQL assertions to the existing NULL-offset
 readiness fix. PostgreSQL 16.15 execution passed at follow-up `6dace4e4`
 and current-upstream extraction `ac6bf2dc`, including all six MK12/MK20
 baseline subtests and the candidate-side negative controls described below.
-YugabyteDB execution remains **NOT RUN**. Future execution requires
-an operator runs these tests in a separately authorized disposable database.
+YugabyteDB execution remains **NOT RUN**. Future execution requires a
+separately authorized disposable database.
 No production target, API, task engine, payload processing, or recovery is used.
 
 ## Statements and Coverage
