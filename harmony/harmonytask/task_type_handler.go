@@ -99,13 +99,17 @@ const (
 // availability, but that's safe — resources can only increase, never
 // invalidating a "fits" decision made moments earlier.
 func (h *taskTypeHandler) considerWork(from string, tasks []task, eventEmitter eventEmitter) (workAccepted bool) {
-	return h.considerWorkWithOwnership(from, tasks, eventEmitter, h.claimTaskOwnership, h.releaseTaskOwnership, nil)
+	return h.considerWorkWithOwnership(from, tasks, eventEmitter, h.claimTaskOwnership, h.releaseTaskOwnership)
 }
 
 // The ownership callbacks keep failure paths testable without changing the
 // production SQL or requiring a live database for admission lifecycle tests.
 func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, eventEmitter eventEmitter,
-	claim func([]TaskID, int) ([]TaskID, error), release func([]TaskID) error, attemptStore taskAttemptStore) (workAccepted bool) {
+	claim func([]TaskID, int) ([]TaskID, error), release func([]TaskID) error, attemptStores ...taskAttemptStore) (workAccepted bool) {
+	var attemptStore taskAttemptStore
+	if len(attemptStores) > 0 {
+		attemptStore = attemptStores[0]
+	}
 	if len(tasks) == 0 {
 		return true
 	}

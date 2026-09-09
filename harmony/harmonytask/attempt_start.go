@@ -100,6 +100,11 @@ func runWithAttemptStart(ctx context.Context, store taskAttemptStore, id TaskID,
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
+		defer func() {
+			if failure := recover(); failure != nil {
+				log.Errorw("Task execution start writer panicked; telemetry is unconfirmed", "id", id, "panic", failure)
+			}
+		}()
 		ok, err := store.record(writeCtx, id, token, started)
 		if err != nil || !ok {
 			log.Warnw("Task execution start is unconfirmed", "id", id, "recorded", ok, "error", err)

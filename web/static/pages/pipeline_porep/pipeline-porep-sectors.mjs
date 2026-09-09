@@ -1,7 +1,7 @@
 import { LitElement, html, css } from 'https://cdn.jsdelivr.net/gh/lit/dist@3/all/lit-all.min.js';
 import RPCCall from '/lib/jsonrpc.mjs';
 import { formatDateTwo } from '/lib/dateutil.mjs';
-import { visiblePoRepSectors } from './personal-visibility.mjs';
+import { visiblePoRepSectors } from './visibility.mjs';
 import '/ux/compact-epoch.mjs';
 import '/ux/task.mjs';
 
@@ -75,13 +75,13 @@ export const pipelineStyles = css`
 class PipelinePorepSectors extends LitElement {
     static properties = {
         data: { type: Array },
-        hidePendingSDR: { type: Boolean },
+        hidePendingSDR: { type: Boolean, attribute: 'hide-pending-sdr' },
     };
 
     constructor() {
         super();
         this.data = [];
-        this.hidePendingSDR = true;
+        this.hidePendingSDR = false;
         this.loadData();
     }
 

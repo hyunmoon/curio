@@ -1,5 +1,5 @@
 import {LitElement, html, css} from 'https://cdn.jsdelivr.net/gh/lit/dist@3/all/lit-all.min.js';
-import {personalTaskAge} from './cluster-tasks-personal.mjs';
+import {clusterTaskAge} from './cluster-tasks-age.mjs';
 import {RPCCallHTTP} from '/lib/jsonrpc.mjs';
 import {
   ClusterTaskFreshnessTicker,
@@ -24,11 +24,9 @@ import {
   freezeClusterTaskDisplayClock,
   formatClusterTaskSectionSummary,
   formatTaskAgeSeconds,
-  interpolateClusterTaskAgeSeconds,
   parseBoundedInteger,
   resetClusterTaskDisplayClock,
   shouldRunClusterTaskFreshness,
-  UNKNOWN_RUNNING_AGE_TOOLTIP,
 } from '/cluster-tasks-model.mjs';
 
 class ClusterTasks extends LitElement {
@@ -776,9 +774,11 @@ class ClusterTasks extends LitElement {
 
   renderRow(entry) {
     const hasOwner = entry.OwnerID !== null && entry.OwnerID !== undefined;
-    const state = entry.State || (hasOwner ? 'running' : 'pending');
+    const state = hasOwner && entry.TookState === 'awaiting-start'
+      ? 'awaiting-start'
+      : entry.State || (hasOwner ? 'running' : 'pending');
     const miner = entry.Miners?.length ? entry.Miners.join(', ') : entry.SpID ? entry.Miner : 'n/a';
-    const ageValue = personalTaskAge(entry, this.displayClock);
+    const ageValue = clusterTaskAge(entry, this.displayClock);
     const age = ageValue.text ?? formatTaskAgeSeconds(ageValue.seconds);
     const ageTitle = ageValue.title;
     return html`

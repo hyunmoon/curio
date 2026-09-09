@@ -8,6 +8,11 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/filecoin-project/curio/harmony/harmonytask/internal/acceptcache"
+	"github.com/filecoin-project/curio/harmony/harmonytask/internal/runregistry"
+	"github.com/filecoin-project/curio/harmony/resources"
+	"github.com/filecoin-project/curio/harmony/taskhelp"
 )
 
 type memoryAttemptStore struct {
@@ -19,6 +24,7 @@ type memoryAttemptStore struct {
 	recordErr    error
 	recordCalled chan struct{}
 	blockWriter  bool
+	panicWriter  bool
 	writerExited chan struct{}
 }
 
@@ -40,6 +46,9 @@ func (s *memoryAttemptStore) prepare(ctx context.Context, id TaskID, token strin
 }
 func (s *memoryAttemptStore) record(ctx context.Context, id TaskID, token string, start time.Time) (bool, error) {
 	defer func() { s.writerExited <- struct{}{} }()
+	if s.panicWriter {
+		panic("synthetic writer panic")
+	}
 	if s.blockWriter {
 		s.recordCalled <- struct{}{}
 		<-ctx.Done()
@@ -96,6 +105,27 @@ func TestAttemptPreparationFailureReleasesWithoutStart(t *testing.T) {
 		if len(ids) != 0 || len(tokens) != 0 || len(s.released) != 2 || len(s.starts) != 0 {
 			t.Fatalf("ids=%v tokens=%v released=%v starts=%v", ids, tokens, s.released, s.starts)
 		}
+	}
+}
+
+func TestAttemptPreparationFailureDoesNotDispatchFromScheduler(t *testing.T) {
+	for _, source := range []string{workSourcePoller, workSourceRecover, workSourcePreempt} {
+		t.Run(source, func(t *testing.T) {
+			store := newMemoryAttemptStore()
+			store.prepareErr = errors.New("synthetic preparation failure")
+			h := &taskTypeHandler{
+				TaskInterface:   &stubAcceptTask{},
+				TaskTypeDetails: TaskTypeDetails{Name: "Synthetic", Max: taskhelp.Max(2), Cost: resources.Resources{Cpu: 1}},
+				TaskEngine:      &TaskEngine{cfg: taskEngineConfig{ctx: context.Background(), reg: &resources.Reg{Resources: resources.Resources{Cpu: 2}}}},
+				running:         runregistry.New(), accept: acceptcache.New(time.Hour), storageFailures: map[TaskID]time.Time{},
+			}
+			accepted := h.considerWorkWithOwnership(source, []task{{ID: 1}}, eventEmitter{},
+				func(ids []TaskID, _ int) ([]TaskID, error) { return ids, nil },
+				func([]TaskID) error { t.Fatal("unexpected storage ownership release"); return nil }, store)
+			if accepted || h.Max.Active() != 0 || len(store.released) != 1 || len(store.starts) != 0 {
+				t.Fatalf("accepted=%v active=%d released=%v starts=%v", accepted, h.Max.Active(), store.released, store.starts)
+			}
+		})
 	}
 }
 
@@ -192,6 +222,22 @@ func TestAttemptWriterJoinedOnPanic(t *testing.T) {
 	case <-s.writerExited:
 	default:
 		t.Fatal("participant survived wrapper")
+	}
+}
+
+func TestAttemptWriterPanicDoesNotEscapeTelemetry(t *testing.T) {
+	s := newMemoryAttemptStore()
+	s.panicWriter = true
+	done, err := runWithAttemptStart(context.Background(), s, 1, "token", nil, time.Now, func(time.Time) {}, func() (bool, error) {
+		select {
+		case <-s.writerExited:
+		case <-time.After(time.Second):
+			t.Fatal("writer did not exit")
+		}
+		return true, nil
+	})
+	if !done || err != nil || len(s.starts) != 0 {
+		t.Fatalf("execution=%v %v telemetry=%v", done, err, s.starts)
 	}
 }
 

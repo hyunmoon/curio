@@ -285,6 +285,7 @@ type CurioSubsystemsConfig struct {
 	// On first start or after a long idle, wait for a stable instance phase
 	// within SealSDRMinStartInterval. This is not a cluster-wide rate limit.
 	// Identity combines CURIO_NODE_NAME and the instance listen identity.
+	// Both must be nonempty when jitter and a positive interval are enabled.
 	// Disabled by default; interval zero preserves unpaced scheduling.
 	SealSDRStartJitter bool
 

@@ -36,10 +36,14 @@ FIL, and Dynamic inner types. There are no field exclusions. An unsupported
 future type or excluded model field fails and requires explicit review.
 `TestUISchemaDocumentation` compares generated help with schema descriptions.
 
-`TestUICustomConfigRoundTrip` exercises production layer load/save preparation
-and runtime loading for both personal pacing profiles, release controls, and
-existing queue limits. Additional tests protect explicit default overrides,
+`TestUIGenericLayerConfigRoundTrip` exercises production layer load/save
+preparation and runtime loading for subsystem settings, durations, and queue
+limits. Additional tests protect explicit default overrides,
 unknown keys, case normalization, and nested address/FIL values.
+
+On personal, `TestUICustomConfigRoundTrip` additionally protects both personal
+pacing profiles and release controls. The separate
+`layer-editor-personal.test.mjs` retains the personal-field editor fixtures.
 
 Database-free commands (use the repository's working native build environment,
 with database connection variables and integration opt-ins absent):
