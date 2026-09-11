@@ -21,7 +21,7 @@ test('actual page uses the filter without hiding RPC rows or falsifying totals',
     const host = readFileSync(new URL('../static/pages/pipeline_porep/index.html', import.meta.url), 'utf8');
     assert.match(host, /<pipeline-porep-sectors hide-pending-sdr>/);
     const page = readFileSync(new URL('../static/pages/pipeline_porep/pipeline-porep-sectors.mjs', import.meta.url), 'utf8');
-    assert.match(page, /visiblePoRepSectors\(this\.data, this\.hidePendingSDR\)/);
+    assert.match(page, /visiblePoRepSectors\(this\.data, snapshot\?\.HidePendingSDR \?\? false\)/);
     assert.match(page, /visibleSectors\.map\(/);
     assert.match(page, /of \$\{this\.data\.length\}/);
     const api = readFileSync(new URL('../api/webrpcporep/pipeline_porep.go', import.meta.url), 'utf8');
