@@ -445,7 +445,7 @@ func (ee eventEmitter) EmitTaskCompleted(taskName string, success bool) {
 //
 // Returns nil on error so the scheduler preserves its existing in-memory state
 // and reservations rather than replacing them with an empty/partial snapshot.
-// Tasks beyond chokePoint per type are dropped to bound memory.
+// Backing-work eligibility is checked before the per-type snapshot bound.
 func (e *TaskEngine) pollAllTaskTypes() map[string][]task {
 	var rows []struct {
 		ID         TaskID    `db:"id"`
@@ -473,15 +473,20 @@ func (e *TaskEngine) pollAllTaskTypes() map[string][]task {
 		if _, ok := result[r.Name]; !ok {
 			continue
 		}
-		if len(result[r.Name]) >= chokePoint {
-			continue
-		}
 		result[r.Name] = append(result[r.Name], task{
 			ID:         r.ID,
 			UpdateTime: r.UpdateTime,
 			PostedTime: r.PostedTime,
 			Retries:    r.Retries,
 		})
+	}
+	for _, h := range e.handlers {
+		selected, err := filterPolledTasks(e.cfg.ctx, h, result[h.Name])
+		if err != nil {
+			log.Errorw("failed to filter task candidates", "name", h.Name, "error", err)
+			return nil
+		}
+		result[h.Name] = selected
 	}
 	return result
 }

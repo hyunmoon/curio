@@ -76,24 +76,10 @@ func NewSDRTask(api SDRAPI, db *harmonydb.DB, sp *SealPoller, sc *ffi2.SealCalls
 
 func (s *SDRTask) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned func() bool) (done bool, err error) {
 
-	var sectorParamsArr []struct {
-		SpID         int64                   `db:"sp_id"`
-		SectorNumber int64                   `db:"sector_number"`
-		RegSealProof abi.RegisteredSealProof `db:"reg_seal_proof"`
-	}
-
-	err = s.db.Select(ctx, &sectorParamsArr, `
-		SELECT sp_id, sector_number, reg_seal_proof
-		FROM sectors_sdr_pipeline
-		WHERE task_id_sdr = $1`, taskID)
+	sectorParams, err := s.sectorReference(ctx, taskID)
 	if err != nil {
 		return false, xerrors.Errorf("getting sector params: %w", err)
 	}
-
-	if len(sectorParamsArr) != 1 {
-		return false, xerrors.Errorf("expected 1 sector params, got %d", len(sectorParamsArr))
-	}
-	sectorParams := sectorParamsArr[0]
 	harmonytask.SetMeta(ctx, PoRepPipelineKey, [2]int64{sectorParams.SpID, sectorParams.SectorNumber})
 
 	dealData, err := dealdata.DealDataSDRPoRep(ctx, s.db, s.sc, sectorParams.SpID, sectorParams.SectorNumber, sectorParams.RegSealProof, true)
@@ -273,18 +259,7 @@ func (s *SDRTask) GetSectorID(db *harmonydb.DB, taskID int64) (*abi.SectorID, er
 var _ = harmonytask.Reg(&SDRTask{})
 
 func (s *SDRTask) taskToSector(id harmonytask.TaskID) (ffi2.SectorRef, error) {
-	var refs []ffi2.SectorRef
-
-	err := s.db.Select(context.Background(), &refs, `SELECT sp_id, sector_number, reg_seal_proof FROM sectors_sdr_pipeline WHERE task_id_sdr = $1`, id)
-	if err != nil {
-		return ffi2.SectorRef{}, xerrors.Errorf("getting sector ref: %w", err)
-	}
-
-	if len(refs) != 1 {
-		return ffi2.SectorRef{}, xerrors.Errorf("expected 1 sector ref, got %d", len(refs))
-	}
-
-	return refs[0], nil
+	return s.sectorReference(context.Background(), id)
 }
 
 var _ harmonytask.TaskInterface = &SDRTask{}

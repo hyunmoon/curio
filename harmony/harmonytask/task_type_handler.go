@@ -49,7 +49,8 @@ type taskTypeHandler struct {
 	// storageFailures is only read/written from considerWork, which runs on
 	// the scheduler thread. The single-writer invariant is what makes this
 	// safe without a mutex.
-	storageFailures map[TaskID]time.Time
+	storageFailures      map[TaskID]time.Time
+	lastAcceptRefusalLog time.Time
 
 	// --- concurrent state, encapsulated behind typed APIs ---
 	//
@@ -105,7 +106,7 @@ func (h *taskTypeHandler) considerWork(from string, tasks []task, eventEmitter e
 // The ownership callbacks keep failure paths testable without changing the
 // production SQL or requiring a live database for admission lifecycle tests.
 func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, eventEmitter eventEmitter,
-	claim func([]TaskID, int) ([]TaskID, error), release func([]TaskID) error, attemptStores ...taskAttemptStore) (workAccepted bool) {
+	claim func([]TaskID, int) ([]TaskID, error), release func([]TaskID, map[TaskID]string) error, attemptStores ...taskAttemptStore) (workAccepted bool) {
 	var attemptStore taskAttemptStore
 	if len(attemptStores) > 0 {
 		attemptStore = attemptStores[0]
@@ -147,7 +148,9 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 		return false
 	}
 	if len(tIDs) == 0 {
-		log.Infow("did not accept task", "task_ids", ids, "reason", "CanAccept() refused", "name", h.Name)
+		if h.shouldLogAcceptRefusal(time.Now()) {
+			log.Infow("did not accept task", "candidate_count", len(ids), "task_id_sample", ids[:min(5, len(ids))], "reason", "CanAccept() refused", "name", h.Name)
+		}
 		return false
 	}
 
@@ -222,6 +225,7 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 		for _, tID := range tIDs {
 			markComplete, err := h.Cost.Claim(int(tID))
 			if err != nil {
+				log.Errorw("did not accept task", "task_id", tID, "reason", "storage claim failed", "name", h.Name, "error", err)
 				failedTIDs = append(failedTIDs, tID)
 				h.storageFailures[tID] = time.Now()
 				continue
@@ -235,8 +239,7 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 		}
 		if len(failedTIDs) > 0 {
 			tIDs = goodTIDs
-			log.Errorw("did not accept task", "task_ids", failedTIDs, "reason", "storage claim failed", "name", h.Name)
-			err := release(failedTIDs)
+			err := release(failedTIDs, attemptTokens)
 			if err != nil {
 				log.Errorw("Could not reset failed tasks", "error", err)
 			}
@@ -411,8 +414,40 @@ func (h *taskTypeHandler) claimTaskOwnership(ids []TaskID, maxAcceptable int) ([
 	return accepted, err
 }
 
-func (h *taskTypeHandler) releaseTaskOwnership(ids []TaskID) error {
-	_, err := h.TaskEngine.cfg.db.Exec(h.TaskEngine.cfg.ctx, `UPDATE harmony_task SET owner_id = NULL WHERE id = ANY($1)`, ids)
+const releasePreparedTaskOwnershipSQL = `UPDATE harmony_task AS t
+SET owner_id = NULL
+FROM unnest($1::bigint[], $2::text[]) AS failed(id, attempt_id)
+WHERE t.id = failed.id AND t.owner_id = $3
+  AND t.attempt_id = failed.attempt_id
+  AND t.attempt_started_at IS NULL AND t.attempt_start_source = 'prepared'`
+
+func (h *taskTypeHandler) releaseTaskOwnership(ids []TaskID, tokens map[TaskID]string) error {
+	return releasePreparedTaskOwnership(ids, tokens, int(h.TaskEngine.cfg.ownerID),
+		func(ctx context.Context, ids []int64, attempts []string, owner int) (int, error) {
+			return h.TaskEngine.cfg.db.Exec(ctx, releasePreparedTaskOwnershipSQL, ids, attempts, owner)
+		})
+}
+
+// releasePreparedTaskOwnership is only for failed storage claims after attempt
+// preparation. Match the attempt as well as the owner: the same machine may
+// have acquired a newer attempt by the time this cleanup reaches the DB.
+// One batch and one independent cleanup budget cover every failed ID.
+func releasePreparedTaskOwnership(ids []TaskID, tokens map[TaskID]string, owner int,
+	exec func(context.Context, []int64, []string, int) (int, error)) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	attempts := make([]string, len(ids))
+	for i, id := range ids {
+		token := tokens[id]
+		if token == "" {
+			return fmt.Errorf("cannot release task %d without its prepared attempt token", id)
+		}
+		attempts[i] = token
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := exec(ctx, toInt64s(ids), attempts, owner)
 	return err
 }
 
@@ -667,6 +702,13 @@ func reorderTaskIDsByPostedOrder(tasks []task, ids []TaskID) []TaskID {
 // intersection with a non-empty cache is a miss for this candidate set — not
 // a CanAccept refusal.
 func (h *taskTypeHandler) resolveAcceptedIDs(ids []TaskID) ([]TaskID, error) {
+	if _, ok := h.TaskInterface.(taskCandidateFilter); ok {
+		var err error
+		ids, err = filterTaskCandidates(h.TaskEngine.cfg.ctx, h.TaskInterface, ids)
+		if err != nil || len(ids) == 0 {
+			return nil, err
+		}
+	}
 	matched, hadFresh := h.accept.TakeMatching(toInt64s(ids))
 	if hadFresh && len(matched) > 0 {
 		tIDs := toTaskIDs(matched)
@@ -685,6 +727,14 @@ func (h *taskTypeHandler) resolveAcceptedIDs(ids []TaskID) ([]TaskID, error) {
 	// hadFresh && len(matched)==0 → unrelated cached ids; live CanAccept.
 	// !hadFresh → empty/expired cache; live CanAccept.
 	return h.CanAccept(ids, h.TaskEngine)
+}
+
+func (h *taskTypeHandler) shouldLogAcceptRefusal(now time.Time) bool {
+	if !h.lastAcceptRefusalLog.IsZero() && now.Sub(h.lastAcceptRefusalLog) < time.Minute {
+		return false
+	}
+	h.lastAcceptRefusalLog = now
+	return true
 }
 
 // toInt64s / toTaskIDs bridge the TaskID (int) and int64 domains used by

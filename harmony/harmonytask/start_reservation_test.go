@@ -248,10 +248,13 @@ func TestStartReservationRealClaimAndStorageFailures(t *testing.T) {
 					default:
 						return ids, nil
 					}
-				}, func(ids []TaskID) error {
+				}, func(ids []TaskID, tokens map[TaskID]string) error {
 					releases++
 					if len(ids) != 1 || ids[0] != 1 {
 						t.Fatalf("wrong ownership release: %v", ids)
+					}
+					if tokens[ids[0]] == "" {
+						t.Fatal("storage ownership release lost the prepared attempt token")
 					}
 					if mode == "release-error" {
 						return errors.New("synthetic ownership release error")

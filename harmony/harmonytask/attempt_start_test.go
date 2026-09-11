@@ -121,7 +121,7 @@ func TestAttemptPreparationFailureDoesNotDispatchFromScheduler(t *testing.T) {
 			}
 			accepted := h.considerWorkWithOwnership(source, []task{{ID: 1}}, eventEmitter{},
 				func(ids []TaskID, _ int) ([]TaskID, error) { return ids, nil },
-				func([]TaskID) error { t.Fatal("unexpected storage ownership release"); return nil }, store)
+				func([]TaskID, map[TaskID]string) error { t.Fatal("unexpected storage ownership release"); return nil }, store)
 			if accepted || h.Max.Active() != 0 || len(store.released) != 1 || len(store.starts) != 0 {
 				t.Fatalf("accepted=%v active=%d released=%v starts=%v", accepted, h.Max.Active(), store.released, store.starts)
 			}
