@@ -125,7 +125,7 @@ func TestCandidateFilterProductionPollPath(t *testing.T) {
 	calls := 0
 	prematureCaps := 0
 	for _, d := range f.Decls {
-		if fn, ok := d.(*ast.FuncDecl); ok && fn.Name.Name == "pollAllTaskTypes" {
+		if fn, ok := d.(*ast.FuncDecl); ok && fn.Name.Name == "pollAllTaskTypesWithQuery" {
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
 				if id, ok := n.(*ast.Ident); ok && id.Name == "chokePoint" {
 					prematureCaps++

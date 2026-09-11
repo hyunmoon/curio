@@ -28,9 +28,8 @@ type schedulerEvent struct {
 	Success bool // for schedulerSourceTaskCompleted: true = done, false = cancelled/failed
 
 	// DBTasks is populated only for schedulerSourceDBPoll events. It contains
-	// the complete snapshot of unowned tasks from the DB, keyed by task type.
-	// This replaces the scheduler's in-memory available task map, ensuring
-	// stale entries (claimed by others, deleted) are garbage-collected.
+	// the successfully queried snapshots, keyed by task type. Omitted types
+	// preserve their previous state; a present empty slice clears that type.
 	DBTasks map[string][]task
 }
 
@@ -204,25 +203,13 @@ func (e *TaskEngine) startScheduler() {
 				switch event.Source {
 
 				case schedulerSourceDBPoll:
-					// Replace the entire available-tasks map with the DB snapshot.
+					// Replace only the successfully queried task-type snapshots.
 					// This garbage-collects stale entries (tasks claimed/deleted by
 					// others). Always re-enter the waterfall afterward: RetryWait
 					// may have elapsed for existing IDs, CanAccept cache was
 					// refreshed, and IAmBored must run when capacity remains with
 					// no claimable work (not only when new IDs appear).
-					for taskName, tasks := range event.DBTasks {
-						sched := availableTasks[taskName]
-						if sched == nil {
-							continue
-						}
-						newHas := lo.Associate(tasks, func(t task) (TaskID, task) {
-							return t.ID, t
-						})
-						availableTasks[taskName] = &taskSchedule{
-							hasID:  newHas,
-							choked: len(tasks) >= chokePoint,
-						}
-					}
+					applyDBTaskSnapshot(availableTasks, event.DBTasks)
 
 					if err := e.pollerTryAllWork(ts, ee); err != nil {
 						log.Errorw("failed tryAllWork", "error", err)
@@ -436,30 +423,49 @@ func (ee eventEmitter) EmitTaskCompleted(taskName string, success bool) {
 	}
 }
 
-// expects single-threaded caller of
+// applyDBTaskSnapshot runs on the scheduler goroutine. Missing keys preserve
+// previous state; present empty keys clear a successfully queried task type.
+func applyDBTaskSnapshot(available map[string]*taskSchedule, snapshot map[string][]task) {
+	for taskName, tasks := range snapshot {
+		if available[taskName] == nil {
+			continue
+		}
+		available[taskName] = &taskSchedule{
+			hasID:  lo.Associate(tasks, func(t task) (TaskID, task) { return t.ID, t }),
+			choked: len(tasks) >= chokePoint,
+		}
+	}
+}
 
-// pollAllTaskTypes queries the DB for all unowned tasks across all registered
-// task types in a single round-trip. This is the only DB read in the
-// scheduling hot path, and it runs on the background poller goroutine — never
-// on the scheduler thread.
+type polledTask struct {
+	ID         TaskID    `db:"id"`
+	Name       string    `db:"name"`
+	UpdateTime time.Time `db:"update_time"`
+	PostedTime time.Time `db:"posted_time"`
+	Retries    int       `db:"retries"`
+}
+
+// pollAllTaskTypes enumerates unowned tasks on the background poller and then
+// performs the optional task-specific bulk checks.
 //
-// Returns nil on error so the scheduler preserves its existing in-memory state
-// and reservations rather than replacing them with an empty/partial snapshot.
+// A common query error preserves every type. A task-specific error omits only
+// that type, so successful snapshots still reach the scheduler.
 // Backing-work eligibility is checked before the per-type snapshot bound.
 func (e *TaskEngine) pollAllTaskTypes() map[string][]task {
-	var rows []struct {
-		ID         TaskID    `db:"id"`
-		Name       string    `db:"name"`
-		UpdateTime time.Time `db:"update_time"`
-		PostedTime time.Time `db:"posted_time"`
-		Retries    int       `db:"retries"`
-	}
+	return e.pollAllTaskTypesWithQuery(func(names []string) ([]polledTask, error) {
+		var rows []polledTask
+		err := e.cfg.db.Select(context.Background(), &rows,
+			`SELECT id, name, update_time, posted_time, retries FROM harmony_task WHERE owner_id IS NULL AND name = ANY($1)`, names)
+		return rows, err
+	})
+}
+
+func (e *TaskEngine) pollAllTaskTypesWithQuery(query func([]string) ([]polledTask, error)) map[string][]task {
 	names := make([]string, len(e.handlers))
 	for i, h := range e.handlers {
 		names[i] = h.Name
 	}
-	err := e.cfg.db.Select(context.Background(), &rows,
-		`SELECT id, name, update_time, posted_time, retries FROM harmony_task WHERE owner_id IS NULL AND name = ANY($1)`, names)
+	rows, err := query(names)
 	if err != nil {
 		log.Errorw("failed to poll tasks from db", "error", err)
 		return nil
@@ -484,7 +490,8 @@ func (e *TaskEngine) pollAllTaskTypes() map[string][]task {
 		selected, err := filterPolledTasks(e.cfg.ctx, h, result[h.Name])
 		if err != nil {
 			log.Errorw("failed to filter task candidates", "name", h.Name, "error", err)
-			return nil
+			delete(result, h.Name)
+			continue
 		}
 		result[h.Name] = selected
 	}
