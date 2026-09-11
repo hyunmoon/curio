@@ -169,3 +169,18 @@ func (s *SDRTask) ReserveTaskStart(taskID harmonytask.TaskID) (func(context.Cont
 	}
 	return func(ctx context.Context) error { return s.startPacer.start(ctx, token, taskID) }, func() { s.startPacer.cancel(token) }, true
 }
+
+// TaskStartBlocked avoids synchronous readiness queries during a known pacing
+// wait. It does not evaluate a new idle phase or consume speculative admission.
+// A due admission still revalidates candidates before attempting reservation.
+func (s *SDRTask) TaskStartBlocked() bool {
+	if s.startPacer == nil {
+		return false
+	}
+	snapshot := s.startPacer.snapshot()
+	blocked := snapshot.reserved != 0 || snapshot.remaining > 0
+	if blocked {
+		s.startPacer.observer.blocked(snapshot)
+	}
+	return blocked
+}

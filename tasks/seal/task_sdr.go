@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.opencensus.io/stats"
 	"go.opencensus.io/tag"
@@ -245,8 +246,23 @@ func (s *SDRTask) GetSpid(db *harmonydb.DB, taskID int64) string {
 }
 
 func (s *SDRTask) GetSectorID(db *harmonydb.DB, taskID int64) (*abi.SectorID, error) {
+	return s.GetSectorIDContext(context.Background(), db, taskID)
+}
+
+func (s *SDRTask) GetSectorIDContext(ctx context.Context, db *harmonydb.DB, taskID int64) (*abi.SectorID, error) {
+	return lookupSDRSectorID(ctx, func(ctx context.Context, spId, sectorNumber *uint64) error {
+		return db.QueryRow(ctx, `SELECT sp_id,sector_number FROM sectors_sdr_pipeline WHERE task_id_sdr = $1`, taskID).Scan(spId, sectorNumber)
+	})
+}
+
+// Diagnostic lookup runs after slot/storage acquisition but before Do entry.
+// Bound it independently and honor preemption; a missing diagnostic sector ID
+// does not replace Do's authoritative sector-reference validation.
+func lookupSDRSectorID(ctx context.Context, scan func(context.Context, *uint64, *uint64) error) (*abi.SectorID, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	var spId, sectorNumber uint64
-	err := db.QueryRow(context.Background(), `SELECT sp_id,sector_number FROM sectors_sdr_pipeline WHERE task_id_sdr = $1`, taskID).Scan(&spId, &sectorNumber)
+	err := scan(ctx, &spId, &sectorNumber)
 	if err != nil {
 		return nil, err
 	}

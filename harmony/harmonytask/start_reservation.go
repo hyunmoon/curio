@@ -2,6 +2,13 @@ package harmonytask
 
 import "context"
 
+// A read-only, process-local fast refusal. A false result is NOT permission to
+// start: eligibility, claim and reservation are still checked normally. Do not
+// perform I/O, reserve a token or move the phase deadline in this method.
+type taskStartReadiness interface {
+	TaskStartBlocked() bool
+}
+
 // taskStartReserver is optional. CanAccept may be cached or called speculatively;
 // this hook runs only after ordinary eligibility/resource checks, before claim.
 // A nil start/cancel pair preserves the unpaced batch path. Otherwise the

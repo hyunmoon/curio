@@ -34,6 +34,12 @@ type pipelineTask interface {
 	GetSectorID(db *harmonydb.DB, taskID int64) (*abi.SectorID, error)
 }
 
+// Context-aware implementations can bound/cancel diagnostic lookup before Do.
+// Legacy pipeline tasks retain their existing interface.
+type contextualPipelineTask interface {
+	GetSectorIDContext(context.Context, *harmonydb.DB, int64) (*abi.SectorID, error)
+}
+
 // taskTypeHandler wraps a TaskInterface with scheduling metadata and runtime
 // state for its task type. The fields fall into three disjoint access
 // regimes — each one clearly labeled below — so a reader can tell at a
@@ -136,6 +142,9 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 	maxAcceptable, err := h.AssertMachineHasCapacity()
 	if err != nil {
 		log.Debugw("did not accept task", "name", h.Name, "reason", "at capacity already: "+err.Error())
+		return false
+	}
+	if gate, ok := h.TaskInterface.(taskStartReadiness); ok && gate.TaskStartBlocked() {
 		return false
 	}
 
@@ -288,27 +297,14 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 		handle := h.running.Start(int64(tID), taskCancel)
 
 		go func(tID TaskID, releaseStorage func(), handle *runregistry.Handle) {
-			if startReservation != nil {
-				defer startReservation.cancel()
-			}
-			eventEmitter.EmitTaskStarted(h.Name, tID)
 			var done bool
 			var doErr error
 			workStart := handle.StartTime()
-
 			var sectorID *abi.SectorID
-			if ht, ok := h.TaskInterface.(pipelineTask); ok {
-				// Use a goroutine-local error: writing the enclosing
-				// considerWork err from concurrent task goroutines is a race.
-				sid, gsErr := ht.GetSectorID(h.TaskEngine.cfg.db, int64(tID))
-				if gsErr != nil {
-					log.Errorw("Could not get sector ID", "task", h.Name, "id", tID, "error", gsErr)
-				}
-				sectorID = sid
-			}
 
-			log.Infow("Beginning work on Task", "id", tID, "from", from, "name", h.Name, "sector", sectorID)
-
+			// Install cleanup before diagnostic lookup or event emission. Neither
+			// is allowed to leave Max/running/storage or an unstarted reservation
+			// stranded on panic. Completion persistence may itself take time.
 			defer func() {
 				if r := recover(); r != nil {
 					stackSlice := make([]byte, 4092)
@@ -316,6 +312,9 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 					log.Error("Recovered from a serious error "+
 						"while processing "+h.Name+" task "+strconv.Itoa(int(tID))+": ", r,
 						" Stack: ", string(stackSlice[:sz]))
+				}
+				if startReservation != nil {
+					startReservation.cancel()
 				}
 				taskCancel()
 
@@ -344,6 +343,20 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 			}()
 
 			defer taskCancel()
+			eventEmitter.EmitTaskStarted(h.Name, tID)
+			// This value is diagnostic only; Do retains its authoritative lookup.
+			// Keep errors local to the goroutine, including concurrent batch tasks.
+			var sectorErr error
+			switch ht := h.TaskInterface.(type) {
+			case contextualPipelineTask:
+				sectorID, sectorErr = ht.GetSectorIDContext(taskCtx, h.TaskEngine.cfg.db, int64(tID))
+			case pipelineTask:
+				sectorID, sectorErr = ht.GetSectorID(h.TaskEngine.cfg.db, int64(tID))
+			}
+			if sectorErr != nil {
+				log.Errorw("Could not get sector ID", "task", h.Name, "id", tID, "error", sectorErr)
+			}
+			log.Infow("Beginning work on Task", "id", tID, "from", from, "name", h.Name, "sector", sectorID)
 
 			var beforeStart func(context.Context) error
 			if startReservation != nil {
