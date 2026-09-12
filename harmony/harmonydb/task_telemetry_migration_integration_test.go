@@ -37,6 +37,13 @@ var completeStartupFS embed.FS
 //go:embed sql/202[3-5]*.sql sql/20260[1-8]*.sql sql/20260909-task-attempt-start.sql sql/20260909-task-ownership-age.sql sql/20260910-task-telemetry-reconcile.sql
 var reconciledStartupFS embed.FS
 
+// The integrated personal baseline already contains the release gate. Include
+// it when isolating an acquisition failure so unrelated valid ledger progress
+// is not mistaken for a partially committed acquisition migration.
+//
+//go:embed sql/202[3-5]*.sql sql/20260[1-8]*.sql sql/20260906*.sql sql/20260909*.sql sql/20260910*.sql
+var personalPreAcquisitionFS embed.FS
+
 type taskMigrationFixture struct {
 	ctx    context.Context
 	conn   *pgx.Conn
@@ -230,7 +237,7 @@ func TestTaskTelemetryRunnerReconciliation(t *testing.T) {
 
 func TestTaskAcquisitionRunnerFailureRestart(t *testing.T) {
 	f := newTaskMigrationFixture(t)
-	f.startup(t, &reconciledStartupFS)
+	f.startup(t, &personalPreAcquisitionFS)
 	f.seed(t, true, true)
 	tasks, ledger := f.snapshot(t, "harmony_task"), f.snapshot(t, "base")
 	locker, err := f.conn.Begin(f.ctx)
