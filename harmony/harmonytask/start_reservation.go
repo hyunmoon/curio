@@ -13,6 +13,8 @@ type taskStartReadiness interface {
 // this hook runs only after ordinary eligibility/resource checks, before claim.
 // A nil start/cancel pair preserves the unpaced batch path. Otherwise the
 // reservation covers one task, and start is called immediately before Do.
+// start must be short and non-I/O: it participates in the atomic decision
+// between entering Do and cancelling a pending admission.
 type taskStartReserver interface {
 	ReserveTaskStart(TaskID) (start func(context.Context) error, cancel func(), allowed bool)
 }

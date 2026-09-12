@@ -261,14 +261,16 @@ func TestStartReservationRealClaimAndStorageFailures(t *testing.T) {
 					}
 					return nil
 				}, store)
-			if ok || reserved != 1 || started != 0 || cancelled != 1 || h.Max.Active() != 0 {
+			settleAdmissions(t, h)
+			pending := mode == "attempt-prepare-error" || mode == "storage-error" || mode == "release-error" || mode == "recovery-storage-error"
+			if ok != pending || reserved != 1 || started != 0 || cancelled != 1 || h.Max.Active() != 0 {
 				t.Fatalf("accepted=%v reserved=%d started=%d cancelled=%d active=%d", ok, reserved, started, cancelled, h.Max.Active())
 			}
 			storagePhase := mode == "storage-error" || mode == "release-error" || mode == "recovery-storage-error"
 			if (storagePhase && (storage.claims != 1 || releases != 1)) || (!storagePhase && (storage.claims != 0 || releases != 0)) {
 				t.Fatalf("storage claims=%d ownership releases=%d", storage.claims, releases)
 			}
-			if (source == workSourceRecover && claims != 0) || (source != workSourceRecover && claims != 1) {
+			if claims != 1 {
 				t.Fatalf("unexpected claim calls=%d for %s", claims, source)
 			}
 		})
@@ -296,20 +298,24 @@ func TestStartReservationProductionCallSites(t *testing.T) {
 				claim = call.Pos()
 			case "runWithAttemptStart":
 				run = call.Pos()
-			case "withStartReservationCleanup":
-				cleanup, cleanupEnd = call.Pos(), call.End()
 			}
 		case *ast.SelectorExpr:
-			if fun.Sel.Name == "Claim" {
+			if fun.Sel.Name == "releaseLocal" {
+				cleanup = call.Pos()
+			}
+			if fun.Sel.Name == "recordCompletion" {
+				cleanupEnd = call.Pos()
+			}
+			if fun.Sel.Name == "beginAdmission" {
 				storage = call.Pos()
 			}
 		}
 		return true
 	})
 	if reserve == token.NoPos || reserve >= claim || claim >= storage || storage >= run {
-		t.Fatalf("production reserve/claim/storage/Do order not protected: %v %v %v %v", reserve, claim, storage, run)
+		t.Fatalf("production reserve/claim/admission/Do path not protected: %v %v %v %v", reserve, claim, storage, run)
 	}
-	if cleanup == token.NoPos || cleanup >= run || run >= cleanupEnd {
-		t.Fatal("production entry is not scoped by immediate reservation cleanup")
+	if cleanup == token.NoPos || cleanup >= cleanupEnd || cleanupEnd >= run {
+		t.Fatal("production defer must release the admission before completion persistence")
 	}
 }

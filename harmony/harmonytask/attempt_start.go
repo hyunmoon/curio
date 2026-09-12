@@ -12,7 +12,9 @@ import (
 
 const PREPARE_TASK_ATTEMPT = `UPDATE harmony_task
 SET attempt_id=$1, attempt_started_at=NULL, attempt_start_source='prepared'
-WHERE id=$2 AND owner_id=$3`
+WHERE id=$2 AND owner_id=$3 AND owner_generation=$4
+  AND (attempt_id IS NULL OR attempt_id=$1)
+  AND attempt_started_at IS NULL AND attempt_start_source IN ('claimed', 'prepared')`
 
 const RECORD_TASK_ATTEMPT_START = `UPDATE harmony_task
 SET attempt_started_at=$1, attempt_start_source='do_entry'
@@ -28,10 +30,17 @@ type taskAttemptStore interface {
 type harmonyTaskAttemptStore struct {
 	db    *harmonydb.DB
 	owner int
+	// Populated by the claim/recovery statement, immutable before workers start.
+	generations map[TaskID]int64
+	token       string
 }
 
 func (s harmonyTaskAttemptStore) prepare(ctx context.Context, id TaskID, token string) error {
-	n, err := s.db.Exec(ctx, PREPARE_TASK_ATTEMPT, token, id, s.owner)
+	generation, ok := s.generations[id]
+	if !ok {
+		return fmt.Errorf("missing acquisition generation for task %d", id)
+	}
+	n, err := s.db.Exec(ctx, PREPARE_TASK_ATTEMPT, token, id, s.owner, generation)
 	if err != nil {
 		return err
 	}
@@ -47,8 +56,28 @@ func (s harmonyTaskAttemptStore) record(ctx context.Context, id TaskID, token st
 }
 
 func (s harmonyTaskAttemptStore) releaseUnstarted(ctx context.Context, id TaskID) error {
-	_, err := s.db.Exec(ctx, `UPDATE harmony_task SET owner_id=NULL WHERE id=$1 AND owner_id=$2`, id, s.owner)
+	generation, ok := s.generations[id]
+	if !ok {
+		return fmt.Errorf("missing cleanup acquisition generation for task %d", id)
+	}
+	if s.token == "" {
+		return fmt.Errorf("missing cleanup attempt token for task %d", id)
+	}
+	_, err := s.db.Exec(ctx, RELEASE_TASK_ACQUISITION, id, s.owner, generation, s.token)
 	return err
+}
+
+const RELEASE_TASK_ACQUISITION = `UPDATE harmony_task SET owner_id=NULL
+WHERE id=$1 AND owner_id=$2 AND owner_generation=$3
+  AND (attempt_id IS NULL OR attempt_id=$4)
+  AND attempt_started_at IS NULL AND attempt_start_source IN ('claimed', 'prepared')`
+
+func bindAttemptToken(store taskAttemptStore, token string) taskAttemptStore {
+	if s, ok := store.(harmonyTaskAttemptStore); ok {
+		s.token = token
+		return s
+	}
+	return store
 }
 
 func prepareTaskAttempts(ctx context.Context, store taskAttemptStore, ids []TaskID) ([]TaskID, map[TaskID]string) {
@@ -59,6 +88,7 @@ func prepareTaskAttempts(ctx context.Context, store taskAttemptStore, ids []Task
 	failed := make([]TaskID, 0)
 	for _, id := range ids {
 		token := uuid.NewString()
+		tokens[id] = token
 		if err := store.prepare(prepareCtx, id, token); err != nil {
 			log.Errorw("Could not prepare task attempt telemetry", "id", id, "error", err)
 			failed = append(failed, id)
@@ -72,9 +102,10 @@ func prepareTaskAttempts(ctx context.Context, store taskAttemptStore, ids []Task
 	releaseCtx, stopRelease := context.WithTimeout(context.Background(), 5*time.Second)
 	defer stopRelease()
 	for _, id := range failed {
-		if err := store.releaseUnstarted(releaseCtx, id); err != nil {
+		if err := bindAttemptToken(store, tokens[id]).releaseUnstarted(releaseCtx, id); err != nil {
 			log.Errorw("Could not release unstarted task", "id", id, "error", err)
 		}
+		delete(tokens, id)
 	}
 	return prepared, tokens
 }

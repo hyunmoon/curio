@@ -251,13 +251,11 @@ func TestCandidateAdmissionReferenceVanishesBeforeStorageClaim(t *testing.T) {
 			if mode == "recovery" {
 				source = workSourceRecover
 			}
-			if h.considerWorkWithOwnership(source, []task{{ID: 1}, {ID: 2}}, eventEmitter{}, claim, release, store) {
-				t.Fatal("missing reference dispatched work")
+			if !h.considerWorkWithOwnership(source, []task{{ID: 1}, {ID: 2}}, eventEmitter{}, claim, release, store) {
+				t.Fatal("expected pending admission before storage revalidation")
 			}
+			settleAdmissions(t, h)
 			wantClaims := 1
-			if mode == "recovery" {
-				wantClaims = 0
-			}
 			wantOwner := 7
 			if mode == "matching-attempt" || mode == "recovery" {
 				wantOwner = 0

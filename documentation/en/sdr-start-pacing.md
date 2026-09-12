@@ -5,6 +5,14 @@ ordinary resource checks, task concurrency limits, or database ownership.
 
 ## Contract
 
+The admission entry hook commits only the in-memory pacing state. Its entry
+diagnostic is delivered outside the scheduler entry decision by a bounded,
+best-effort sender (one outstanding entry log per pacer). A stalled log sink
+drops additional entry diagnostics, not task starts. This keeps pending
+cancellation and Do entry independent of log I/O. Configuration and rate-limited
+blocked-start diagnostics retain their existing delivery behavior; this is not
+a promise that all scheduler-side diagnostics or other I/O are asynchronous.
+
 `Subsystems.SealSDRMinStartInterval` retains its duration key and zero default.
 Zero preserves the existing unpaced batch path, even when jitter is enabled.
 Negative intervals reject SDR task construction instead of becoming unlimited.

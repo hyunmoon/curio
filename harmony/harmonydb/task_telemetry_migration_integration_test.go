@@ -21,16 +21,21 @@ import (
 )
 
 // Frozen historical startup inputs, not fabricated base ledger entries. All
-// selected files are the real production migrations through the release gate.
+// selected files are the real production migrations through August 2026, plus
+// the specified task telemetry variant. The independent MK20 release gate is
+// not a prerequisite for task telemetry or its migration history.
 //
-//go:embed sql/202[3-5]*.sql sql/20260[1-8]*.sql sql/20260906-mk20-release-gate.sql sql/20260909-task-ownership-age.sql
+//go:embed sql/202[3-5]*.sql sql/20260[1-8]*.sql sql/20260909-task-ownership-age.sql
 var ownershipStartupFS embed.FS
 
-//go:embed sql/202[3-5]*.sql sql/20260[1-8]*.sql sql/20260906-mk20-release-gate.sql sql/20260909-task-attempt-start.sql
+//go:embed sql/202[3-5]*.sql sql/20260[1-8]*.sql sql/20260909-task-attempt-start.sql
 var attemptStartupFS embed.FS
 
-//go:embed sql/202[3-5]*.sql sql/20260[1-8]*.sql sql/20260906-mk20-release-gate.sql sql/20260909-task-attempt-start.sql sql/20260909-task-ownership-age.sql
+//go:embed sql/202[3-5]*.sql sql/20260[1-8]*.sql sql/20260909-task-attempt-start.sql sql/20260909-task-ownership-age.sql
 var completeStartupFS embed.FS
+
+//go:embed sql/202[3-5]*.sql sql/20260[1-8]*.sql sql/20260909-task-attempt-start.sql sql/20260909-task-ownership-age.sql sql/20260910-task-telemetry-reconcile.sql
+var reconciledStartupFS embed.FS
 
 type taskMigrationFixture struct {
 	ctx    context.Context
@@ -185,6 +190,14 @@ func (f *taskMigrationFixture) assertPreserved(t *testing.T, tasks, ledger []map
 	require.NoError(t, f.conn.QueryRow(f.ctx, `SELECT count(*) FROM pg_trigger WHERE tgrelid='harmony_task'::regclass
 		AND tgname IN ('harmony_task_clear_attempt_start_trigger','harmony_task_sync_work_start_trigger')`).Scan(&triggers))
 	require.Equal(t, 2, triggers)
+	var acquisitionLedger, acquisitionTrigger int
+	require.NoError(t, f.conn.QueryRow(f.ctx, "SELECT count(*) FROM base WHERE entry='20260912'").Scan(&acquisitionLedger))
+	require.Equal(t, 1, acquisitionLedger, "startup must reach the acquisition fence migration")
+	require.NoError(t, f.conn.QueryRow(f.ctx, `SELECT count(*) FROM pg_trigger WHERE tgrelid='harmony_task'::regclass AND tgname='harmony_task_acquisition_generation'`).Scan(&acquisitionTrigger))
+	require.Equal(t, 1, acquisitionTrigger)
+	for _, row := range after {
+		require.NotNil(t, row["owner_generation"])
+	}
 	t.Logf("preserved %d task rows and %d original ledger rows; reconciliation recorded once", len(tasks), len(ledger))
 }
 
@@ -198,6 +211,7 @@ func TestTaskTelemetryRunnerReconciliation(t *testing.T) {
 		{"ownership_only", &ownershipStartupFS, false, true},
 		{"attempt_only", &attemptStartupFS, true, false},
 		{"fully_applied_in_flight", &completeStartupFS, true, true},
+		{"previous_normal_schema", &reconciledStartupFS, true, true},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			f := newTaskMigrationFixture(t)
@@ -212,6 +226,41 @@ func TestTaskTelemetryRunnerReconciliation(t *testing.T) {
 			require.Equal(t, stableLedger, f.snapshot(t, "base"), "restart must not manufacture another applied entry")
 		})
 	}
+}
+
+func TestTaskAcquisitionRunnerFailureRestart(t *testing.T) {
+	f := newTaskMigrationFixture(t)
+	f.startup(t, &reconciledStartupFS)
+	f.seed(t, true, true)
+	tasks, ledger := f.snapshot(t, "harmony_task"), f.snapshot(t, "base")
+	locker, err := f.conn.Begin(f.ctx)
+	require.NoError(t, err)
+	_, err = locker.Exec(f.ctx, "LOCK TABLE harmony_task IN ACCESS SHARE MODE")
+	require.NoError(t, err)
+	var captured *pgxpool.Pool
+	require.Nil(t, harmonyquery.ITestUpgradeFunc)
+	harmonyquery.ITestUpgradeFunc = func(pool *pgxpool.Pool, _ string, _ string) { captured = pool }
+	defer func() {
+		harmonyquery.ITestUpgradeFunc = nil
+		c, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		_ = locker.Rollback(c)
+		if captured != nil {
+			captured.Close()
+		}
+	}()
+	_, err = NewFromConfig(f.cfg)
+	require.ErrorContains(t, err, "20260912-task-acquisition-generation.sql")
+	require.ErrorContains(t, err, "lock timeout")
+	require.NoError(t, locker.Rollback(f.ctx))
+	harmonyquery.ITestUpgradeFunc = nil
+	if captured != nil {
+		captured.Close()
+		captured = nil
+	}
+	require.Equal(t, ledger, f.snapshot(t, "base"), "failed DDL must not fabricate its ledger entry")
+	f.startup(t, nil)
+	f.assertPreserved(t, tasks, ledger)
 }
 
 func TestTaskTelemetryRunnerPartialFailureRestart(t *testing.T) {

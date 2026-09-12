@@ -48,6 +48,7 @@ func TestSDRStartReadinessIsReadOnly(t *testing.T) {
 		if err := start(context.Background()); err != nil {
 			t.Fatal(err)
 		}
+		awaitSDREntryLog(t, p)
 		cancel()
 		before = p.snapshot()
 		for range 10 {

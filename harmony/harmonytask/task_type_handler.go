@@ -11,6 +11,7 @@ import (
 
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/samber/lo"
+	"github.com/yugabyte/pgx/v5"
 	"go.opencensus.io/stats"
 	"go.opencensus.io/tag"
 	"golang.org/x/xerrors"
@@ -63,8 +64,11 @@ type taskTypeHandler struct {
 	// The mutex and backing store for each of these lives inside an internal
 	// sub-package, so nothing in this package can reach them without going
 	// through methods that lock correctly.
-	running *runregistry.Registry
-	accept  *acceptcache.Cache
+	running            *runregistry.Registry
+	accept             *acceptcache.Cache
+	admissions         map[TaskID]*taskAdmission
+	completionRecorder func(TaskID, bool, error)
+	admissionFactory   func(string, []task) (func([]TaskID, int) ([]TaskID, error), taskAttemptStore)
 }
 
 // canAcceptCacheTTL controls how long pre-computed CanAccept results remain
@@ -80,9 +84,10 @@ const storageFailureTimeout = 3 * time.Minute
 // workSource* identify how work was discovered. They are passed into
 // considerWork as the "from" argument (stats, logging, recover path).
 const (
-	workSourcePoller  = "poller"
-	workSourceRecover = "recovered"
-	workSourcePreempt = "preempt"
+	workSourcePoller   = "poller"
+	workSourceRecover  = "recovered"
+	workSourcePreempt  = "preempt"
+	workSourceOverride = "scheduling-override"
 )
 
 // considerWork is the core scheduling function for a single task type. It
@@ -106,7 +111,20 @@ const (
 // availability, but that's safe — resources can only increase, never
 // invalidating a "fits" decision made moments earlier.
 func (h *taskTypeHandler) considerWork(from string, tasks []task, eventEmitter eventEmitter) (workAccepted bool) {
-	return h.considerWorkWithOwnership(from, tasks, eventEmitter, h.claimTaskOwnership, h.releaseTaskOwnership)
+	generations := make(map[TaskID]int64)
+	store := taskAttemptStore(harmonyTaskAttemptStore{db: h.TaskEngine.cfg.db, owner: h.TaskEngine.cfg.ownerID, generations: generations})
+	release := h.releaseTaskOwnership
+	claim := func(ids []TaskID, limit int) ([]TaskID, error) {
+		if from == workSourceRecover {
+			return h.recoverTaskOwnership(tasks, ids, limit, generations)
+		}
+		return h.claimTaskOwnership(ids, limit, generations, tasks...)
+	}
+	if h.admissionFactory != nil {
+		claim, store = h.admissionFactory(from, tasks)
+		release = nil
+	}
+	return h.considerWorkWithOwnership(from, tasks, eventEmitter, claim, release, store)
 }
 
 // The ownership callbacks keep failure paths testable without changing the
@@ -124,16 +142,25 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 	// Skip IDs already running on this node. After a successful claim,
 	// running.Start happens before considerWork returns, so a later waterfall
 	// (TaskCompleted / bundle / tryStart) must not re-claim and log "already Taken".
-	if from != workSourceRecover {
+	{
 		tasks = lo.Filter(tasks, func(t task, _ int) bool {
 			_, running := h.running.Get(int64(t.ID))
-			return !running
+			return !running && h.admissions[t.ID] == nil
 		})
 		if len(tasks) == 0 {
 			return true
 		}
 	}
 
+	if h.TaskEngine.cfg.ctx.Err() != nil || h.TaskEngine.atomics.draining.Load() {
+		return false
+	}
+	if h.admissions == nil {
+		h.admissions = make(map[TaskID]*taskAdmission)
+	}
+	if len(h.admissions) >= maxPendingAdmissions {
+		return false
+	}
 	if h.Max.AtMax() {
 		log.Debugw("did not accept task", "name", h.Name, "reason", "at max already")
 		return false
@@ -165,6 +192,7 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 
 	tIDs = reorderTaskIDsByPostedOrder(tasks, tIDs)
 
+	maxAcceptable = min(maxAcceptable, maxPendingAdmissions-len(h.admissions))
 	headroomUntilMax := h.Max.Headroom()
 	if maxAcceptable > headroomUntilMax {
 		maxAcceptable = headroomUntilMax
@@ -195,7 +223,7 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 		}
 	}()
 
-	if from != workSourceRecover {
+	{
 		tasksAccepted, err := claim(tIDs, maxAcceptable)
 		if err != nil {
 			log.Error(err)
@@ -207,6 +235,9 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 			log.Debugw("did not accept task", "task_id", tIDs, "reason", "already Taken", "name", h.Name)
 
 			return false
+		}
+		if len(tasksAccepted) > maxAcceptable {
+			panic("claim exceeded admission headroom")
 		}
 		if len(tasksAccepted) != len(tIDs) {
 			remainder := lo.Filter(tIDs, func(tID TaskID, _ int) bool {
@@ -220,212 +251,181 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 	if attemptStore == nil {
 		attemptStore = harmonyTaskAttemptStore{db: h.TaskEngine.cfg.db, owner: int(h.TaskEngine.cfg.ownerID)}
 	}
-	tIDs, attemptTokens := prepareTaskAttempts(h.TaskEngine.cfg.ctx, attemptStore, tIDs)
-	if len(tIDs) == 0 {
-		return false
-	}
-
-	releaseStorage := make([]func(), len(tIDs))
-
-	if h.Cost.Storage != nil {
-		failedTIDs := []TaskID{}
-		goodTIDs := []TaskID{}
-		releaseStorage = []func(){}
-		for _, tID := range tIDs {
-			markComplete, err := h.Cost.Claim(int(tID))
-			if err != nil {
-				log.Errorw("did not accept task", "task_id", tID, "reason", "storage claim failed", "name", h.Name, "error", err)
-				failedTIDs = append(failedTIDs, tID)
-				h.storageFailures[tID] = time.Now()
-				continue
-			}
-			goodTIDs = append(goodTIDs, tID)
-			releaseStorage = append(releaseStorage, func() {
-				if err := markComplete(); err != nil {
-					log.Errorw("Could not release storage", "error", err)
-				}
-			})
-		}
-		if len(failedTIDs) > 0 {
-			tIDs = goodTIDs
-			err := release(failedTIDs, attemptTokens)
-			if err != nil {
-				log.Errorw("Could not reset failed tasks", "error", err)
-			}
-			if len(goodTIDs) == 0 {
-				return false
-			}
-		}
-	} else {
-		for i := range tIDs {
-			releaseStorage[i] = func() {}
-		}
-	}
-
-	_ = stats.RecordWithTags(context.Background(), []tag.Mutator{
-		tag.Upsert(taskNameTag, h.Name),
-		tag.Upsert(sourceTag, from),
-	}, TaskMeasures.TasksStarted.M(int64(len(tIDs))))
-
-	h.Max.Add(len(tIDs))
-	_ = stats.RecordWithTags(context.Background(), []tag.Mutator{
-		tag.Upsert(taskNameTag, h.Name),
-	}, TaskMeasures.ActiveTasks.M(int64(h.Max.ActiveThis())))
-
-	// Drop claimed IDs from the scheduler's available set immediately (same
-	// thread). Waiting for async TaskStarted left a window where another
-	// waterfall re-tried the SQL claim and logged "already Taken".
 	eventEmitter.NoteClaimed(h.Name, tIDs)
-
-	// 6. Launch a goroutine for each claimed task. Each goroutine:
-	//   - Emits TaskStarted so peers are notified (local map already cleared)
-	//   - Calls Do() with a stillOwned callback for single-writer safety
-	//   - On completion, records results to DB and emits TaskCompleted
-	//   - On failure, emits TaskNew to re-add the task for retry
-	i := 0
-	for _, tID := range tIDs {
-		// Derive from context.Background(), not the engine ctx: a graceful
-		// shutdown (which cancels the engine ctx to stop picking up new work)
-		// must NOT cancel tasks already running, or in-flight time-sensitive
-		// work (WinningPost/WindowPost) would be aborted mid-flight even though
-		// GracefullyTerminate explicitly waits for it to finish. The only things
-		// that cancel a running task are preemption (handle.Preempt) and the
-		// task's own completion (the deferred taskCancel below).
-		taskCtx, taskCancel := context.WithCancel(context.Background())
-		meta := &completionMeta{vals: make(map[any]any)}
-		taskCtx = context.WithValue(taskCtx, completionMetaKey{}, meta)
-		handle := h.running.Start(int64(tID), taskCancel)
-
-		go func(tID TaskID, releaseStorage func(), handle *runregistry.Handle) {
-			var done bool
-			var doErr error
-			workStart := handle.StartTime()
-			var sectorID *abi.SectorID
-
-			// Install cleanup before diagnostic lookup or event emission. Neither
-			// is allowed to leave Max/running/storage or an unstarted reservation
-			// stranded on panic. Completion persistence may itself take time.
-			defer func() {
-				if r := recover(); r != nil {
-					stackSlice := make([]byte, 4092)
-					sz := runtime.Stack(stackSlice, false)
-					log.Error("Recovered from a serious error "+
-						"while processing "+h.Name+" task "+strconv.Itoa(int(tID))+": ", r,
-						" Stack: ", string(stackSlice[:sz]))
-				}
-				if startReservation != nil {
-					startReservation.cancel()
-				}
-				taskCancel()
-
-				preempted := handle.IsPreempted()
-				h.running.Finish(int64(tID))
-
-				h.Max.Add(-1)
-
-				if releaseStorage != nil {
-					releaseStorage()
-				}
-				h.recordCompletion(tID, sectorID, workStart, done, doErr, preempted)
-				success := done && doErr == nil
-				if success {
-					h.TaskEngine.invokeTaskCompleteCallbacks(h.Name, meta, tID)
-				}
-				eventEmitter.EmitTaskCompleted(h.Name, success)
-				if !done {
-					for _, t := range tasks {
-						if t.ID == tID {
-							h.emitRetryTask(eventEmitter, t, preempted)
-							break
-						}
-					}
-				}
-			}()
-
-			defer taskCancel()
-			eventEmitter.EmitTaskStarted(h.Name, tID)
-			// This value is diagnostic only; Do retains its authoritative lookup.
-			// Keep errors local to the goroutine, including concurrent batch tasks.
-			var sectorErr error
-			switch ht := h.TaskInterface.(type) {
-			case contextualPipelineTask:
-				sectorID, sectorErr = ht.GetSectorIDContext(taskCtx, h.TaskEngine.cfg.db, int64(tID))
-			case pipelineTask:
-				sectorID, sectorErr = ht.GetSectorID(h.TaskEngine.cfg.db, int64(tID))
-			}
-			if sectorErr != nil {
-				log.Errorw("Could not get sector ID", "task", h.Name, "id", tID, "error", sectorErr)
-			}
-			log.Infow("Beginning work on Task", "id", tID, "from", from, "name", h.Name, "sector", sectorID)
-
-			var beforeStart func(context.Context) error
-			if startReservation != nil {
-				beforeStart = startReservation.start
-			}
-			done, doErr = withStartReservationCleanup(startReservation, func() (bool, error) {
-				return runWithAttemptStart(taskCtx, attemptStore, tID, attemptTokens[tID], beforeStart, time.Now, func(start time.Time) {
-					workStart = start
-				}, func() (bool, error) {
-					return h.Do(taskCtx, tID, func() bool {
-						if taskCtx.Err() != nil {
-							return false
-						}
-						if taskhelp.IsBackgroundTask(h.Name) || h.CanYield {
-							if h.TaskEngine.atomics.yieldBackground.Load() {
-								log.Infow("yielding background task", "name", h.Name, "id", tID)
-								return false
-							}
-						}
-						// Uninterruptible work (e.g. Send*) calls stillOwned before
-						// taking a per-sender lock. During shutdown drain, fail that
-						// check so hundreds of waiters can exit without starting a new
-						// critical section; in-flight holders do not call stillOwned
-						// and are waited on via Active() in GracefullyTerminate.
-						if h.Uninterruptible && h.TaskEngine.atomics.draining.Load() {
-							log.Infow("yielding uninterruptible task during shutdown drain", "name", h.Name, "id", tID)
-							return false
-						}
-
-						var owner int
-						err := h.TaskEngine.cfg.db.QueryRow(taskCtx,
-							`SELECT owner_id FROM harmony_task WHERE id=$1`, tID).Scan(&owner)
-						if err != nil {
-							log.Error("Cannot determine ownership: ", err)
-							return false
-						}
-						return owner == h.TaskEngine.cfg.ownerID
-					})
-				})
-			})
-			if doErr != nil {
-				log.Errorw("Do() returned error", "type", h.Name, "id", strconv.Itoa(int(tID)), "error", doErr)
-			}
-		}(tID, releaseStorage[i], handle)
-		dispatched = true
-		i++
+	for _, id := range tIDs {
+		h.beginAdmission(from, id, tasks, attemptStore, startReservation, eventEmitter, release)
 	}
+	dispatched = true // accepted includes pending, not just Do-entered
 	return true
 }
 
-func (h *taskTypeHandler) claimTaskOwnership(ids []TaskID, maxAcceptable int) ([]TaskID, error) {
-	var accepted []TaskID
-	err := h.TaskEngine.cfg.db.Select(h.TaskEngine.cfg.ctx, &accepted, `
-		WITH candidates AS (
-			SELECT t.id
+func (h *taskTypeHandler) dispatchAdmission(a *taskAdmission) {
+	tID, from, tasks, attemptStore, eventEmitter, handle := a.id, a.from, a.tasks, a.store, a.ee, a.handle
+	taskCancel := a.cancel
+	meta := &completionMeta{vals: make(map[any]any)}
+	taskCtx := context.WithValue(a.ctx, completionMetaKey{}, meta)
+	_ = stats.RecordWithTags(context.Background(), []tag.Mutator{tag.Upsert(taskNameTag, h.Name), tag.Upsert(sourceTag, from)}, TaskMeasures.TasksStarted.M(1))
+	go func() {
+		var done bool
+		var doErr error
+		workStart := handle.StartTime()
+		var sectorID *abi.SectorID
+
+		// Install cleanup before diagnostic lookup or event emission. Neither
+		// is allowed to leave Max/running/storage or an unstarted reservation
+		// stranded on panic. Completion persistence may itself take time.
+		defer func() {
+			if r := recover(); r != nil {
+				stackSlice := make([]byte, 4092)
+				sz := runtime.Stack(stackSlice, false)
+				log.Error("Recovered from a serious error "+
+					"while processing "+h.Name+" task "+strconv.Itoa(int(tID))+": ", r,
+					" Stack: ", string(stackSlice[:sz]))
+			}
+
+			select {
+			case <-a.entered:
+			default:
+				a.handle.CancelPending()
+				return
+			}
+			taskCancel()
+
+			preempted := handle.IsPreempted()
+			a.releaseLocal()
+			var retry *task
+			if h.completionRecorder != nil {
+				h.completionRecorder(tID, done, doErr)
+			} else {
+				retry = h.recordCompletion(tID, sectorID, workStart, done, doErr, preempted, a.token)
+			}
+			success := done && doErr == nil
+			if success {
+				h.TaskEngine.invokeTaskCompleteCallbacks(h.Name, meta, tID)
+			}
+			eventEmitter.EmitTaskCompleted(h.Name, success)
+			h.emitRetryTask(eventEmitter, retry)
+		}()
+
+		defer taskCancel()
+		for _, snapshot := range tasks {
+			if snapshot.ID == tID {
+				eventEmitter.EmitTaskStarted(h.Name, tID, snapshot)
+				break
+			}
+		}
+		// This value is diagnostic only; Do retains its authoritative lookup.
+		// Keep errors local to the goroutine, including concurrent batch tasks.
+		var sectorErr error
+		switch ht := h.TaskInterface.(type) {
+		case contextualPipelineTask:
+			sectorID, sectorErr = ht.GetSectorIDContext(taskCtx, h.TaskEngine.cfg.db, int64(tID))
+		case pipelineTask:
+			sectorID, sectorErr = ht.GetSectorID(h.TaskEngine.cfg.db, int64(tID))
+		}
+		if sectorErr != nil {
+			log.Errorw("Could not get sector ID", "task", h.Name, "id", tID, "error", sectorErr)
+		}
+		log.Infow("Beginning work on Task", "id", tID, "from", from, "name", h.Name, "sector", sectorID)
+
+		beforeStart := a.enter
+		done, doErr = runWithAttemptStart(taskCtx, attemptStore, tID, a.token, beforeStart, time.Now, func(start time.Time) {
+			workStart = start
+		}, func() (bool, error) {
+			return h.Do(taskCtx, tID, func() bool {
+				if taskCtx.Err() != nil {
+					return false
+				}
+				if taskhelp.IsBackgroundTask(h.Name) || h.CanYield {
+					if h.TaskEngine.atomics.yieldBackground.Load() {
+						log.Infow("yielding background task", "name", h.Name, "id", tID)
+						return false
+					}
+				}
+				// Uninterruptible work (e.g. Send*) calls stillOwned before
+				// taking a per-sender lock. During shutdown drain, fail that
+				// check so hundreds of waiters can exit without starting a new
+				// critical section; in-flight holders do not call stillOwned
+				// and are waited on via Active() in GracefullyTerminate.
+				if h.Uninterruptible && h.TaskEngine.atomics.draining.Load() {
+					log.Infow("yielding uninterruptible task during shutdown drain", "name", h.Name, "id", tID)
+					return false
+				}
+
+				var owner int
+				err := h.TaskEngine.cfg.db.QueryRow(taskCtx,
+					`SELECT owner_id FROM harmony_task WHERE id=$1`, tID).Scan(&owner)
+				if err != nil {
+					log.Error("Cannot determine ownership: ", err)
+					return false
+				}
+				return owner == h.TaskEngine.cfg.ownerID
+			})
+		})
+		if doErr != nil {
+			log.Errorw("Do() returned error", "type", h.Name, "id", strconv.Itoa(int(tID)), "error", doErr)
+		}
+	}()
+}
+
+func (h *taskTypeHandler) claimTaskOwnership(ids []TaskID, maxAcceptable int, generations map[TaskID]int64, observed ...task) ([]TaskID, error) {
+	expected := make(map[TaskID]task, len(observed))
+	for _, t := range observed {
+		expected[t.ID] = t
+	}
+	retries := make([]int, len(ids))
+	updates := make([]*time.Time, len(ids))
+	waits := make([]int64, len(ids))
+	for i, id := range ids {
+		t, ok := expected[id]
+		if !ok {
+			return nil, fmt.Errorf("missing claim snapshot for task %d", id)
+		}
+		retries[i] = t.Retries
+		// First notifications do not carry an authoritative retry timestamp.
+		if t.Retries > 0 && !t.UpdateTime.IsZero() {
+			updates[i] = &t.UpdateTime
+		}
+		if t.Retries > 0 && h.RetryWait != nil {
+			waits[i] = h.RetryWait(t.Retries).Microseconds()
+		}
+	}
+	var accepted []struct {
+		ID              TaskID
+		OwnerGeneration int64 `db:"owner_generation"`
+	}
+	err := h.TaskEngine.cfg.db.Select(h.TaskEngine.cfg.ctx, &accepted, claimTaskOwnershipSQL,
+		h.TaskEngine.cfg.ownerID, ids, maxAcceptable, retries, updates, waits)
+	idsOut := make([]TaskID, 0, len(accepted))
+	for _, row := range accepted {
+		idsOut = append(idsOut, row.ID)
+		generations[row.ID] = row.OwnerGeneration
+	}
+	return idsOut, err
+}
+
+const claimTaskOwnershipSQL = `
+		WITH expected AS (
+			SELECT * FROM unnest($2::bigint[], $4::int[], $5::timestamptz[], $6::bigint[])
+			AS x(id, retries, updated, wait_us)
+		), candidates AS (
+			SELECT t.id, x.retries, x.updated, x.wait_us
 			FROM harmony_task t
-			JOIN unnest($2::bigint[]) AS x(id) ON x.id = t.id
-			WHERE t.owner_id IS NULL
+			JOIN expected x ON x.id = t.id
+			WHERE t.owner_id IS NULL AND t.retries = x.retries
+			  AND (t.update_time = x.updated OR (x.updated IS NULL AND x.retries = 0))
+			  AND (t.retries = 0 OR CURRENT_TIMESTAMP >= t.update_time + x.wait_us * INTERVAL '1 microsecond')
 			ORDER BY array_position($2, t.id::bigint)
 			LIMIT $3
-			FOR UPDATE SKIP LOCKED
+			FOR UPDATE OF t SKIP LOCKED
 		)
 		UPDATE harmony_task t
 		SET owner_id = $1
 		FROM candidates c
-		WHERE t.id = c.id
-		RETURNING t.id;`, h.TaskEngine.cfg.ownerID, ids, maxAcceptable)
-	return accepted, err
-}
+		WHERE t.id = c.id AND t.owner_id IS NULL AND t.retries = c.retries
+		  AND (t.update_time = c.updated OR (c.updated IS NULL AND c.retries = 0))
+		  AND (t.retries = 0 OR CURRENT_TIMESTAMP >= t.update_time + c.wait_us * INTERVAL '1 microsecond')
+		RETURNING t.id, t.owner_generation;`
 
 const releasePreparedTaskOwnershipSQL = `UPDATE harmony_task AS t
 SET owner_id = NULL
@@ -468,31 +468,24 @@ func releasePreparedTaskOwnership(ids []TaskID, tokens map[TaskID]string, owner 
 // recordCompletion. Failed tasks sleep RetryWait before emitting so the task is
 // not visible to scheduling (or peers) until the backoff elapses. Tasks dropped
 // after MaxFailures are not re-emitted.
-func (h *taskTypeHandler) emitRetryTask(eventEmitter eventEmitter, base task, preempted bool) {
-	if base.ID == 0 {
+func (h *taskTypeHandler) emitRetryTask(eventEmitter eventEmitter, retry *task) {
+	if retry == nil {
 		return
 	}
-
-	if preempted {
-		eventEmitter.EmitTaskNew(h.Name, base)
-		return
-	}
-
-	if h.MaxFailures > 0 && base.Retries >= int(h.MaxFailures)-1 {
-		return
-	}
-
-	retry := base
-	retry.Retries++
-	retry.UpdateTime = time.Now().UTC()
-
-	var wait time.Duration
-	if h.RetryWait != nil && retry.Retries > 0 {
-		wait = h.RetryWait(retry.Retries)
-	}
+	ctx := h.TaskEngine.cfg.ctx
+	wait := max(0, time.Until(retryDeadline(*retry, h.RetryWait)))
 	go func() {
-		time.Sleep(wait)
-		eventEmitter.EmitTaskNew(h.Name, retry)
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		select {
+		case <-ctx.Done():
+		case eventEmitter.schedulerChannel <- schedulerEvent{TaskID: retry.ID, TaskType: h.Name, Source: schedulerSourceAdded, Retries: retry.Retries, PostedTime: retry.PostedTime, UpdateTime: retry.UpdateTime}:
+		}
 	}()
 }
 
@@ -507,9 +500,11 @@ func (h *taskTypeHandler) emitRetryTask(eventEmitter eventEmitter, base task, pr
 // Retries with exponential backoff on DB errors to guarantee eventual
 // persistence. If the process restarts before completion, the resurrection
 // logic in New() will recover the task.
-func (h *taskTypeHandler) recordCompletion(tID TaskID, sectorID *abi.SectorID, workStart time.Time, done bool, doErr error, preempted bool) {
+func (h *taskTypeHandler) recordCompletion(tID TaskID, sectorID *abi.SectorID, workStart time.Time, done bool, doErr error, preempted bool, attemptToken ...string) *task {
 	workEnd := time.Now()
 	retryWait := time.Millisecond * 100
+	var unavailable *taskhelp.WorkerUnavailable
+	workerUnavailable := errors.As(doErr, &unavailable) && len(attemptToken) == 1 && attemptToken[0] != ""
 
 	{
 		_ = stats.RecordWithTags(context.Background(), []tag.Mutator{
@@ -533,8 +528,10 @@ func (h *taskTypeHandler) recordCompletion(tID TaskID, sectorID *abi.SectorID, w
 	}
 
 	var waitStartTime time.Time
+	var retry *task
 retryRecordCompletion:
 	cm, err := h.TaskEngine.cfg.db.BeginTransaction(context.Background(), func(tx *harmonydb.Tx) (bool, error) {
+		retry = nil // Results belong only to the committed transaction attempt.
 		var postedTime time.Time
 		var retries uint
 		var updateTime time.Time
@@ -558,11 +555,37 @@ retryRecordCompletion:
 				result = "non-failing error: " + doErr.Error()
 			}
 		case preempted:
-			_, err = tx.Exec(`UPDATE harmony_task SET owner_id=NULL, update_time=CURRENT_TIMESTAMP WHERE id=$1`, tID)
+			retry = &task{ID: tID, Retries: int(retries), PostedTime: postedTime}
+			// Preemption is not a new failure: retain the retry clock whose wait
+			// was already satisfied at claim, for both peer and SQL eligibility.
+			token := ""
+			if len(attemptToken) == 1 {
+				token = attemptToken[0]
+			}
+			err = tx.QueryRow(`UPDATE harmony_task SET owner_id=NULL
+ WHERE id=$1 AND owner_id=$2 AND retries=$3 AND ($4='' OR attempt_id=$4)
+ RETURNING update_time`, tID, h.TaskEngine.cfg.ownerID, retries, token).Scan(&retry.UpdateTime)
+			if errors.Is(err, pgx.ErrNoRows) {
+				retry = nil
+				return true, nil
+			}
 			if err != nil {
 				return false, fmt.Errorf("could not release preempted task: %v %v", tID, err)
 			}
 			result = "preempted"
+		case workerUnavailable:
+			retry = &task{ID: tID, Retries: int(retries), PostedTime: postedTime}
+			err = tx.QueryRow(`UPDATE harmony_task SET owner_id=NULL, update_time=CURRENT_TIMESTAMP
+ WHERE id=$1 AND owner_id=$2 AND attempt_id=$3 AND retries=$4
+ RETURNING update_time`, tID, h.TaskEngine.cfg.ownerID, attemptToken[0], retries).Scan(&retry.UpdateTime)
+			if errors.Is(err, pgx.ErrNoRows) {
+				retry = nil
+				return true, nil
+			}
+			if err != nil {
+				return false, fmt.Errorf("could not return task from unavailable worker: %w", err)
+			}
+			result = "error: " + doErr.Error()
 		default:
 			result = "unspecified error"
 			if doErr != nil {
@@ -578,7 +601,8 @@ retryRecordCompletion:
 					return false, fmt.Errorf("could not delete failed job: %w", err)
 				}
 			} else {
-				_, err = tx.Exec(`UPDATE harmony_task SET owner_id=NULL, retries=$1, update_time=CURRENT_TIMESTAMP WHERE id=$2`, retries+1, tID)
+				retry = &task{ID: tID, Retries: int(retries) + 1, PostedTime: postedTime}
+				err = tx.QueryRow(`UPDATE harmony_task SET owner_id=NULL, retries=$1, update_time=CURRENT_TIMESTAMP WHERE id=$2 RETURNING update_time`, retries+1, tID).Scan(&retry.UpdateTime)
 				if err != nil {
 					return false, fmt.Errorf("could not disown failed task: %v %v", tID, err)
 				}
@@ -617,6 +641,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`, tID, h.Name, postedTime.U
 	_ = stats.RecordWithTags(context.Background(), []tag.Mutator{
 		tag.Upsert(taskNameTag, h.Name),
 	}, TaskMeasures.TaskScheduledWait.M(scheduledWait))
+	return retry
 }
 
 // maxHeadroom limits how many tasks of a single type can be accepted in one

@@ -16,7 +16,7 @@ contracts are unchanged.
 
 This is a forward-only compatibility repair. Dropping these columns is not a
 safe inverse: some installations already depended on them before reconciliation.
-Rolling source back to the pre-repair personal head keeps compatible columns;
+Rolling source back to a pre-reconciliation version keeps compatible columns;
 it neither reverses an applied ledger receipt nor repairs a different old schema.
 DDL takes relation locks, so rollout still requires a separately authorized,
 bounded migration window. This change does not make simultaneous startup
@@ -57,11 +57,10 @@ go test -c -tags=integration -o task-migrations.test ./harmony/harmonydb
 ./task-migrations.test -test.v -test.count=1 -test.timeout=6m -test.run '^TestTaskTelemetry'
 ```
 
-The real startup matrix and separate existing attempt/CAS SQL tests were executed
-on disposable PostgreSQL 16.15. Yugabyte execution remains NOT RUN. Static checks,
-unit/race results, and compilation are not substitutes for another database's
-DDL/locking behavior. The historical SQL/ledger separation remains a runner
-limitation outside this repair.
+Record the real startup matrix and attempt/CAS execution separately for each
+database engine and source revision. Static checks, unit/race results, and
+compilation are not substitutes for database DDL/locking behavior. The
+historical SQL/ledger separation remains a runner limitation outside this repair.
 
 The synchronous pre-dispatch attempt preparation/liveness finding is **not**
 fixed here. Passing reservation/token/Do-entry tests does not prove that a slow

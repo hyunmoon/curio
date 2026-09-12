@@ -2,6 +2,7 @@ package seal
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/filecoin-project/curio/harmony/harmonytask"
@@ -72,6 +73,20 @@ type sdrPacingObserver struct {
 	blockedLogged  bool
 	lastBlockedLog time.Duration
 	sink           func(sdrPacingEvent)
+	entryLogBusy   atomic.Bool
+}
+
+// Entry runs inside the scheduler's cancellation/entry decision. Never make
+// that decision wait for diagnostic I/O. At most one outstanding entry log
+// exists per pacer; a stalled sink drops subsequent entry diagnostics only.
+func (o *sdrPacingObserver) entry(e sdrPacingEvent) {
+	if !o.entryLogBusy.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer o.entryLogBusy.Store(false)
+		o.emit(e)
+	}()
 }
 
 func (o *sdrPacingObserver) blocked(s sdrPacingSnapshot) {

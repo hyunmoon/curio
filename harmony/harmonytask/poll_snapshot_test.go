@@ -134,7 +134,7 @@ func TestPollSnapshotProductionConnections(t *testing.T) {
 				return true
 			})
 		}
-		if fn.Name.Name == "startScheduler" {
+		if fn.Name.Name == "runScheduler" {
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
 				c, ok := n.(*ast.CaseClause)
 				if !ok {

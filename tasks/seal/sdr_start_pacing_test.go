@@ -16,6 +16,10 @@ func testSDRPacer(t *testing.T, interval time.Duration, jitter bool) (*sdrStartP
 	if err != nil {
 		t.Fatal(err)
 	}
+	if p != nil {
+		p.observer.sink = func(sdrPacingEvent) {}
+		t.Cleanup(func() { awaitSDREntryLog(t, p) })
+	}
 	return p, n
 }
 

@@ -22,8 +22,19 @@ import (
 
 // No regular Curio/libpq defaults are used. Each invocation owns one fresh
 // HarmonyDB test namespace and only drops that namespace during cleanup.
-func attemptSQLFixture(t *testing.T) (context.Context, *harmonydb.DB, *harmonydb.DB, *pgx.Conn) {
+func attemptSQLFixture(t *testing.T, capture ...func(harmonydb.Config)) (context.Context, *harmonydb.DB, *harmonydb.DB, *pgx.Conn) {
+	return attemptSQLFixtureSchema(t, true, capture...)
+}
+
+// Historical migration tests deliberately start before telemetry exists.
+// Runtime tests must instead exercise the complete embedded startup runner.
+func attemptSQLFixtureSchema(t *testing.T, current bool, capture ...func(harmonydb.Config)) (context.Context, *harmonydb.DB, *harmonydb.DB, *pgx.Conn) {
 	t.Helper()
+	if current {
+		ctx, first, second, conn := retrySQLFixture(t, capture...)
+		assertCurrentTaskSchema(t, ctx, conn)
+		return ctx, first, second, conn
+	}
 	if os.Getenv("CURIO_TASK_ATTEMPT_ITEST") != "1" {
 		t.Skip("requires explicit CURIO_TASK_ATTEMPT_ITEST=1 and a disposable loopback target")
 	}
@@ -45,6 +56,10 @@ func attemptSQLFixture(t *testing.T) (context.Context, *harmonydb.DB, *harmonydb
 	first, err := harmonydb.NewFromConfig(cfg)
 	require.NoError(t, err)
 	t.Cleanup(first.ITestDeleteAll)
+	cfg.ReadOnly = true
+	for _, f := range capture {
+		f(cfg)
+	}
 	second, err := harmonydb.NewFromConfig(cfg)
 	require.NoError(t, err)
 	t.Cleanup(second.ITestDeleteAll)
@@ -83,7 +98,7 @@ func applyAttemptMigration(t *testing.T, ctx context.Context, conn *pgx.Conn, na
 }
 
 func TestTaskAttemptSQLMigrationAndIdentity(t *testing.T) {
-	ctx, db, other, conn := attemptSQLFixture(t)
+	ctx, db, other, conn := attemptSQLFixtureSchema(t, false)
 	_, err := db.Exec(ctx, `INSERT INTO harmony_task (id,posted_time,owner_id,added_by,name) VALUES (1,CURRENT_TIMESTAMP-INTERVAL '3 hours',101,101,'Synthetic'),(2,CURRENT_TIMESTAMP,NULL,101,'Synthetic')`)
 	require.NoError(t, err)
 	applyAttemptMigration(t, ctx, conn, "20260909-task-ownership-age.sql")
@@ -96,7 +111,10 @@ func TestTaskAttemptSQLMigrationAndIdentity(t *testing.T) {
 	}
 	read(1)
 	require.False(t, start.Valid || token.Valid || source.Valid, "upgrade must not backfill execution provenance")
-	first := harmonyTaskAttemptStore{db: db, owner: 101}
+	applyAttemptMigration(t, ctx, conn, "20260912-task-acquisition-generation.sql")
+	var generation int64
+	require.NoError(t, db.QueryRow(ctx, RECOVER_TASK_ACQUISITION, 1, 101, 0).Scan(&generation))
+	first := harmonyTaskAttemptStore{db: db, owner: 101, generations: map[TaskID]int64{1: generation}}
 	delayed := harmonyTaskAttemptStore{db: other, owner: 101}
 	ids, tokens := prepareTaskAttempts(ctx, first, []TaskID{1})
 	require.Equal(t, []TaskID{1}, ids)
@@ -115,6 +133,8 @@ func TestTaskAttemptSQLMigrationAndIdentity(t *testing.T) {
 	var triggerCount int
 	require.NoError(t, conn.QueryRow(ctx, `SELECT count(*) FROM pg_trigger WHERE tgrelid='harmony_task'::regclass AND tgname='harmony_task_clear_attempt_start_trigger'`).Scan(&triggerCount))
 	require.Equal(t, 1, triggerCount)
+	require.NoError(t, db.QueryRow(ctx, RECOVER_TASK_ACQUISITION, 1, 101, generation).Scan(&generation))
+	first.generations[1] = generation
 	_, next := prepareTaskAttempts(ctx, first, []TaskID{1})
 	require.NotEqual(t, old, next[1], "same-owner recovery must replace attempt identity")
 	ok, err = delayed.record(ctx, 1, old, entry)
@@ -152,12 +172,10 @@ func TestTaskAttemptSQLMigrationAndIdentity(t *testing.T) {
 }
 
 func TestTaskAttemptSQLDoEntryAndRollback(t *testing.T) {
-	ctx, db, _, conn := attemptSQLFixture(t)
-	applyAttemptMigration(t, ctx, conn, "20260909-task-ownership-age.sql")
-	applyAttemptMigration(t, ctx, conn, "20260909-task-attempt-start.sql")
+	ctx, db, _, _ := attemptSQLFixture(t)
 	_, err := db.Exec(ctx, `INSERT INTO harmony_task (id,posted_time,owner_id,added_by,name) VALUES (1,CURRENT_TIMESTAMP-INTERVAL '3 hours',101,101,'Synthetic')`)
 	require.NoError(t, err)
-	store := harmonyTaskAttemptStore{db: db, owner: 101}
+	store := harmonyTaskAttemptStore{db: db, owner: 101, generations: map[TaskID]int64{1: 0}}
 	_, tokens := prepareTaskAttempts(ctx, store, []TaskID{1})
 	entry := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	var history time.Time
@@ -183,7 +201,7 @@ func TestTaskAttemptSQLDoEntryAndRollback(t *testing.T) {
 	require.True(t, done)
 	require.True(t, history.Equal(entry), "live and new History starts must share the same instant")
 	committed, err := db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (bool, error) {
-		_, err := tx.Exec(PREPARE_TASK_ATTEMPT, "rolled-back", 1, 101)
+		_, err := tx.Exec(PREPARE_TASK_ATTEMPT, "rolled-back", 1, 101, 0)
 		return false, err
 	})
 	require.NoError(t, err)
@@ -191,4 +209,58 @@ func TestTaskAttemptSQLDoEntryAndRollback(t *testing.T) {
 	var stored string
 	require.NoError(t, db.QueryRow(ctx, `SELECT attempt_id FROM harmony_task WHERE id=1`).Scan(&stored))
 	require.Equal(t, tokens[1], stored)
+}
+
+// This covers the production prepared-attempt cleanup statement and parameter
+// pairing. It is a row-effect/rollback test, not a simultaneous-writer race.
+func TestTaskAttemptSQLPreparedCleanup(t *testing.T) {
+	ctx, db, _, _ := attemptSQLFixture(t)
+	_, err := db.Exec(ctx, `INSERT INTO harmony_task (id,posted_time,owner_id,added_by,name)
+SELECT n,CURRENT_TIMESTAMP,CASE WHEN n=2 THEN 102 ELSE 101 END,101,'Synthetic' FROM generate_series(1,6) n`)
+	require.NoError(t, err)
+	_, err = db.Exec(ctx, `UPDATE harmony_task SET attempt_id='token-'||id,attempt_start_source='prepared'`)
+	require.NoError(t, err)
+	_, err = db.Exec(ctx, `UPDATE harmony_task SET attempt_started_at=CURRENT_TIMESTAMP,attempt_start_source='do_entry' WHERE id=4`)
+	require.NoError(t, err)
+	readOwner := func(id int, expected int) {
+		t.Helper()
+		var owner sql.NullInt64
+		require.NoError(t, db.QueryRow(ctx, `SELECT owner_id FROM harmony_task WHERE id=$1`, id).Scan(&owner))
+		require.Equal(t, expected != 0, owner.Valid)
+		if owner.Valid {
+			require.Equal(t, int64(expected), owner.Int64)
+		}
+	}
+	var changed int
+	err = releasePreparedTaskOwnership([]TaskID{5, 1, 2, 3, 4}, map[TaskID]string{1: "token-1", 2: "token-2", 3: "old-token", 4: "token-4", 5: "token-5"}, 101,
+		func(ctx context.Context, ids []int64, attempts []string, owner int) (int, error) {
+			n, err := db.Exec(ctx, releasePreparedTaskOwnershipSQL, ids, attempts, owner)
+			changed = n
+			return n, err
+		})
+	require.NoError(t, err)
+	require.Equal(t, 2, changed)
+	readOwner(1, 0)
+	readOwner(5, 0)
+	readOwner(2, 102)
+	readOwner(3, 101)
+	readOwner(4, 101)
+	readOwner(6, 101)
+	var token, source string
+	require.NoError(t, db.QueryRow(ctx, `SELECT attempt_id,attempt_start_source FROM harmony_task WHERE id=4`).Scan(&token, &source))
+	require.Equal(t, "token-4", token)
+	require.Equal(t, "do_entry", source)
+	committed, err := db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (bool, error) {
+		n, err := tx.Exec(releasePreparedTaskOwnershipSQL, []int64{6}, []string{"token-6"}, 101)
+		require.Equal(t, 1, n)
+		return false, err
+	})
+	require.NoError(t, err)
+	require.False(t, committed)
+	readOwner(6, 101)
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	_, err = db.Exec(cancelled, releasePreparedTaskOwnershipSQL, []int64{6}, []string{"token-6"}, 101)
+	require.Error(t, err)
+	readOwner(6, 101)
 }

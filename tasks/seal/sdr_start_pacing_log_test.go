@@ -132,6 +132,7 @@ func TestSDRPacingProductionLogPath(t *testing.T) {
 	if err := start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	awaitSDREntryLog(t, s.startPacer)
 	if _, _, ok := s.ReserveTaskStart(43); ok {
 		t.Fatal("interval not enforced")
 	}
@@ -175,6 +176,7 @@ func TestSDRPacingBlockedDiagnostics(t *testing.T) {
 					if err := start(context.Background()); err != nil {
 						t.Fatal(err)
 					}
+					awaitSDREntryLog(t, p)
 				}
 			}
 			events = nil
@@ -263,6 +265,7 @@ func TestSDRPacingLogsOnlyCommittedDoEntry(t *testing.T) {
 	if err := start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	awaitSDREntryLog(t, p)
 	cancel() // Execution failure does not undo entry or its diagnostic.
 	if err := start(context.Background()); err == nil {
 		t.Fatal("double start accepted")
@@ -366,6 +369,7 @@ func TestSDRPacingSlowLoggerDoesNotHoldAdmission(t *testing.T) {
 				case <-time.After(2 * time.Second):
 					t.Error("logging participant did not exit")
 				}
+				awaitSDREntryLog(t, p)
 			})
 			select {
 			case <-entered:

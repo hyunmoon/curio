@@ -104,6 +104,14 @@ func (p *sdrStartPacer) start(ctx context.Context, token uint64, taskID harmonyt
 	return err
 }
 
+func (p *sdrStartPacer) startAdmission(ctx context.Context, token uint64, taskID harmonytask.TaskID) error {
+	snapshot, err := p.startSnapshot(ctx, token)
+	if err == nil {
+		p.observer.entry(sdrPacingEvent{kind: sdrPacingStarted, snapshot: snapshot, token: token, taskID: taskID})
+	}
+	return err
+}
+
 func (p *sdrStartPacer) startSnapshot(ctx context.Context, token uint64) (sdrPacingSnapshot, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -167,7 +175,7 @@ func (s *SDRTask) ReserveTaskStart(taskID harmonytask.TaskID) (func(context.Cont
 	if !ok {
 		return nil, nil, false
 	}
-	return func(ctx context.Context) error { return s.startPacer.start(ctx, token, taskID) }, func() { s.startPacer.cancel(token) }, true
+	return func(ctx context.Context) error { return s.startPacer.startAdmission(ctx, token, taskID) }, func() { s.startPacer.cancel(token) }, true
 }
 
 // TaskStartBlocked avoids synchronous readiness queries during a known pacing

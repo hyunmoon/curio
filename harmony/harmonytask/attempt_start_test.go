@@ -29,7 +29,7 @@ type memoryAttemptStore struct {
 }
 
 func newMemoryAttemptStore() *memoryAttemptStore {
-	return &memoryAttemptStore{tokens: map[TaskID]string{}, starts: map[TaskID]time.Time{}, recordCalled: make(chan struct{}, 1), writerExited: make(chan struct{}, 1)}
+	return &memoryAttemptStore{tokens: map[TaskID]string{}, starts: map[TaskID]time.Time{}, recordCalled: make(chan struct{}, 1024), writerExited: make(chan struct{}, 1024)}
 }
 func (s *memoryAttemptStore) prepare(ctx context.Context, id TaskID, token string) error {
 	s.mu.Lock()
@@ -122,7 +122,8 @@ func TestAttemptPreparationFailureDoesNotDispatchFromScheduler(t *testing.T) {
 			accepted := h.considerWorkWithOwnership(source, []task{{ID: 1}}, eventEmitter{},
 				func(ids []TaskID, _ int) ([]TaskID, error) { return ids, nil },
 				func([]TaskID, map[TaskID]string) error { t.Fatal("unexpected storage ownership release"); return nil }, store)
-			if accepted || h.Max.Active() != 0 || len(store.released) != 1 || len(store.starts) != 0 {
+			settleAdmissions(t, h)
+			if !accepted || h.Max.Active() != 0 || len(store.released) != 1 || len(store.starts) != 0 {
 				t.Fatalf("accepted=%v active=%d released=%v starts=%v", accepted, h.Max.Active(), store.released, store.starts)
 			}
 		})
@@ -247,8 +248,12 @@ func TestAttemptProductionCallSiteAndSQLGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := string(data)
-	prepare, storage, entry := strings.Index(source, "prepareTaskAttempts("), strings.Index(source, "h.Cost.Claim("), strings.Index(source, "runWithAttemptStart(")
-	if prepare < 0 || prepare >= storage || storage >= entry || !strings.Contains(source, "workStart = start") {
+	admission, err := os.ReadFile("admission.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(source, "h.beginAdmission(") || !strings.Contains(source, "runWithAttemptStart(") || !strings.Contains(source, "workStart = start") ||
+		!strings.Contains(string(admission), "a.store.prepare(") || !strings.Contains(string(admission), "h.Cost.Claim(") || !strings.Contains(string(admission), "h.dispatchAdmission(a)") {
 		t.Fatal("production does not use the checked attempt boundary")
 	}
 	for _, s := range []string{"owner_id=$3", "attempt_id=$4", "attempt_started_at IS NULL", "attempt_start_source='prepared'"} {
