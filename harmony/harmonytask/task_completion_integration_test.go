@@ -88,8 +88,11 @@ func TestCompletionSQLSameOwnerRecoveryAndMissing(t *testing.T) {
 func TestCompletionSQLHistoryRollbackRetry(t *testing.T) {
 	ctx, db, _, conn := attemptSQLFixture(t)
 	_, err := conn.Exec(ctx, `CREATE SEQUENCE completion_fixture_attempt;
- CREATE FUNCTION fail_first_completion() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
- IF nextval('completion_fixture_attempt')=1 THEN RAISE EXCEPTION 'fixture retry' USING ERRCODE='40001'; END IF;
+ CREATE TABLE completion_fixture_observed (sequence_value bigint NOT NULL);
+ CREATE FUNCTION fail_first_completion() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE value bigint; BEGIN
+ value := nextval('completion_fixture_attempt');
+ IF value=1 THEN RAISE EXCEPTION 'fixture retry' USING ERRCODE='40001'; END IF;
+ INSERT INTO completion_fixture_observed VALUES(value);
  RETURN NEW; END $$;
  CREATE TRIGGER completion_fixture BEFORE INSERT ON harmony_task_history FOR EACH ROW EXECUTE FUNCTION fail_first_completion();`)
 	require.NoError(t, err)
@@ -102,22 +105,24 @@ func TestCompletionSQLHistoryRollbackRetry(t *testing.T) {
 	require.True(t, result.applied)
 	require.NotNil(t, result.retry)
 	require.Equal(t, 2, result.retry.Retries, "rolled-back attempt must not consume two failures")
-	var retries, history, attempts int
+	var retries, history, observed, sequenceValue int
 	require.NoError(t, db.QueryRow(ctx, `SELECT retries FROM harmony_task WHERE id=1`).Scan(&retries))
 	require.NoError(t, db.QueryRow(ctx, `SELECT count(*) FROM harmony_task_history WHERE task_id=1`).Scan(&history))
-	require.NoError(t, db.QueryRow(ctx, `SELECT last_value FROM completion_fixture_attempt`).Scan(&attempts))
+	require.NoError(t, db.QueryRow(ctx, `SELECT count(*),min(sequence_value) FROM completion_fixture_observed`).Scan(&observed, &sequenceValue))
 	require.Equal(t, 2, retries)
 	require.Equal(t, 1, history)
-	require.Equal(t, 2, attempts)
+	require.Equal(t, 1, observed, "exactly one history-trigger attempt committed")
+	require.GreaterOrEqual(t, sequenceValue, 2, "the fresh sequence's first value raises before history can commit")
+	// Yugabyte reserves sequence values in blocks; last_value is not an
+	// invocation/retry counter, and reconnects can leave gaps in issued values.
+	t.Logf("first history insert raises 40001; committed trigger sequence value=%d; committed history=%d; failure budget=%d; exact retry count=NOT_MEASURED", sequenceValue, history, retries)
 }
 
 func TestCompletionSQLWaitsForAcquisitionChange(t *testing.T) {
 	ctx, db, observer, conn := attemptSQLFixture(t)
 	var version string
 	require.NoError(t, conn.QueryRow(ctx, `SELECT version()`).Scan(&version))
-	if strings.Contains(strings.ToLower(version), "yugabyte") {
-		t.Skip("PostgreSQL linked blocker observer; no claim of equivalent Yugabyte observation")
-	}
+	yugabyte := strings.Contains(strings.ToLower(version), "yugabyte") || strings.Contains(version, "-YB-")
 	_, err := db.Exec(ctx, `INSERT INTO harmony_task(id,name,posted_time,added_by,owner_id,retries)
  VALUES(1,'TreeRC',CURRENT_TIMESTAMP,101,101,2)`)
 	require.NoError(t, err)
@@ -142,6 +147,13 @@ func TestCompletionSQLWaitsForAcquisitionChange(t *testing.T) {
 	}()
 	_, err = locker.Exec(ctx, `SELECT id FROM harmony_task WHERE id=1 FOR UPDATE`)
 	require.NoError(t, err)
+	var blocker string
+	if yugabyte {
+		require.NoError(t, locker.QueryRow(ctx, "SELECT yb_get_current_transaction()::text").Scan(&blocker))
+		require.NotEmpty(t, blocker)
+		_, err = locker.Exec(ctx, "SET LOCAL yb_locks_min_txn_age = 0")
+		require.NoError(t, err)
+	}
 	started = true
 	go func() {
 		defer close(joined)
@@ -149,12 +161,20 @@ func TestCompletionSQLWaitsForAcquisitionChange(t *testing.T) {
 	}()
 	require.Eventually(t, func() bool {
 		var linked bool
+		if yugabyte {
+			// The held connection is also the observer, so SET LOCAL applies to
+			// the exact lock inspection. The completion uses a separate pool.
+			err := locker.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_locks
+ WHERE NOT granted AND relation='harmony_task'::regclass
+ AND (ybdetails->'blocked_by') ? $1)`, blocker).Scan(&linked)
+			return err == nil && linked
+		}
 		err := observer.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
  WHERE $1=ANY(pg_blocking_pids(pid)) AND wait_event_type='Lock'
  AND query LIKE 'SELECT posted_time, update_time, retries FROM harmony_task%')`, conn.PgConn().PID()).Scan(&linked)
 		return err == nil && linked
 	}, time.Second, 5*time.Millisecond, "contention not established")
-	t.Log("observed completion waiting on this fixture's exact acquisition row-lock holder")
+	t.Logf("observed completion waiting on exact acquisition holder; Yugabyte=%v blocker=%s", yugabyte, blocker)
 	_, err = locker.Exec(ctx, `UPDATE harmony_task SET owner_id=102 WHERE id=1`)
 	require.NoError(t, err)
 	require.NoError(t, locker.Commit(ctx))

@@ -25,12 +25,16 @@ import (
 // for uninterruptible native work; no proof computation, chain or storage API
 // is invoked. Actual claim, attempt entry and completion SQL are executed.
 func TestCompletionSQLLateCompletion(t *testing.T) {
-	if os.Getenv("CURIO_CLEANUP_BOUNDARY_ITEST") != "1" {
+	if os.Getenv("CURIO_COMPLETION_TRIAL_ITEST") == "1" {
+		require.Equal(t, "1", os.Getenv("CURIO_DISPOSABLE_CURIO_SCHEMA"))
+		require.Equal(t, "curio_test_cas_tasks", os.Getenv("CURIO_TASK_ATTEMPT_ITEST_DATABASE"))
+	} else if os.Getenv("CURIO_CLEANUP_BOUNDARY_ITEST") != "1" {
 		t.Skip("requires CURIO_CLEANUP_BOUNDARY_ITEST=1 as well as the explicit task fixture target")
+	} else {
+		require.Equal(t, "curio_cleanup_disposable", os.Getenv("CURIO_TASK_ATTEMPT_ITEST_DATABASE"))
+		require.Equal(t, "curio_cleanup_fixture", os.Getenv("CURIO_TASK_ATTEMPT_ITEST_USER"))
 	}
 	require.Equal(t, "127.0.0.1", os.Getenv("CURIO_TASK_ATTEMPT_ITEST_HOST"))
-	require.Equal(t, "curio_cleanup_disposable", os.Getenv("CURIO_TASK_ATTEMPT_ITEST_DATABASE"))
-	require.Equal(t, "curio_cleanup_fixture", os.Getenv("CURIO_TASK_ATTEMPT_ITEST_USER"))
 	ctx, db, other, _ := attemptSQLFixture(t)
 	for stageIndex, stage := range []string{tasknames.SDR, tasknames.TreeRC} {
 		t.Run(stage, func(t *testing.T) {

@@ -25,6 +25,12 @@ func retrySQLFixture(t *testing.T, capture ...func(harmonydb.Config)) (context.C
 		t.Skip("requires explicit CURIO_TASK_ATTEMPT_ITEST=1 and a disposable loopback target")
 	}
 	const prefix = "CURIO_TASK_ATTEMPT_ITEST_"
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		for _, ambient := range []string{"PG", "HARMONYQUERY_", "CURIO_HARMONYDB_", "CURIO_DB_"} {
+			require.False(t, strings.HasPrefix(key, ambient), "clear inherited variable %s", key)
+		}
+	}
 	host, port := os.Getenv(prefix+"HOST"), os.Getenv(prefix+"PORT")
 	address := net.ParseIP(host)
 	require.True(t, address != nil && address.IsLoopback(), "HOST must be a literal loopback IP")
@@ -37,18 +43,58 @@ func retrySQLFixture(t *testing.T, capture ...func(harmonydb.Config)) (context.C
 	opts := harmonydb.ItestOptions{Hosts: []string{host}, Port: port, Database: database,
 		Username: user, Password: os.Getenv(prefix + "PASSWORD"), ITestID: harmonydb.ITestNewID()}
 	cfg := opts.HarmonyConfig()
+	if os.Getenv("CURIO_DISPOSABLE_CURIO_SCHEMA") == "1" {
+		require.Equal(t, "127.0.0.1", host)
+		require.True(t, strings.HasPrefix(database, "curio_test_"))
+		cfg.ITestID, cfg.Schema = "", "curio"
+		check, err := pgx.ParseConfig("postgresql://placeholder@127.0.0.1/placeholder?sslmode=disable&load_balance=false")
+		require.NoError(t, err)
+		check.Host, check.Port, check.Database, check.User, check.Password = host, uint16(n), database, user, opts.Password
+		check.Fallbacks, check.ConnectTimeout = nil, 5*time.Second
+		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		admin, err := pgx.ConnectConfig(c, check)
+		require.NoError(t, err)
+		var exists bool
+		err = admin.QueryRow(c, "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname='curio')").Scan(&exists)
+		require.NoError(t, err)
+		if exists {
+			require.NoError(t, admin.Close(c))
+		}
+		require.False(t, exists, "curio must be absent: never adopt an existing schema")
+		// Own cleanup before startup, including an error in a later pool open.
+		t.Cleanup(func() {
+			cleanup, stop := context.WithTimeout(context.Background(), 60*time.Second)
+			defer stop()
+			defer func() {
+				closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer closeCancel()
+				require.NoError(t, admin.Close(closeCtx))
+			}()
+			_, err := admin.Exec(cleanup, "SET statement_timeout='55s'")
+			require.NoError(t, err)
+			_, err = admin.Exec(cleanup, "SET client_min_messages='warning'")
+			require.NoError(t, err)
+			_, err = admin.Exec(cleanup, "DROP SCHEMA IF EXISTS curio CASCADE")
+			require.NoError(t, err)
+		})
+	}
 	cfg.ReadOnly, cfg.LoadBalance = false, false
 	cfg.ApplicationName = "curio-attempt-itest"
 	first, err := harmonydb.NewFromConfig(cfg)
 	require.NoError(t, err)
-	t.Cleanup(first.ITestDeleteAll)
+	if cfg.Schema != "curio" {
+		t.Cleanup(first.ITestDeleteAll)
+	}
 	cfg.ReadOnly = true
 	for _, f := range capture {
 		f(cfg)
 	}
 	second, err := harmonydb.NewFromConfig(cfg)
 	require.NoError(t, err)
-	t.Cleanup(second.ITestDeleteAll)
+	if cfg.Schema != "curio" {
+		t.Cleanup(second.ITestDeleteAll)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 	pcfg, err := pgx.ParseConfig("postgresql://placeholder@127.0.0.1/placeholder?sslmode=disable&load_balance=false")
@@ -56,6 +102,9 @@ func retrySQLFixture(t *testing.T, capture ...func(harmonydb.Config)) (context.C
 	pcfg.Host, pcfg.Port, pcfg.Database, pcfg.User, pcfg.Password = host, uint16(n), database, user, opts.Password
 	pcfg.Fallbacks, pcfg.ConnectTimeout = nil, 5*time.Second
 	pcfg.RuntimeParams = map[string]string{"search_path": "itest_" + string(opts.ITestID), "statement_timeout": "5000", "lock_timeout": "2000"}
+	if cfg.Schema == "curio" {
+		pcfg.RuntimeParams["search_path"] = "curio"
+	}
 	conn, err := pgx.ConnectConfig(ctx, pcfg)
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -63,6 +112,30 @@ func retrySQLFixture(t *testing.T, capture ...func(harmonydb.Config)) (context.C
 		defer stop()
 		require.NoError(t, conn.Close(closeCtx))
 	})
+	for label, query := range map[string]func() (string, string, string, error){
+		"first pool": func() (string, string, string, error) {
+			var s, p, a string
+			e := first.QueryRow(ctx, "SELECT current_schema(),current_setting('search_path'),host(inet_server_addr())").Scan(&s, &p, &a)
+			return s, p, a, e
+		},
+		"second pool": func() (string, string, string, error) {
+			var s, p, a string
+			e := second.QueryRow(ctx, "SELECT current_schema(),current_setting('search_path'),host(inet_server_addr())").Scan(&s, &p, &a)
+			return s, p, a, e
+		},
+		"direct connection": func() (string, string, string, error) {
+			var s, p, a string
+			e := conn.QueryRow(ctx, "SELECT current_schema(),current_setting('search_path'),host(inet_server_addr())").Scan(&s, &p, &a)
+			return s, p, a, e
+		},
+	} {
+		s, p, a, err := query()
+		require.NoError(t, err)
+		require.Equal(t, pcfg.RuntimeParams["search_path"], s)
+		require.Equal(t, s, strings.Trim(p, "\""))
+		require.Equal(t, host, a)
+		t.Logf("%s: schema=%s search_path=%s ITestID=%q", label, s, p, cfg.ITestID)
+	}
 	for _, column := range []struct{ table, name, kind string }{
 		{"harmony_task", "update_time", "timestamp with time zone"},
 		{"harmony_task", "posted_time", "timestamp with time zone"},
@@ -81,6 +154,12 @@ func retrySQLFixture(t *testing.T, capture ...func(harmonydb.Config)) (context.C
 	var version, isolation string
 	require.NoError(t, conn.QueryRow(ctx, `SELECT version()`).Scan(&version))
 	require.NoError(t, conn.QueryRow(ctx, `SHOW transaction_isolation`).Scan(&isolation))
-	t.Logf("database=%s requested isolation=driver default; SQL transaction_isolation=%s; Yugabyte effective isolation=UNVERIFIED", version, isolation)
+	if strings.Contains(version, "-YB-") || strings.Contains(strings.ToLower(version), "yugabyte") {
+		var effective string
+		require.NoError(t, conn.QueryRow(ctx, `SELECT yb_get_effective_transaction_isolation_level()`).Scan(&effective))
+		require.Equal(t, "read committed", effective)
+		t.Logf("Yugabyte effective isolation=%s; process flags are independently archived", effective)
+	}
+	t.Logf("database=%s requested isolation=driver default; SQL transaction_isolation=%s", version, isolation)
 	return ctx, first, second, conn
 }
