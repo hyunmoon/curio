@@ -241,7 +241,13 @@ func TestPoRepSummarySQLLargeLinkedSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	require.Less(t, len(wire), 4096, "response scales with miners, not joined tasks")
 	t.Logf("one summary statement; linked pending=32108 running=44 preparing=44 owners=44 miners=2; returned=%d bytes=%d wall=%s; retries=NOT_MEASURED", len(rows), len(wire), elapsed)
-	plan, err := conn.Query(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) "+porepSummaryQuery, 0)
+	var version string
+	require.NoError(t, conn.QueryRow(ctx, "SELECT version()").Scan(&version))
+	explain := "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) "
+	if strings.Contains(version, "-YB-") || strings.Contains(strings.ToLower(version), "yugabyte") {
+		explain = "EXPLAIN (ANALYZE, DIST, FORMAT TEXT) "
+	}
+	plan, err := conn.Query(ctx, explain+porepSummaryQuery, 0)
 	require.NoError(t, err)
 	defer plan.Close()
 	for plan.Next() {
