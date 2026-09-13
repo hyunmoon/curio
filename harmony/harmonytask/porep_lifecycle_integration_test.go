@@ -35,9 +35,10 @@ func TestPoRepLifecycleSQLTerminalFailureRetainsEvidence(t *testing.T) {
  VALUES(1000,1,0,1,TRUE,TRUE,1)`)
 	require.NoError(t, err)
 	h := &taskTypeHandler{TaskTypeDetails: TaskTypeDetails{Name: "PoRep", Max: taskhelp.Max(2), MaxFailures: 10},
-		TaskEngine: &TaskEngine{cfg: taskEngineConfig{db: db, hostAndPort: "worker-a.example"}}}
+		TaskEngine: &TaskEngine{cfg: taskEngineConfig{db: db, ownerID: 101, hostAndPort: "worker-a.example"}}}
 	for attempt := 1; attempt <= 10; attempt++ {
-		h.recordCompletion(1, &abi.SectorID{Miner: 1000, Number: 1}, time.Now(), false, errors.New("synthetic proof failure"), false)
+		identity := prepareRetryFixtureAttempt(t, ctx, db, 101, 1, "fixture-attempt")
+		h.recordCompletion(1, &abi.SectorID{Miner: 1000, Number: 1}, time.Now(), false, errors.New("synthetic proof failure"), false, identity)
 		var rows int
 		require.NoError(t, db.QueryRow(ctx, `SELECT count(*) FROM harmony_task WHERE id=1`).Scan(&rows))
 		if attempt < 10 {

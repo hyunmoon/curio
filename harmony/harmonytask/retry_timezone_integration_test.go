@@ -96,7 +96,8 @@ func TestRetrySQLTimeZoneMatrix(t *testing.T) {
 			ids, err = hs[0].claimTaskOwnership([]TaskID{1}, 1, map[TaskID]int64{}, row)
 			require.NoError(t, err)
 			require.Empty(t, ids, "second owner must not overwrite the winner")
-			retry := hs[1].recordCompletion(1, nil, time.Now(), false, errors.New("synthetic sector failure"), false)
+			ordinaryID := prepareRetryFixtureAttempt(t, ctx, claimant, 102, 1, "ordinary-token")
+			retry := hs[1].recordCompletion(1, nil, time.Now(), false, errors.New("synthetic sector failure"), false, ordinaryID).retry
 			require.NotNil(t, retry)
 			actual := poll(hs[0])
 			require.True(t, retry.UpdateTime.Equal(actual.UpdateTime), "completion RETURNING shifted the instant")
@@ -113,16 +114,16 @@ func TestRetrySQLTimeZoneMatrix(t *testing.T) {
 			ids, err = hs[0].claimTaskOwnership([]TaskID{1}, 1, map[TaskID]int64{}, row)
 			require.NoError(t, err)
 			require.Equal(t, []TaskID{1}, ids)
-			prepareRetryFixtureAttempt(t, ctx, writer, 101, 1, "preempt-token")
-			retry = hs[0].recordCompletion(1, nil, time.Now(), false, context.Canceled, true, "preempt-token")
+			preemptID := prepareRetryFixtureAttempt(t, ctx, writer, 101, 1, "preempt-token")
+			retry = hs[0].recordCompletion(1, nil, time.Now(), false, context.Canceled, true, preemptID).retry
 			require.NotNil(t, retry)
 			require.True(t, retry.UpdateTime.Equal(row.UpdateTime), "preemption must retain the already-satisfied instant")
 			ids, err = hs[1].claimTaskOwnership([]TaskID{1}, 1, map[TaskID]int64{}, *retry)
 			require.NoError(t, err)
 			require.Equal(t, []TaskID{1}, ids)
-			prepareRetryFixtureAttempt(t, ctx, claimant, 102, 1, "probe-token")
-			require.Nil(t, hs[0].recordCompletion(1, nil, time.Now(), false, context.Canceled, true, "preempt-token"), "stale preemption cannot release a newer attempt")
-			retry = hs[1].recordCompletion(1, nil, time.Now(), false, &taskhelp.WorkerUnavailable{Cause: errors.New("synthetic local C2 unavailable")}, false, "probe-token")
+			probeID := prepareRetryFixtureAttempt(t, ctx, claimant, 102, 1, "probe-token")
+			require.False(t, hs[0].recordCompletion(1, nil, time.Now(), false, context.Canceled, true, preemptID).applied, "stale preemption cannot release a newer attempt")
+			retry = hs[1].recordCompletion(1, nil, time.Now(), false, &taskhelp.WorkerUnavailable{Cause: errors.New("synthetic local C2 unavailable")}, false, probeID).retry
 			require.NotNil(t, retry)
 			actual = poll(hs[0])
 			require.True(t, retry.UpdateTime.Equal(actual.UpdateTime), "worker deferral RETURNING shifted the instant")
@@ -137,8 +138,8 @@ func TestRetrySQLPositivePreemptionImmediatelyReclaims(t *testing.T) {
  VALUES(1,'PoRep',101,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP-INTERVAL '2 hours',1,101)`)
 	require.NoError(t, err)
 	h := &taskTypeHandler{TaskEngine: &TaskEngine{cfg: taskEngineConfig{ctx: ctx, db: db, ownerID: 101}}, TaskTypeDetails: TaskTypeDetails{Name: "PoRep", Max: taskhelp.Max(1), RetryWait: func(int) time.Duration { return time.Hour }}}
-	prepareRetryFixtureAttempt(t, ctx, db, 101, 1, "preempted-attempt")
-	retry := h.recordCompletion(1, nil, time.Now(), false, context.Canceled, true, "preempted-attempt")
+	preemptID := prepareRetryFixtureAttempt(t, ctx, db, 101, 1, "preempted-attempt")
+	retry := h.recordCompletion(1, nil, time.Now(), false, context.Canceled, true, preemptID).retry
 	require.NotNil(t, retry)
 	require.Equal(t, 1, retry.Retries, "preemption neither consumes nor resets sector failures")
 	ch := make(chan schedulerEvent, 1)
@@ -158,10 +159,11 @@ func TestRetrySQLPositivePreemptionImmediatelyReclaims(t *testing.T) {
 	require.Equal(t, 1, count)
 }
 
-func prepareRetryFixtureAttempt(t *testing.T, ctx context.Context, db *harmonydb.DB, owner int, id TaskID, token string) {
+func prepareRetryFixtureAttempt(t *testing.T, ctx context.Context, db *harmonydb.DB, owner int, id TaskID, token string) completionIdentity {
 	t.Helper()
 	var generation int64
 	require.NoError(t, db.QueryRow(ctx, `SELECT owner_generation FROM harmony_task WHERE id=$1 AND owner_id=$2`, id, owner).Scan(&generation))
 	store := harmonyTaskAttemptStore{db: db, owner: owner, generations: map[TaskID]int64{id: generation}, token: token}
 	require.NoError(t, store.prepare(ctx, id, token))
+	return completionIdentityFor(store, id, token)
 }
