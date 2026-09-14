@@ -164,7 +164,19 @@ func (p *path) stat(ls LocalStorage, newReserve ...statExistingSectorForReservat
 			if !os.IsNotExist(err) {
 				log.Warnf("getting disk usage of '%s': %+v", p.sectorPath(id, fileType), err)
 			}
-			return 0, nil
+			used = 0
+		}
+
+		// SDR writes into unique children of a per-sector scratch root. Credit
+		// those bytes as materialized reservation, even alongside legacy or
+		// published files; the caller still caps the credit at the reservation.
+		if fileType == storiface.FTCache || fileType == storiface.FTKey {
+			scratch, scratchErr := ls.DiskUsage(storiface.SDRTempRoot(sp))
+			if scratchErr == nil {
+				used += scratch
+			} else if !os.IsNotExist(scratchErr) {
+				log.Warnw("getting SDR scratch disk usage", "path", sp, "error", scratchErr)
+			}
 		}
 
 		log.Debugw("accounting existing files", "id", id, "fileType", fileType, "path", sp, "used", used, "overhead", overhead)

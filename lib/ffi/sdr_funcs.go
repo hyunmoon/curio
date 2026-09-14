@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -153,11 +154,27 @@ func (l *storageProvider) AcquireSector(ctx context.Context, taskID *harmonytask
 }
 
 func (sb *SealCalls) GenerateSDR(ctx context.Context, taskID harmonytask.TaskID, into storiface.SectorFileType, sector storiface.SectorRef, ticket abi.SealRandomness, commDcid cid.Cid) error {
+	return sb.generateSDR(ctx, taskID, into, sector, ticket, commDcid, ffi.GenerateSDR, os.RemoveAll)
+}
+
+// The injected operations keep filesystem/error interleavings testable without
+// running native proofs. Production always uses the synchronous FFI call above.
+func (sb *SealCalls) generateSDR(ctx context.Context, taskID harmonytask.TaskID, into storiface.SectorFileType, sector storiface.SectorRef, ticket abi.SealRandomness, commDcid cid.Cid, generate func(abi.RegisteredSealProof, string, [32]byte) error, removeAll func(string) error) (retErr error) {
+	if into != storiface.FTCache && into != storiface.FTKey {
+		return xerrors.Errorf("unsupported SDR output type: %s", into)
+	}
 	paths, pathIDs, releaseSector, err := sb.Sectors.AcquireSector(ctx, &taskID, sector, storiface.FTNone, into, storiface.PathSealing)
 	if err != nil {
 		return xerrors.Errorf("acquiring sector paths: %w", err)
 	}
-	defer releaseSector()
+	published := false
+	defer func() {
+		if published {
+			releaseSector()
+		} else {
+			releaseSector(into)
+		}
+	}()
 
 	// prepare SDR params
 	commd, err := commcid.CIDToDataCommitmentV1(commDcid)
@@ -171,21 +188,33 @@ func (sb *SealCalls) GenerateSDR(ctx context.Context, taskID harmonytask.TaskID,
 	}
 
 	intoPath := storiface.PathByType(paths, into)
-	intoTemp := intoPath + storiface.TempSuffix
-
-	// make sure the cache dir is empty
-	if err := os.RemoveAll(intoPath); err != nil {
-		return xerrors.Errorf("removing into: %w", err)
+	// Never recycle a sector-wide scratch directory: another process/attempt
+	// may still be writing it. Legacy .tmp paths are deliberately left alone.
+	root := storiface.SDRTempRoot(intoPath)
+	if err := os.MkdirAll(root, 0755); err != nil {
+		return xerrors.Errorf("mkdir SDR scratch root: %w", err)
 	}
-	if err := os.RemoveAll(intoTemp); err != nil {
-		return xerrors.Errorf("removing intoTemp: %w", err)
+	intoTemp, err := os.MkdirTemp(root, "attempt-")
+	if err != nil {
+		return xerrors.Errorf("mkdir SDR attempt: %w", err)
 	}
-	if err := os.MkdirAll(intoTemp, 0755); err != nil {
-		return xerrors.Errorf("mkdir intoTemp dir: %w", err)
+	// Runs only after generate returns, not when its context is cancelled.
+	// Runs before releaseSector, including on publication failure. Do not
+	// remove the shared root: another attempt can be creating its directory.
+	defer func() {
+		if err := removeAll(intoTemp); err != nil {
+			cleanupErr := xerrors.Errorf("cleaning SDR attempt %s: %w", intoTemp, err)
+			log.Errorw("SDR scratch cleanup failed", "sector", sector.ID, "error", cleanupErr, "operationError", retErr)
+			retErr = errors.Join(retErr, cleanupErr)
+		}
+	}()
+	// MkdirTemp starts private; retain the existing published-cache permissions.
+	if err := os.Chmod(intoTemp, 0755); err != nil {
+		return xerrors.Errorf("setting SDR cache permissions: %w", err)
 	}
 
 	// generate new sector key
-	err = ffi.GenerateSDR(
+	err = generate(
 		sector.ProofType,
 		intoTemp,
 		replicaID,
@@ -203,14 +232,15 @@ func (sb *SealCalls) GenerateSDR(ctx context.Context, taskID harmonytask.TaskID,
 		}
 		lastLayer := proofpaths.LayerFileName(numLayers)
 
-		if err := os.Rename(filepath.Join(intoTemp, lastLayer), filepath.Join(intoPath)); err != nil {
+		if err := publishSDR(filepath.Join(intoTemp, lastLayer), intoPath); err != nil {
 			return xerrors.Errorf("renaming last layer: %w", err)
 		}
 	} else {
-		if err := os.Rename(intoTemp, intoPath); err != nil {
+		if err := publishSDR(intoTemp, intoPath); err != nil {
 			return xerrors.Errorf("renaming into: %w", err)
 		}
 	}
+	published = true
 
 	if err := sb.ensureOneCopy(ctx, sector.ID, pathIDs, into); err != nil {
 		return xerrors.Errorf("ensure one copy: %w", err)
