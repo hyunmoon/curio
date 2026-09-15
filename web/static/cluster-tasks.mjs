@@ -20,6 +20,7 @@ import {
   completeClusterTaskRefresh,
   createClusterTaskDisplayClock,
   createClusterTaskViewState,
+  clusterTaskExecutionSection,
   failClusterTaskRefresh,
   freezeClusterTaskDisplayClock,
   formatClusterTaskSectionSummary,
@@ -222,7 +223,7 @@ class ClusterTasks extends LitElement {
 
       th:nth-child(4),
       td:nth-child(4) {
-        width: 9ch;
+        width: 15ch;
       }
 
       th:nth-child(5),
@@ -774,9 +775,7 @@ class ClusterTasks extends LitElement {
 
   renderRow(entry) {
     const hasOwner = entry.OwnerID !== null && entry.OwnerID !== undefined;
-    const state = hasOwner && entry.TookState === 'awaiting-start'
-      ? 'awaiting-start'
-      : entry.State || (hasOwner ? 'running' : 'pending');
+    const state = clusterTaskExecutionSection(entry).replace('awaiting-start', 'Awaiting start');
     const miner = entry.Miners?.length ? entry.Miners.join(', ') : entry.SpID ? entry.Miner : 'n/a';
     const ageValue = clusterTaskAge(entry, this.displayClock);
     const age = ageValue.text ?? formatTaskAgeSeconds(ageValue.seconds);
@@ -786,7 +785,7 @@ class ClusterTasks extends LitElement {
         <td title=${miner}>${miner}</td>
         <td title=${entry.Name}>${entry.Name}</td>
         <td><a href="/pages/task/id/?id=${entry.ID}">${entry.ID}</a></td>
-        <td>${state}</td>
+        <td title=${ageTitle}>${state}</td>
         <td class="age-column" title=${ageTitle}>${age}</td>
         <td title=${entry.Owner || ''}>
           ${hasOwner
@@ -801,7 +800,7 @@ class ClusterTasks extends LitElement {
     return formatClusterTaskSectionSummary(
         section.entries.length,
         section.total,
-        response.TotalsAvailable,
+        section.totalsAvailable,
     );
   }
 
