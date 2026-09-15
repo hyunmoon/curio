@@ -240,7 +240,10 @@ func TestManagedLinuxReviewConnected(t *testing.T) {
 	control := c.StateDir
 	config := filepath.Join(control, "domain.json")
 	names := []string{"curio-sdr-review-a-" + c.Domain + ".service", "curio-sdr-review-b-" + c.Domain + ".service"}
-	unitPath := func(name string) string { return filepath.Join("/etc/systemd/system", name) }
+	// Runtime masks in /run must take precedence over these owned fixture units.
+	const unitDir = "/usr/local/lib/systemd/system"
+	require.NoError(t, os.MkdirAll(unitDir, 0755))
+	unitPath := func(name string) string { return filepath.Join(unitDir, name) }
 	for _, name := range names {
 		_, e := os.Lstat(unitPath(name))
 		require.True(t, os.IsNotExist(e))
@@ -319,6 +322,12 @@ func TestManagedLinuxReviewConnected(t *testing.T) {
 	require.FileExists(t, filepath.Join(ts[0].Root, "cache/s-t03199233-160988/keep"))
 	// Real MaintenanceGuard and exclusive lease, not an injected boolean.
 	reviewCommand(t, "systemctl", "mask", "--runtime", names[0], names[1])
+	for _, name := range names {
+		properties, err := unitProperties(name)
+		require.NoError(t, err)
+		require.Equal(t, "masked-runtime", properties["UnitFileState"], name)
+		require.Equal(t, "inactive", properties["ActiveState"], name)
+	}
 	p := filepath.Join(base, "s-t01000-100.tmp")
 	require.NoError(t, os.Mkdir(p, 0755))
 	require.NoError(t, os.WriteFile(filepath.Join(p, "legacy"), make([]byte, 8192), 0600))
