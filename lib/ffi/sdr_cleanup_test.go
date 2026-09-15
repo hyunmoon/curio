@@ -22,6 +22,7 @@ import (
 	"github.com/filecoin-project/curio/harmony/harmonytask"
 	"github.com/filecoin-project/curio/lib/paths"
 	"github.com/filecoin-project/curio/lib/proofpaths"
+	"github.com/filecoin-project/curio/lib/sdrscratch"
 	"github.com/filecoin-project/curio/lib/storiface"
 )
 
@@ -58,6 +59,7 @@ type sdrCleanupFixture struct {
 	dest      string
 	releases  atomic.Int32
 	onRelease func()
+	recordIO  sdrscratch.RecordIO
 }
 
 func newSDRCleanupFixture(t *testing.T, into storiface.SectorFileType, dest string) *sdrCleanupFixture {
@@ -86,7 +88,7 @@ func (f *sdrCleanupFixture) run(ctx context.Context, generate func(abi.Registere
 			f.releases.Add(1)
 		})
 	}}})
-	return f.sb.generateSDR(ctx, 1, f.into, f.sector, make([]byte, 32), f.commD, generate, cleanup)
+	return f.sb.generateSDR(ctx, 1, f.into, f.sector, make([]byte, 32), f.commD, generate, cleanup, f.recordIO)
 }
 
 func writeSDRTestLayers(p abi.RegisteredSealProof, dir string, _ [32]byte) error {

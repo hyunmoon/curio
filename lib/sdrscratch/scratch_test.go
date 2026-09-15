@@ -165,6 +165,8 @@ func TestStartupReplacementAndPartialFailure(t *testing.T) {
 		require.NoError(t, os.Rename(p, p+"-old"))
 		require.NoError(t, os.Mkdir(p, 0700))
 		require.ErrorContains(t, w.Returned(), "pathname replaced")
+		_, err := w.ReclaimOwn()
+		require.Error(t, err, "identity failure must not grant immediate cleanup authority")
 		require.FileExists(t, filepath.Join(p+"-old", "layer-1"))
 	})
 	t.Run("replacement-during-unlink", func(t *testing.T) {
@@ -201,12 +203,14 @@ func TestStartupReplacementAndPartialFailure(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 1, r[0].FilesRemoved)
 	})
-	t.Run("diagnostic-write-failure", func(t *testing.T) {
+	t.Run("diagnostic-write-without-observed-return", func(t *testing.T) {
 		base, p, w := fixture(t)
 		// Inject ENOSPC at the persistent write boundary; do not fill a host disk.
-		require.ErrorIs(t, w.saveWith("returned", func(int, string, []byte, int) error { return unix.ENOSPC }), unix.ENOSPC)
+		require.ErrorIs(t, w.saveWith("returned", func(int, string, []byte, int) error { return unix.ENOSPC }, w.dir.Sync), unix.ENOSPC)
 		require.Equal(t, "active", w.r.State)
-		_, err := w.Reclaim()
+		_, err := w.ReclaimOwn()
+		require.Error(t, err, "a diagnostic operation alone cannot grant observed-return authority")
+		_, err = w.Reclaim()
 		require.Error(t, err)
 		require.NoError(t, w.Close())
 		require.Error(t, w.Returned())

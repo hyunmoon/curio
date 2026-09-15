@@ -155,12 +155,12 @@ func (l *storageProvider) AcquireSector(ctx context.Context, taskID *harmonytask
 }
 
 func (sb *SealCalls) GenerateSDR(ctx context.Context, taskID harmonytask.TaskID, into storiface.SectorFileType, sector storiface.SectorRef, ticket abi.SealRandomness, commDcid cid.Cid, ticketEpoch ...abi.ChainEpoch) error {
-	return sb.generateSDR(ctx, taskID, into, sector, ticket, commDcid, ffi.GenerateSDR, nil, ticketEpoch...)
+	return sb.generateSDR(ctx, taskID, into, sector, ticket, commDcid, ffi.GenerateSDR, nil, nil, ticketEpoch...)
 }
 
 // The injected operations keep filesystem/error interleavings testable without
 // running native proofs. Production always uses the synchronous FFI call above.
-func (sb *SealCalls) generateSDR(ctx context.Context, taskID harmonytask.TaskID, into storiface.SectorFileType, sector storiface.SectorRef, ticket abi.SealRandomness, commDcid cid.Cid, generate func(abi.RegisteredSealProof, string, [32]byte) error, beforeCleanup func(string) error, ticketEpoch ...abi.ChainEpoch) (retErr error) {
+func (sb *SealCalls) generateSDR(ctx context.Context, taskID harmonytask.TaskID, into storiface.SectorFileType, sector storiface.SectorRef, ticket abi.SealRandomness, commDcid cid.Cid, generate func(abi.RegisteredSealProof, string, [32]byte) error, beforeCleanup func(string) error, recordIO sdrscratch.RecordIO, ticketEpoch ...abi.ChainEpoch) (retErr error) {
 	if into != storiface.FTCache && into != storiface.FTKey {
 		return xerrors.Errorf("unsupported SDR output type: %s", into)
 	}
@@ -228,7 +228,7 @@ func (sb *SealCalls) generateSDR(ctx context.Context, taskID harmonytask.TaskID,
 		return xerrors.Errorf("mkdir SDR scratch root: %w", err)
 	}
 	intoTemp := reservation.Scratch
-	writer, err := sdrscratch.Begin(intoTemp)
+	writer, err := sdrscratch.BeginWithRecordIO(intoTemp, recordIO)
 	if err != nil {
 		return xerrors.Errorf("begin SDR scratch ownership: %w", err)
 	}
@@ -244,17 +244,26 @@ func (sb *SealCalls) generateSDR(ctx context.Context, taskID harmonytask.TaskID,
 		if !canCleanup {
 			return
 		}
-		err := writer.Returned()
-		if err == nil && beforeCleanup != nil {
-			err = beforeCleanup(intoTemp)
+		recordErr := writer.Returned()
+		var cleanupErr error
+		var removed int
+		if beforeCleanup != nil {
+			cleanupErr = beforeCleanup(intoTemp)
 		}
-		if err == nil {
-			_, err = writer.Reclaim()
+		if cleanupErr == nil {
+			// The current writer directly observed return and still owns its FD
+			// and lock. A failed diagnostic write must not prevent own cleanup.
+			removed, cleanupErr = writer.ReclaimOwn()
 		}
-		if err != nil {
-			cleanupErr := xerrors.Errorf("cleaning SDR attempt %s: %w", intoTemp, err)
-			log.Errorw("SDR scratch cleanup failed", "sector", sector.ID, "error", cleanupErr, "operationError", retErr)
-			retErr = errors.Join(retErr, cleanupErr)
+		if recordErr != nil || cleanupErr != nil {
+			log.Errorw("SDR scratch return/cleanup result", "sector", sector.ID, "scratch", intoTemp,
+				"recordError", recordErr, "cleanupError", cleanupErr, "filesRemoved", removed, "operationError", retErr)
+		}
+		if recordErr != nil {
+			retErr = errors.Join(retErr, xerrors.Errorf("recording SDR attempt return %s: %w", intoTemp, recordErr))
+		}
+		if cleanupErr != nil {
+			retErr = errors.Join(retErr, xerrors.Errorf("cleaning SDR attempt %s (%d files removed): %w", intoTemp, removed, cleanupErr))
 		}
 	}()
 	// Begin durably probes/records the incomplete marker before native entry.

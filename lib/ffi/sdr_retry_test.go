@@ -66,7 +66,7 @@ func TestSDRPublishedInputMismatch(t *testing.T) {
 					require.NoError(t, os.Truncate(p, 0))
 				}
 				calls := 0
-				err := f.sb.generateSDR(context.Background(), 1, ft, sector, ticket, d, func(abi.RegisteredSealProof, string, [32]byte) error { calls++; return nil }, nil)
+				err := f.sb.generateSDR(context.Background(), 1, ft, sector, ticket, d, func(abi.RegisteredSealProof, string, [32]byte) error { calls++; return nil }, nil, nil)
 				require.Error(t, err)
 				require.Zero(t, calls)
 			})

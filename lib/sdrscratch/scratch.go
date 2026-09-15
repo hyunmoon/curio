@@ -1,6 +1,6 @@
-// Package sdrscratch reclaims only scratch whose synchronous writer durably
-// recorded that it no longer uses the directory. A free lock is NOT evidence
-// that an interrupted native call (or a child process) has ended.
+// Package sdrscratch separates a current writer's observed synchronous return
+// from the durable return certificate required by a later scanner. A free lock
+// is NOT evidence that an interrupted native call (or a child process) has ended.
 package sdrscratch
 
 import (
@@ -44,6 +44,17 @@ type Writer struct {
 	dir  *os.File
 	r    record
 	path string
+	// Process-local authority, never reconstructed from a free lock or metadata.
+	returnedHere bool
+	recordIO     RecordIO
+}
+
+// RecordIO is the narrow persistence boundary for writer diagnostics. Nil uses
+// real xattr writes and directory Sync. It does not control reclamation checks
+// or file removal. Callers must not use it to manufacture return certificates.
+type RecordIO interface {
+	SetXattr(int, string, []byte, int) error
+	Sync(*os.File) error
 }
 
 func openDirAt(parent int, name string) (*os.File, error) {
@@ -98,10 +109,13 @@ func get(f *os.File, key string) ([]byte, error) {
 }
 
 func (w *Writer) save(state string) error {
-	return w.saveWith(state, unix.Fsetxattr)
+	if w.recordIO != nil {
+		return w.saveWith(state, w.recordIO.SetXattr, func() error { return w.recordIO.Sync(w.dir) })
+	}
+	return w.saveWith(state, unix.Fsetxattr, w.dir.Sync)
 }
 
-func (w *Writer) saveWith(state string, set func(int, string, []byte, int) error) error {
+func (w *Writer) saveWith(state string, set func(int, string, []byte, int) error, sync func() error) error {
 	r := w.r
 	r.State = state
 	b, err := json.Marshal(r)
@@ -111,7 +125,7 @@ func (w *Writer) saveWith(state string, set func(int, string, []byte, int) error
 	if err := set(int(w.dir.Fd()), attribute, b, 0); err != nil {
 		return err
 	}
-	if err := w.dir.Sync(); err != nil {
+	if err := sync(); err != nil {
 		return err
 	}
 	w.r = r
@@ -131,6 +145,12 @@ func validName(name string) bool {
 // same cache/key directory. Contention returns an error, never a sleeping
 // scheduler or a lock held throughout native execution.
 func Begin(path string) (*Writer, error) {
+	return BeginWithRecordIO(path, nil)
+}
+
+// BeginWithRecordIO has the same ownership contract as Begin, with per-writer
+// persistence operations for deterministic I/O failure testing.
+func BeginWithRecordIO(path string, recordIO RecordIO) (*Writer, error) {
 	if !validName(filepath.Base(path)) || !strings.HasSuffix(filepath.Dir(path), ".sdr.tmp") {
 		return nil, fmt.Errorf("invalid SDR scratch name")
 	}
@@ -169,7 +189,7 @@ func Begin(path string) (*Writer, error) {
 	if err != nil {
 		return nil, err
 	}
-	w := &Writer{dir: dir, path: path, r: record{Version: 1, Name: name, Root: rootName, State: "active"}}
+	w := &Writer{dir: dir, path: path, recordIO: recordIO, r: record{Version: 1, Name: name, Root: rootName, State: "active"}}
 	if err = lock(dir); err == nil {
 		w.r.Device, w.r.Inode, err = identity(dir)
 	}
@@ -219,11 +239,16 @@ func sameDevice(a, b *os.File) error {
 	return sameMount(a, b)
 }
 
-func (w *Writer) Close() error { return w.dir.Close() }
+func (w *Writer) Close() error {
+	w.returnedHere = false
+	return w.dir.Close()
+}
 
 // Returned must be called only after a synchronous native ERROR return (or a
 // failure before entering native), or after a key was successfully published.
 // Never call it merely because context/ownership/heartbeat was lost.
+// A persistence error does not erase this writer's directly observed return.
+// Its lock and pinned FD must remain continuously held until cleanup finishes.
 func (w *Writer) Returned() error {
 	current, err := openDir(w.path)
 	if err != nil {
@@ -237,7 +262,25 @@ func (w *Writer) Returned() error {
 	if dev != w.r.Device || ino != w.r.Inode {
 		return fmt.Errorf("writer pathname replaced; preserve scratch")
 	}
+	dev, ino, err = identity(w.dir)
+	if err != nil {
+		return err
+	}
+	if dev != w.r.Device || ino != w.r.Inode {
+		return fmt.Errorf("writer descriptor identity changed; preserve scratch")
+	}
+	w.returnedHere = true
 	return w.save("returned")
+}
+
+// ReclaimOwn uses only this writer's observed return, while its original pinned
+// directory FD and lock remain held. It can run even when the return certificate
+// could not be persisted. Scanners never acquire this process-local authority.
+func (w *Writer) ReclaimOwn() (int, error) {
+	if !w.returnedHere {
+		return 0, fmt.Errorf("no return observed by this writer")
+	}
+	return w.reclaimFiles(unix.Unlinkat)
 }
 
 // Reclaim never traverses directories, symlinks or mount points, and never
@@ -250,6 +293,10 @@ func (w *Writer) reclaim(unlink func(int, string, int) error) (int, error) {
 	if w.r.State != "returned" {
 		return 0, fmt.Errorf("no synchronous return certificate")
 	}
+	return w.reclaimFiles(unlink)
+}
+
+func (w *Writer) reclaimFiles(unlink func(int, string, int) error) (int, error) {
 	b, err := get(w.dir, completionAttribute)
 	if err != nil {
 		return 0, fmt.Errorf("unknown completion marker: %w", err)
