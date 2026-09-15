@@ -353,9 +353,6 @@ func (st *Local) OpenPath(ctx context.Context, p string) error {
 // openPath opens a storage path. If declare is true, it will also declare sectors.
 // Returns the storage ID and canStore flag for use with declareSectors if declare is false.
 func (st *Local) openPath(ctx context.Context, p string, declare bool) (storiface.ID, bool, error) {
-	st.localLk.Lock()
-	defer st.localLk.Unlock()
-
 	mb, err := os.ReadFile(filepath.Join(p, MetaFile))
 	if err != nil {
 		return "", false, xerrors.Errorf("reading storage metadata for %s: %w", p, err)
@@ -365,6 +362,13 @@ func (st *Local) openPath(ctx context.Context, p string, declare bool) (storifac
 	if err := json.Unmarshal(mb, &meta); err != nil {
 		return "", false, xerrors.Errorf("unmarshalling storage metadata for %s: %w", p, err)
 	}
+	// Reclamation performs local filesystem I/O, never under localLk. Failure
+	// is visible and retried by ReserveSDR; other storage/task roles still open.
+	if meta.CanSeal {
+		st.sweepSDRScratch(p)
+	}
+	st.localLk.Lock()
+	defer st.localLk.Unlock()
 
 	if existing, exists := st.paths[meta.ID]; exists {
 		log.Debugw("skipping duplicate storage path", "path", p, "existing", existing.Local, "id", meta.ID)

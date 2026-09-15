@@ -27,9 +27,9 @@ func TestSDRPublishedRetry(t *testing.T) {
 				return writeSDRTestLayers(p, d, r)
 			}
 			f.store.err = errors.New("temporary post-publication error")
-			require.ErrorContains(t, f.run(context.Background(), native, os.RemoveAll), "temporary post-publication error")
+			require.ErrorContains(t, f.run(context.Background(), native, nil), "temporary post-publication error")
 			f.store.err = nil
-			require.NoError(t, f.run(context.Background(), native, os.RemoveAll), "known published output must finish on retry")
+			require.NoError(t, f.run(context.Background(), native, nil), "known published output must finish on retry")
 			require.Equal(t, 1, calls, "retry must not repeat native generation")
 		})
 	}
@@ -40,7 +40,7 @@ func TestSDRPublishedInputMismatch(t *testing.T) {
 		for _, which := range []string{"ticket", "commD", "proof", "sector", "missing-layer"} {
 			t.Run(ft.String()+"/"+which, func(t *testing.T) {
 				f := newSDRCleanupFixture(t, ft, filepath.Join(t.TempDir(), "output"))
-				require.NoError(t, f.run(context.Background(), writeSDRTestLayers, os.RemoveAll))
+				require.NoError(t, f.run(context.Background(), writeSDRTestLayers, nil))
 				sector, d, ticket := f.sector, f.commD, make([]byte, 32)
 				switch which {
 				case "ticket":
@@ -66,7 +66,7 @@ func TestSDRPublishedInputMismatch(t *testing.T) {
 					require.NoError(t, os.Truncate(p, 0))
 				}
 				calls := 0
-				err := f.sb.generateSDR(context.Background(), 1, ft, sector, ticket, d, func(abi.RegisteredSealProof, string, [32]byte) error { calls++; return nil }, os.RemoveAll)
+				err := f.sb.generateSDR(context.Background(), 1, ft, sector, ticket, d, func(abi.RegisteredSealProof, string, [32]byte) error { calls++; return nil }, nil)
 				require.Error(t, err)
 				require.Zero(t, calls)
 			})
@@ -85,7 +85,7 @@ func TestSDRLatePublicationConflict(t *testing.T) {
 					return err
 				}
 				return os.WriteFile(f.dest, []byte("concurrent destination"), 0600)
-			}, os.RemoveAll)
+			}, nil)
 			require.Error(t, err)
 			require.Equal(t, 1, calls)
 			b, err := os.ReadFile(f.dest)
@@ -100,7 +100,7 @@ func TestSDRPublishedAcrossProcess(t *testing.T) {
 	if dest := os.Getenv("CURIO_SDR_RECEIPT_TEST_CHILD"); dest != "" {
 		f := newSDRCleanupFixture(t, storiface.FTCache, dest)
 		f.store.err = errors.New("post-publish failure before process exit")
-		require.ErrorContains(t, f.run(context.Background(), writeSDRTestLayers, os.RemoveAll), "post-publish failure")
+		require.ErrorContains(t, f.run(context.Background(), writeSDRTestLayers, nil), "post-publish failure")
 		return
 	}
 	dest := filepath.Join(t.TempDir(), "cache")
@@ -114,7 +114,7 @@ func TestSDRPublishedAcrossProcess(t *testing.T) {
 	require.NoError(t, f.run(context.Background(), func(abi.RegisteredSealProof, string, [32]byte) error {
 		t.Error("native repeated after process restart")
 		return nil
-	}, os.RemoveAll))
+	}, nil))
 }
 
 func TestSDRExistingConflictIsEarly(t *testing.T) {
@@ -126,7 +126,7 @@ func TestSDRExistingConflictIsEarly(t *testing.T) {
 			err := f.run(context.Background(), func(p abi.RegisteredSealProof, d string, r [32]byte) error {
 				calls++
 				return writeSDRTestLayers(p, d, r)
-			}, os.RemoveAll)
+			}, nil)
 			require.Error(t, err)
 			require.Zero(t, calls, "known conflict must reject before native entry")
 		})

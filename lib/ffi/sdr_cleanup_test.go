@@ -113,12 +113,9 @@ func TestSDRCleanupFailureRegression(t *testing.T) {
 			return err
 		}
 		return syscall.ENOSPC
-	}, os.RemoveAll)
+	}, nil)
 	require.ErrorIs(t, err, syscall.ENOSPC)
-	_, statErr := os.Stat(scratch)
-	if !os.IsNotExist(statErr) {
-		t.Errorf("failed SDR scratch still exists: %s (%v)", scratch, statErr)
-	}
+	assertSDREmptyTombstone(t, scratch)
 	if f.index.declares.Load() != 0 {
 		t.Errorf("failed SDR declared a cache: %d", f.index.declares.Load())
 	}
@@ -145,12 +142,12 @@ func TestSDRCleanupReturnAndCrossAttempt(t *testing.T) {
 					return result
 				}
 			}
-			go func() { doneOld <- old.run(ctx, body(enteredOld, releaseOld, syscall.ENOSPC), os.RemoveAll) }()
+			go func() { doneOld <- old.run(ctx, body(enteredOld, releaseOld, syscall.ENOSPC), nil) }()
 			oldDir := <-enteredOld
 			cancel()
 			require.DirExists(t, oldDir)
 			require.Zero(t, old.releases.Load())
-			go func() { doneNext <- next.run(context.Background(), body(enteredNext, releaseNext, nil), os.RemoveAll) }()
+			go func() { doneNext <- next.run(context.Background(), body(enteredNext, releaseNext, nil), nil) }()
 			nextDir := <-enteredNext
 			require.NotEqual(t, oldDir, nextDir)
 			if newerPublished {
@@ -160,7 +157,7 @@ func TestSDRCleanupReturnAndCrossAttempt(t *testing.T) {
 			}
 			close(releaseOld)
 			require.ErrorIs(t, <-doneOld, syscall.ENOSPC)
-			require.NoDirExists(t, oldDir)
+			assertSDREmptyTombstone(t, oldDir)
 			if !newerPublished {
 				require.DirExists(t, nextDir)
 				close(releaseNext)
@@ -177,13 +174,15 @@ func TestSDRCleanupSuccessAndBoundaries(t *testing.T) {
 	for _, into := range []storiface.SectorFileType{storiface.FTCache, storiface.FTKey} {
 		t.Run(into.String(), func(t *testing.T) {
 			f := newSDRCleanupFixture(t, into, filepath.Join(t.TempDir(), "output"))
-			require.NoError(t, f.run(context.Background(), writeSDRTestLayers, os.RemoveAll))
+			require.NoError(t, f.run(context.Background(), writeSDRTestLayers, nil))
 			entries, err := os.ReadDir(storiface.SDRTempRoot(f.dest))
 			require.NoError(t, err)
-			require.Empty(t, entries)
+			for _, e := range entries {
+				assertSDREmptyTombstone(t, filepath.Join(storiface.SDRTempRoot(f.dest), e.Name()))
+			}
 			require.EqualValues(t, 1, f.index.declares.Load())
 			// Known completion may be reused, but must not be regenerated.
-			require.NoError(t, f.run(context.Background(), func(abi.RegisteredSealProof, string, [32]byte) error { t.Error("native repeated"); return nil }, os.RemoveAll))
+			require.NoError(t, f.run(context.Background(), func(abi.RegisteredSealProof, string, [32]byte) error { t.Error("native repeated"); return nil }, nil))
 			require.EqualValues(t, 2, f.index.declares.Load())
 			_, err = os.Stat(f.dest)
 			require.NoError(t, err)
@@ -192,7 +191,7 @@ func TestSDRCleanupSuccessAndBoundaries(t *testing.T) {
 	t.Run("existing-empty-directory", func(t *testing.T) {
 		f := newSDRCleanupFixture(t, storiface.FTCache, filepath.Join(t.TempDir(), "output"))
 		require.NoError(t, os.Mkdir(f.dest, 0755))
-		require.Error(t, f.run(context.Background(), writeSDRTestLayers, os.RemoveAll))
+		require.Error(t, f.run(context.Background(), writeSDRTestLayers, nil))
 		entries, err := os.ReadDir(f.dest)
 		require.NoError(t, err)
 		require.Empty(t, entries)
@@ -204,7 +203,7 @@ func TestSDRCleanupSuccessAndBoundaries(t *testing.T) {
 			require.NoError(t, os.WriteFile(p, []byte("preserve"), 0600))
 		}
 		f.commD = cid.Undef
-		require.Error(t, f.run(context.Background(), func(abi.RegisteredSealProof, string, [32]byte) error { t.Error("native called"); return nil }, os.RemoveAll))
+		require.Error(t, f.run(context.Background(), func(abi.RegisteredSealProof, string, [32]byte) error { t.Error("native called"); return nil }, nil))
 		for _, p := range []string{f.dest, f.dest + storiface.TempSuffix, filepath.Join(root, "sealed"), filepath.Join(root, "unsealed"), filepath.Join(root, "other-sector")} {
 			b, err := os.ReadFile(p)
 			require.NoError(t, err)
@@ -215,7 +214,7 @@ func TestSDRCleanupSuccessAndBoundaries(t *testing.T) {
 	t.Run("post-publication-api-error", func(t *testing.T) {
 		f := newSDRCleanupFixture(t, storiface.FTCache, filepath.Join(t.TempDir(), "output"))
 		f.store.err = errors.New("index unavailable")
-		require.ErrorIs(t, f.run(context.Background(), writeSDRTestLayers, os.RemoveAll), f.store.err)
+		require.ErrorIs(t, f.run(context.Background(), writeSDRTestLayers, nil), f.store.err)
 		require.FileExists(t, filepath.Join(f.dest, proofpaths.LayerFileName(11)))
 		require.EqualValues(t, 1, f.index.declares.Load())
 	})
@@ -251,11 +250,13 @@ func TestSDRCleanupRepeatedFailuresReleaseAfterCleanup(t *testing.T) {
 			require.NoError(t, err)
 			require.Positive(t, st.Sys().(*syscall.Stat_t).Blocks, "fixture must allocate blocks, not just sparse apparent bytes")
 			return syscall.ENOSPC
-		}, func(d string) error { err := os.RemoveAll(d); cleanupFinished = true; return err })
+		}, func(string) error { cleanupFinished = true; return nil })
 		require.ErrorIs(t, err, syscall.ENOSPC)
 		entries, err := os.ReadDir(storiface.SDRTempRoot(f.dest))
 		require.NoError(t, err)
-		require.Empty(t, entries)
+		for _, e := range entries {
+			assertSDREmptyTombstone(t, filepath.Join(storiface.SDRTempRoot(f.dest), e.Name()))
+		}
 	}
 	require.EqualValues(t, 20, f.releases.Load())
 	require.Zero(t, f.index.declares.Load())
@@ -277,7 +278,7 @@ func TestSDRCleanupDelayedReleaseFourSlots(t *testing.T) {
 					return err
 				}
 				return syscall.EIO
-			}, func(dir string) error { entered <- struct{}{}; <-allowCleanup; return os.RemoveAll(dir) })
+			}, func(string) error { entered <- struct{}{}; <-allowCleanup; return nil })
 		}()
 	}
 	for i := 0; i < 4; i++ {
@@ -294,7 +295,7 @@ func TestSDRCleanupDelayedReleaseFourSlots(t *testing.T) {
 		<-released
 	}
 	next := newSDRCleanupFixture(t, storiface.FTCache, filepath.Join(t.TempDir(), "next"))
-	require.NoError(t, next.run(context.Background(), writeSDRTestLayers, os.RemoveAll))
+	require.NoError(t, next.run(context.Background(), writeSDRTestLayers, nil))
 	require.EqualValues(t, 1, next.releases.Load())
 }
 
@@ -305,11 +306,12 @@ func TestSDRCleanupMissingLastLayerAndLegacyPreservation(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(legacy, "old-attempt"), []byte("untouched"), 0600))
 	err := f.run(context.Background(), func(_ abi.RegisteredSealProof, dir string, _ [32]byte) error {
 		return os.WriteFile(filepath.Join(dir, "partial"), []byte("partial"), 0600)
-	}, os.RemoveAll)
+	}, nil)
 	require.Error(t, err)
 	entries, err := os.ReadDir(storiface.SDRTempRoot(f.dest))
 	require.NoError(t, err)
-	require.Empty(t, entries)
+	require.Len(t, entries, 1, "successful native return with invalid output is preserved for review")
+	require.FileExists(t, filepath.Join(storiface.SDRTempRoot(f.dest), entries[0].Name(), "partial"))
 	require.FileExists(t, filepath.Join(legacy, "old-attempt"))
 	require.Zero(t, f.index.declares.Load())
 }
@@ -350,7 +352,7 @@ func TestSDRCleanupProcessHelper(t *testing.T) {
 			return err
 		}
 		return syscall.EIO
-	}, os.RemoveAll)
+	}, nil)
 	require.ErrorIs(t, err, syscall.EIO)
 	require.Zero(t, f.index.declares.Load())
 	require.EqualValues(t, 1, f.releases.Load())
@@ -376,12 +378,19 @@ func TestSDRCleanupSeparateProcess(t *testing.T) {
 	old, err := os.ReadFile(filepath.Join(root, "ready"))
 	require.NoError(t, err)
 	next := newSDRCleanupFixture(t, storiface.FTCache, filepath.Join(root, "output"))
-	require.NoError(t, next.run(context.Background(), writeSDRTestLayers, os.RemoveAll))
+	require.NoError(t, next.run(context.Background(), writeSDRTestLayers, nil))
 	require.DirExists(t, string(old), "new attempt must not delete a different process's scratch")
 	require.NoError(t, os.WriteFile(filepath.Join(root, "finish"), nil, 0600))
 	err = cmd.Wait()
 	waited = true
 	require.NoError(t, err)
-	require.NoDirExists(t, string(old))
+	assertSDREmptyTombstone(t, string(old))
 	require.FileExists(t, filepath.Join(next.dest, proofpaths.LayerFileName(11)))
+}
+
+func assertSDREmptyTombstone(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Empty(t, entries, "all failed scratch files must be reclaimed; the inode-bound empty directory is retained")
 }

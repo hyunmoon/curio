@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/filecoin-project/curio/lib/sdrscratch"
 	"github.com/filecoin-project/curio/lib/storiface"
 )
 
@@ -22,7 +23,7 @@ type SDRReservation struct {
 }
 
 func NewSDRReservation(destination string) *SDRReservation {
-	p := filepath.Join(storiface.SDRTempRoot(destination), "attempt-"+uuid.NewString())
+	p := filepath.Join(storiface.SDRTempRoot(destination), sdrscratch.Prefix+uuid.NewString())
 	return &SDRReservation{Scratch: p, materialized: p}
 }
 
@@ -51,6 +52,20 @@ func sdrCredit(ls LocalStorage, p string, oh int64) (int64, error) {
 func (st *Local) ReserveSDR(ctx context.Context, sid storiface.SectorRef, ft storiface.SectorFileType, ids storiface.SectorPaths, overheads map[storiface.SectorFileType]int, minFree float64, r *SDRReservation) (func(), error) {
 	if r == nil || (ft != storiface.FTCache && ft != storiface.FTKey) {
 		return nil, fmt.Errorf("invalid SDR reservation intent")
+	}
+	// Never unlink under the caller's ReservationCtxLock. TaskStorage performs
+	// the out-of-lock preparation; this read-only check denies pending cleanup.
+	st.localLk.RLock()
+	p := st.paths[storiface.ID(storiface.PathByType(ids, ft))]
+	var local string
+	if p != nil {
+		local = p.Local
+	}
+	st.localLk.RUnlock()
+	if local != "" {
+		if err := sdrscratch.Check(filepath.Join(local, ft.String())); err != nil {
+			return nil, fmt.Errorf("SDR scratch cleanup before reservation: %w", err)
+		}
 	}
 	return st.reserve(ctx, sid, ft, ids, overheads, minFree, r)
 }

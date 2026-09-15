@@ -16,12 +16,12 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/puzpuzpuz/xsync/v2"
 	"github.com/samber/lo"
-	"golang.org/x/sys/unix"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/curio/harmony/harmonytask"
 	"github.com/filecoin-project/curio/lib/ffiselect"
 	"github.com/filecoin-project/curio/lib/proof"
+	"github.com/filecoin-project/curio/lib/sdrscratch"
 	"github.com/filecoin-project/curio/lib/storiface"
 
 	// TODO everywhere here that we call this we should call our proxy instead.
@@ -155,12 +155,12 @@ func (l *storageProvider) AcquireSector(ctx context.Context, taskID *harmonytask
 }
 
 func (sb *SealCalls) GenerateSDR(ctx context.Context, taskID harmonytask.TaskID, into storiface.SectorFileType, sector storiface.SectorRef, ticket abi.SealRandomness, commDcid cid.Cid, ticketEpoch ...abi.ChainEpoch) error {
-	return sb.generateSDR(ctx, taskID, into, sector, ticket, commDcid, ffi.GenerateSDR, os.RemoveAll, ticketEpoch...)
+	return sb.generateSDR(ctx, taskID, into, sector, ticket, commDcid, ffi.GenerateSDR, nil, ticketEpoch...)
 }
 
 // The injected operations keep filesystem/error interleavings testable without
 // running native proofs. Production always uses the synchronous FFI call above.
-func (sb *SealCalls) generateSDR(ctx context.Context, taskID harmonytask.TaskID, into storiface.SectorFileType, sector storiface.SectorRef, ticket abi.SealRandomness, commDcid cid.Cid, generate func(abi.RegisteredSealProof, string, [32]byte) error, removeAll func(string) error, ticketEpoch ...abi.ChainEpoch) (retErr error) {
+func (sb *SealCalls) generateSDR(ctx context.Context, taskID harmonytask.TaskID, into storiface.SectorFileType, sector storiface.SectorRef, ticket abi.SealRandomness, commDcid cid.Cid, generate func(abi.RegisteredSealProof, string, [32]byte) error, beforeCleanup func(string) error, ticketEpoch ...abi.ChainEpoch) (retErr error) {
 	if into != storiface.FTCache && into != storiface.FTKey {
 		return xerrors.Errorf("unsupported SDR output type: %s", into)
 	}
@@ -228,36 +228,46 @@ func (sb *SealCalls) generateSDR(ctx context.Context, taskID harmonytask.TaskID,
 		return xerrors.Errorf("mkdir SDR scratch root: %w", err)
 	}
 	intoTemp := reservation.Scratch
-	if err := os.Mkdir(intoTemp, 0700); err != nil {
-		return xerrors.Errorf("mkdir SDR attempt: %w", err)
+	writer, err := sdrscratch.Begin(intoTemp)
+	if err != nil {
+		return xerrors.Errorf("begin SDR scratch ownership: %w", err)
 	}
-	// Runs only after generate returns, not when its context is cancelled.
-	// Runs before releaseSector, including on publication failure. Do not
-	// remove the shared root: another attempt can be creating its directory.
 	defer func() {
-		if err := removeAll(intoTemp); err != nil {
+		if err := writer.Close(); err != nil {
+			retErr = errors.Join(retErr, err)
+		}
+	}()
+	// A panic/cancellation while native is active is not a return certificate.
+	// Successful but unpublished output must also survive a later API/I/O error.
+	canCleanup := true // native has not been entered
+	defer func() {
+		if !canCleanup {
+			return
+		}
+		err := writer.Returned()
+		if err == nil && beforeCleanup != nil {
+			err = beforeCleanup(intoTemp)
+		}
+		if err == nil {
+			_, err = writer.Reclaim()
+		}
+		if err != nil {
 			cleanupErr := xerrors.Errorf("cleaning SDR attempt %s: %w", intoTemp, err)
 			log.Errorw("SDR scratch cleanup failed", "sector", sector.ID, "error", cleanupErr, "operationError", retErr)
 			retErr = errors.Join(retErr, cleanupErr)
 		}
 	}()
-	// MkdirTemp starts private; retain the existing published-cache permissions.
-	if err := os.Chmod(intoTemp, 0755); err != nil {
-		return xerrors.Errorf("setting SDR cache permissions: %w", err)
-	}
-	// Probe support before costly native work. An incomplete marker is never
-	// accepted as a receipt and lives only inside our private scratch.
-	if err := unix.Setxattr(intoTemp, sdrReceiptAttribute, []byte("incomplete"), 0); err != nil {
-		return xerrors.Errorf("SDR completion xattr unavailable: %w", err)
-	}
+	// Begin durably probes/records the incomplete marker before native entry.
 
 	// generate new sector key
+	canCleanup = false
 	err = generate(
 		sector.ProofType,
 		intoTemp,
 		replicaID,
 	)
 	if err != nil {
+		canCleanup = true // synchronous error return, not loss of ownership
 		return xerrors.Errorf("generating SDR %d (%s): %w", sector.ID.Number, intoTemp, err)
 	}
 
@@ -285,6 +295,7 @@ func (sb *SealCalls) generateSDR(ctx context.Context, taskID harmonytask.TaskID,
 		}
 	}
 	published = true
+	canCleanup = onlyLastLayer // cache directory was published; never reclaim it
 	reservation.UsePublished(intoPath)
 
 	if err := sb.ensureOneCopy(ctx, sector.ID, pathIDs, into); err != nil {

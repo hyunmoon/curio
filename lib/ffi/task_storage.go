@@ -136,6 +136,9 @@ func (t *TaskStorage) HasCapacity() bool {
 }
 
 func (t *TaskStorage) Claim(taskID int) (func() error, error) {
+	if t.sdr {
+		t.sc.Sectors.localStore.PrepareSDRScratch()
+	}
 	// TaskStorage Claim Attempts to reserve storage for the task
 	// A: Create a reservation for files to be allocated
 	// B: Create a reservation for existing files to be fetched into local storage
