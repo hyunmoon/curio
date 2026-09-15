@@ -33,6 +33,14 @@ func TestTaskTookCurrentAttemptOnly(t *testing.T) {
 		{"legacy backfill", func(r *clusterTaskSummaryLimitedRow) { r.AttemptStartSource = sql.NullString{} }, "unknown", 0, false},
 		{"migration provenance", func(r *clusterTaskSummaryLimitedRow) { r.AttemptStartSource.String = "migration" }, "unknown", 0, false},
 		{"missing identity", func(r *clusterTaskSummaryLimitedRow) { r.AttemptID = sql.NullString{} }, "unknown", 0, false},
+		{"empty identity", func(r *clusterTaskSummaryLimitedRow) { r.AttemptID.String = "" }, "unknown", 0, false},
+		{"zero seconds", func(r *clusterTaskSummaryLimitedRow) { r.AttemptStartedAt.Time = now }, "running", 0, true},
+		{"claimed with contradictory start", func(r *clusterTaskSummaryLimitedRow) { r.AttemptStartSource.String = "claimed" }, "unknown", 0, false},
+		{"claim before token allocation", func(r *clusterTaskSummaryLimitedRow) {
+			r.AttemptID = sql.NullString{}
+			r.AttemptStartedAt = sql.NullTime{}
+			r.AttemptStartSource.String = "claimed"
+		}, "awaiting-start", 0, false},
 		{"future clock", func(r *clusterTaskSummaryLimitedRow) { r.AttemptStartedAt.Time = now.Add(time.Minute) }, "future-start", 0, false},
 		{"same owner recovered", func(r *clusterTaskSummaryLimitedRow) {
 			r.AttemptID.String = "restart"

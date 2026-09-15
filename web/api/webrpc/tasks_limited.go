@@ -93,6 +93,7 @@ type ClusterTaskSummaryLimitedTask struct {
 	SpIDs                []string
 	Miners               []string
 	OwnershipStartSource string
+	OwnershipStartedAt   *time.Time // Ordering only; never a Took fallback.
 	Miner                string
 	State                string
 	AgeSeconds           *int64
@@ -104,6 +105,7 @@ type ClusterTaskSummaryLimitedTask struct {
 }
 
 type ClusterTaskSummaryLimitedResponse struct {
+	// Running and RunningTotal retain their legacy meaning: all owned tasks.
 	Running            []ClusterTaskSummaryLimitedTask
 	Pending            []ClusterTaskSummaryLimitedTask
 	Applied            ClusterTaskSummaryApplied
@@ -115,6 +117,15 @@ type ClusterTaskSummaryLimitedResponse struct {
 	TaskTypesAvailable bool
 	Partial            bool
 	Warnings           []ClusterTaskSummaryWarning
+	SectionTotals      *ClusterTaskSectionTotals
+}
+
+// Counts cover the full filtered set, before either display limit is applied.
+type ClusterTaskSectionTotals struct {
+	Running       int64
+	AwaitingStart int64
+	Unknown       int64
+	Pending       int64
 }
 
 type clusterTaskSummaryLimitedRow struct {
@@ -133,10 +144,11 @@ type clusterTaskSummaryLimitedRow struct {
 }
 
 type clusterTaskSummarySnapshot struct {
-	Rows         []clusterTaskSummaryLimitedRow
-	RunningTotal int64
-	PendingTotal int64
-	ObservedAt   time.Time
+	SectionTotals ClusterTaskSectionTotals
+	Rows          []clusterTaskSummaryLimitedRow
+	RunningTotal  int64
+	PendingTotal  int64
+	ObservedAt    time.Time
 }
 
 type clusterTaskSummarySource interface {
@@ -149,6 +161,9 @@ type harmonyClusterTaskSummarySource struct {
 }
 
 type clusterTaskSummaryDBRow struct {
+	ExecutionTotal     int64          `db:"execution_total"`
+	AwaitingStartTotal int64          `db:"awaiting_start_total"`
+	UnknownTotal       int64          `db:"unknown_total"`
 	ID                 sql.NullInt64  `db:"id"`
 	Name               sql.NullString `db:"name"`
 	PostedTime         sql.NullTime   `db:"posted_time"`
@@ -167,7 +182,9 @@ type clusterTaskSummaryDBRow struct {
 }
 
 const clusterTaskSummaryLimitedQuery = `
-WITH matching AS (
+WITH observed AS (
+	SELECT statement_timestamp() AS observed_at
+), raw_matching AS (
 	SELECT
 		t.id,
 		t.name,
@@ -178,22 +195,35 @@ WITH matching AS (
 		t.attempt_id,
 		t.attempt_start_source,
 		t.owner_id,
+		o.observed_at,
 		CASE WHEN t.name::TEXT = ANY($5::TEXT[]) THEN 0 ELSE 1 END AS display_priority
 	FROM harmony_task t
+	CROSS JOIN observed o
 	WHERE ($1::BOOLEAN OR t.name NOT LIKE 'bg:%')
 		AND ($2::TEXT IS NULL OR t.name = $2)
-),
-matching_counts AS (
+), classified AS (
+	SELECT *, ` + clusterTaskTookStateSQL + ` AS took_state FROM raw_matching
+), matching AS (
+	SELECT *, CASE took_state WHEN 'running' THEN 0 WHEN 'awaiting-start' THEN 1
+		WHEN 'pending' THEN 3 ELSE 2 END AS section_order,
+		CASE WHEN took_state = 'running'
+			THEN FLOOR(EXTRACT(EPOCH FROM observed_at - attempt_started_at))::BIGINT END AS took_seconds
+	FROM classified
+), matching_counts AS (
 	SELECT
 		COUNT(*) FILTER (WHERE owner_id IS NOT NULL) AS running_total,
-		COUNT(*) FILTER (WHERE owner_id IS NULL) AS pending_total
+		COUNT(*) FILTER (WHERE owner_id IS NULL) AS pending_total,
+		COUNT(*) FILTER (WHERE took_state = 'running') AS execution_total,
+		COUNT(*) FILTER (WHERE took_state = 'awaiting-start') AS awaiting_start_total,
+		COUNT(*) FILTER (WHERE took_state IN ('unknown', 'future-start')) AS unknown_total
 	FROM matching
 ),
 running AS (
-	SELECT *, 'running'::TEXT AS state, 0::BIGINT AS section_order
+	SELECT *, 'running'::TEXT AS state
 	FROM matching
 	WHERE owner_id IS NOT NULL
-	ORDER BY display_priority ASC, work_start ASC NULLS FIRST, id ASC
+	ORDER BY section_order ASC, took_seconds DESC NULLS LAST,
+		CASE WHEN section_order > 0 THEN work_start END ASC NULLS LAST, id ASC
 	LIMIT $3
 ),
 remaining AS (
@@ -201,7 +231,7 @@ remaining AS (
 	FROM running
 ),
 pending AS (
-	SELECT *, 'pending'::TEXT AS state, 1::BIGINT AS section_order
+	SELECT *, 'pending'::TEXT AS state
 	FROM matching
 	WHERE owner_id IS NULL
 	ORDER BY display_priority ASC, posted_time ASC, id ASC
@@ -211,9 +241,6 @@ selected AS (
 	SELECT * FROM running
 	UNION ALL
 	SELECT * FROM pending
-),
-observed AS (
-	SELECT statement_timestamp() AS observed_at
 )
 SELECT
 	s.id,
@@ -230,6 +257,9 @@ SELECT
 	s.display_priority,
 	c.running_total,
 	c.pending_total,
+	c.execution_total,
+	c.awaiting_start_total,
+	c.unknown_total,
 	o.observed_at
 FROM matching_counts c
 CROSS JOIN observed o
@@ -237,8 +267,10 @@ LEFT JOIN selected s ON TRUE
 LEFT JOIN harmony_machines hm ON hm.id = s.owner_id
 ORDER BY
 	s.section_order ASC NULLS LAST,
-	s.display_priority ASC NULLS LAST,
-	CASE WHEN s.section_order = 0 THEN s.work_start ELSE s.posted_time END ASC NULLS FIRST,
+	s.took_seconds DESC NULLS LAST,
+	CASE WHEN s.section_order = 3 THEN s.display_priority END ASC NULLS LAST,
+	CASE WHEN s.section_order = 3 THEN s.posted_time
+		WHEN s.section_order > 0 THEN s.work_start END ASC NULLS LAST,
 	s.id ASC`
 
 func (s harmonyClusterTaskSummarySource) LoadSnapshot(ctx context.Context, applied ClusterTaskSummaryApplied) (clusterTaskSummarySnapshot, error) {
@@ -252,6 +284,8 @@ func (s harmonyClusterTaskSummarySource) LoadSnapshot(ctx context.Context, appli
 	}
 
 	snapshot := clusterTaskSummarySnapshot{
+		SectionTotals: ClusterTaskSectionTotals{Running: rows[0].ExecutionTotal,
+			AwaitingStart: rows[0].AwaitingStartTotal, Unknown: rows[0].UnknownTotal, Pending: rows[0].PendingTotal},
 		Rows:         make([]clusterTaskSummaryLimitedRow, 0, len(rows)),
 		RunningTotal: rows[0].RunningTotal,
 		PendingTotal: rows[0].PendingTotal,
@@ -448,6 +482,10 @@ func buildLimitedTaskSummary(row clusterTaskSummaryLimitedRow, observedAt time.T
 		ageSeconds := clusterTaskAgeSeconds(observedAt, row.PostedTime)
 		task.AgeSeconds = &ageSeconds
 	} else {
+		if row.WorkStart.Valid {
+			started := row.WorkStart.Time
+			task.OwnershipStartedAt = &started
+		}
 		task.AgeSeconds = knownTaskAge(observedAt, row.WorkStart, row.WorkStartSource)
 		task.OwnershipStartSource = "unknown"
 		if task.AgeSeconds != nil {
@@ -492,6 +530,7 @@ func buildClusterTaskSummaryLimited(ctx context.Context, request ClusterTaskSumm
 	}
 
 	response := ClusterTaskSummaryLimitedResponse{
+		SectionTotals:   &snapshot.SectionTotals,
 		Running:         make([]ClusterTaskSummaryLimitedTask, 0),
 		Pending:         make([]ClusterTaskSummaryLimitedTask, 0),
 		Applied:         applied,

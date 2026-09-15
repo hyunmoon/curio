@@ -9,7 +9,7 @@ export const CLUSTER_TASK_DEFAULTS = Object.freeze({
 });
 
 export const CLUSTER_TASK_ORDER_POLICY =
-  'Sealing/proof first; longest ownership age first within each group';
+  'Running: longest Took first across all task types and owners. Do entry is not a native liveness check.';
 export const RUNNING_AGE_TOOLTIP =
   'Took starts at entry into the current task Do attempt, matching new History records; not at claim or FFI entry.';
 export const PENDING_AGE_TOOLTIP =
@@ -162,20 +162,18 @@ export function formatClusterTaskSectionSummary(shown, total, totalsAvailable) {
 
 export function clusterTaskSectionEmptyMessage(sectionKey, value) {
   const response = normalizeClusterTaskResponse(value);
-  const entries = sectionKey === 'pending' ? response.Pending : response.Running;
+  const section = buildClusterTaskSections(value, false).find(s => s.key === sectionKey);
   if (sectionKey === 'pending' && response.Applied.MaxPending === 0) {
     return 'Pending preview is disabled.';
   }
-  if (entries.length > 0) {
+  if (section.entries.length > 0) {
     return '';
   }
-  if (!response.TotalsAvailable) {
+  if (!section.totalsAvailable) {
     return `No ${sectionKey} rows displayed; total unavailable.`;
   }
 
-  const total = sectionKey === 'pending'
-    ? response.PendingTotal
-    : response.RunningTotal;
+  const total = section.total;
   if (total === 0) {
     return `No ${sectionKey} tasks match the applied snapshot filters.`;
   }
@@ -183,9 +181,9 @@ export function clusterTaskSectionEmptyMessage(sectionKey, value) {
     sectionKey === 'pending' &&
     response.Running.length >= response.Applied.MaxTasks
   ) {
-    return 'Pending preview is omitted because running tasks use the display limit.';
+    return 'Pending preview is omitted because owned tasks use the display limit.';
   }
-  return `No ${sectionKey} rows displayed for this snapshot.`;
+  return `No ${sectionKey} rows displayed; earlier sections use the display limit.`;
 }
 
 function normalizeTaskName(value) {
@@ -298,7 +296,12 @@ export function normalizeClusterTaskResponse(value) {
     },
     RunningTotal: nonNegativeInteger(response.RunningTotal),
     PendingTotal: nonNegativeInteger(response.PendingTotal),
-    TotalsAvailable: Boolean(response.TotalsAvailable),
+    TotalsAvailable: Boolean(response.TotalsAvailable) &&
+      Number.isSafeInteger(response.PendingTotal) && response.PendingTotal >= 0,
+    SectionTotals: response.SectionTotals &&
+      ['Running', 'AwaitingStart', 'Unknown', 'Pending'].every(key =>
+        Number.isSafeInteger(response.SectionTotals[key]) && response.SectionTotals[key] >= 0)
+      ? {...response.SectionTotals} : null,
     Partial: Boolean(response.Partial),
     ObservedAt: typeof response.ObservedAt === 'string' ? response.ObservedAt : '',
     TaskTypes: Array.isArray(response.TaskTypes)
@@ -367,26 +370,59 @@ function groupsFor(entries, coalesceEntries) {
     : entries.map((entry) => [entry]);
 }
 
+function ownershipOrderTimestamp(value) {
+  const milliseconds = typeof value === 'string' ? Date.parse(value) : NaN;
+  if (!Number.isFinite(milliseconds)) return null;
+  // Preserve the database's sub-millisecond precision rather than letting
+  // Date.parse create false ties that disagree with SQL before LIMIT.
+  const fraction = value.match(/\.(\d+)(?:Z|[+-]\d\d:\d\d)$/)?.[1] || '';
+  return BigInt(milliseconds) * 1000000n + BigInt(fraction.padEnd(9, '0').slice(3, 9));
+}
+
+// Accepted snapshots are immutable. Reuse the split/sort when the display
+// clock ticks; only a new snapshot or coalescing change needs new groups.
+const sectionCache = new WeakMap();
 export function buildClusterTaskSections(response, coalesceEntries) {
+  const cacheable = response && typeof response === 'object';
+  const cacheKey = Boolean(coalesceEntries);
+  if (cacheable && sectionCache.get(response)?.has(cacheKey)) return sectionCache.get(response).get(cacheKey);
   const normalized = normalizeClusterTaskResponse(response);
-  return [
-    {
-      key: 'running',
-      title: 'Running',
-      ageLabel: 'Took',
-      ageTooltip: `${RUNNING_AGE_TOOLTIP} ${INTERPOLATED_AGE_TOOLTIP}`,
-      entries: normalized.Running,
-      groups: groupsFor(normalized.Running, coalesceEntries),
-      total: normalized.RunningTotal,
-    },
-    {
-      key: 'pending',
-      title: 'Pending preview',
-      ageLabel: 'Waiting',
-      ageTooltip: `${PENDING_AGE_TOOLTIP} ${INTERPOLATED_AGE_TOOLTIP}`,
-      entries: normalized.Pending,
-      groups: groupsFor(normalized.Pending, coalesceEntries),
-      total: normalized.PendingTotal,
-    },
+  const sections = [
+    {key: 'running', title: 'Running', countKey: 'Running'},
+    {key: 'awaiting-start', title: 'Awaiting start', countKey: 'AwaitingStart'},
+    {key: 'unknown', title: 'Unknown', countKey: 'Unknown'},
+    {key: 'pending', title: 'Pending preview', countKey: 'Pending'},
   ];
+  const rows = [...normalized.Running, ...normalized.Pending];
+  const result = sections.map(section => {
+    const pending = section.key === 'pending';
+    const entries = rows.filter(row => clusterTaskExecutionSection(row) === section.key);
+    if (!pending) entries.sort((a, b) => {
+      if (section.key === 'running') return Math.floor(b.TookSeconds) - Math.floor(a.TookSeconds) || a.ID - b.ID;
+      const left = ownershipOrderTimestamp(a.OwnershipStartedAt), right = ownershipOrderTimestamp(b.OwnershipStartedAt);
+      if ((left === null) !== (right === null)) return left === null ? 1 : -1;
+      if (left !== right) return left < right ? -1 : 1;
+      return a.ID - b.ID;
+    });
+    return {...section, entries, groups: groupsFor(entries, coalesceEntries),
+      ageLabel: pending ? 'Waiting' : 'Took',
+      ageTooltip: `${pending ? PENDING_AGE_TOOLTIP : RUNNING_AGE_TOOLTIP} ${INTERPOLATED_AGE_TOOLTIP}`,
+      totalsAvailable: normalized.TotalsAvailable && (pending || normalized.SectionTotals !== null),
+      total: pending ? normalized.PendingTotal : normalized.SectionTotals?.[section.countKey],
+    };
+  });
+  if (cacheable) {
+    if (!sectionCache.has(response)) sectionCache.set(response, new Map());
+    sectionCache.get(response).set(cacheKey, result);
+  }
+  return result;
+}
+
+// Do not infer execution from ownership or turn contradictory payloads into 0s.
+export function clusterTaskExecutionSection(entry) {
+  if (entry.OwnerID === null || entry.OwnerID === undefined) return 'pending';
+  if (entry.TookState === 'running' && Number.isFinite(entry.TookSeconds) && entry.TookSeconds >= 0 &&
+      typeof entry.AttemptID === 'string' && entry.AttemptID.length > 0) return 'running';
+  if (entry.TookState === 'awaiting-start' && entry.TookSeconds == null) return 'awaiting-start';
+  return 'unknown';
 }

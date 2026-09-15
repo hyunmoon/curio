@@ -144,7 +144,7 @@ test('section summaries expose shown and total counts', () => {
 });
 
 test('pending empty states distinguish capacity, filters, disabled previews, and unknown totals', () => {
-  const runningAtLimit = Array.from({length: 500}, (_, index) => ({ID: index + 1}));
+  const runningAtLimit = Array.from({length: 500}, (_, index) => ({ID: index + 1, OwnerID: 7}));
   const capacityResponse = normalizeClusterTaskResponse({
     Running: runningAtLimit,
     Pending: [],
@@ -155,7 +155,7 @@ test('pending empty states distinguish capacity, filters, disabled previews, and
   });
   assert.equal(
       clusterTaskSectionEmptyMessage('pending', capacityResponse),
-      'Pending preview is omitted because running tasks use the display limit.',
+      'Pending preview is omitted because owned tasks use the display limit.',
   );
   assert.equal(
       formatClusterTaskSectionSummary(
@@ -368,11 +368,11 @@ test('first refresh failure remains a first-state error, not stale data', () => 
   assert.equal(state.error, 'offline');
 });
 
-test('sections are Running then Pending and coalesce only inside each section', () => {
+test('four execution sections coalesce only inside each section', () => {
   const response = {
     Running: [
-      {ID: 1, State: 'running', SpID: '1000', Name: 'SDR', OwnerID: '7'},
-      {ID: 2, State: 'running', SpID: '1000', Name: 'SDR', OwnerID: '7'},
+      {ID: 1, State: 'running', TookState: 'running', TookSeconds: 10, AttemptID: 'one', SpID: '1000', Name: 'SDR', OwnerID: '7'},
+      {ID: 2, State: 'running', TookState: 'running', TookSeconds: 9, AttemptID: 'two', SpID: '1000', Name: 'SDR', OwnerID: '7'},
     ],
     Pending: [
       {ID: 3, State: 'pending', SpID: '1000', Name: 'SDR', OwnerID: null},
@@ -381,20 +381,20 @@ test('sections are Running then Pending and coalesce only inside each section', 
   };
 
   const expanded = buildClusterTaskSections(response, false);
-  assert.deepEqual(expanded.map((section) => section.key), ['running', 'pending']);
+  assert.deepEqual(expanded.map((section) => section.key), ['running', 'awaiting-start', 'unknown', 'pending']);
   assert.deepEqual(expanded[0].groups.map((group) => group.map((entry) => entry.ID)), [[1], [2]]);
-  assert.deepEqual(expanded[1].groups.map((group) => group.map((entry) => entry.ID)), [[3], [4]]);
+  assert.deepEqual(expanded[3].groups.map((group) => group.map((entry) => entry.ID)), [[3], [4]]);
 
   const coalesced = buildClusterTaskSections(response, true);
   assert.deepEqual(coalesced[0].groups.map((group) => group.map((entry) => entry.ID)), [[1, 2]]);
-  assert.deepEqual(coalesced[1].groups.map((group) => group.map((entry) => entry.ID)), [[3, 4]]);
+  assert.deepEqual(coalesced[3].groups.map((group) => group.map((entry) => entry.ID)), [[3, 4]]);
   assert.equal(coalesced[0].ageLabel, 'Took');
-  assert.equal(coalesced[1].ageLabel, 'Waiting');
+  assert.equal(coalesced[3].ageLabel, 'Waiting');
   assert.match(RUNNING_AGE_TOOLTIP, /Do attempt/);
   assert.match(PENDING_AGE_TOOLTIP, /posted/);
   assert.equal(
       CLUSTER_TASK_ORDER_POLICY,
-      'Sealing/proof first; longest ownership age first within each group',
+      'Running: longest Took first across all task types and owners. Do entry is not a native liveness check.',
   );
 });
 
@@ -405,6 +405,7 @@ test('coalescing preserves the selected-record bound', () => {
     SpID: '1000',
     Name: 'SDR',
     OwnerID: 7,
+    TookState: 'running', TookSeconds: 1, AttemptID: `attempt-${index}`,
   }));
 
   const sections = buildClusterTaskSections({Running: selected, Pending: []}, true);

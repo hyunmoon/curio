@@ -55,11 +55,28 @@ func (m *memoryClusterTaskSummarySource) LoadSnapshot(ctx context.Context, appli
 
 	sort.Slice(running, func(i, j int) bool {
 		left, right := running[i], running[j]
-		if left.DisplayPriority != right.DisplayPriority {
-			return left.DisplayPriority < right.DisplayPriority
+		leftAge, leftState := taskTookAge(left, m.observedAt)
+		rightAge, rightState := taskTookAge(right, m.observedAt)
+		rank := func(state string) int {
+			if state == "running" {
+				return 0
+			}
+			if state == "awaiting-start" {
+				return 1
+			}
+			return 2
+		}
+		if rank(leftState) != rank(rightState) {
+			return rank(leftState) < rank(rightState)
+		}
+		if leftAge != nil && rightAge != nil {
+			if *leftAge != *rightAge {
+				return *leftAge > *rightAge
+			}
+			return left.ID < right.ID
 		}
 		if left.WorkStart.Valid != right.WorkStart.Valid {
-			return !left.WorkStart.Valid
+			return left.WorkStart.Valid
 		}
 		if left.WorkStart.Valid && !left.WorkStart.Time.Equal(right.WorkStart.Time) {
 			return left.WorkStart.Time.Before(right.WorkStart.Time)
@@ -78,15 +95,28 @@ func (m *memoryClusterTaskSummarySource) LoadSnapshot(ctx context.Context, appli
 	})
 
 	runningTotal, pendingTotal := len(running), len(pending)
+	totals := ClusterTaskSectionTotals{Pending: int64(pendingTotal)}
+	for _, row := range running {
+		_, state := taskTookAge(row, m.observedAt)
+		switch state {
+		case "running":
+			totals.Running++
+		case "awaiting-start":
+			totals.AwaitingStart++
+		default:
+			totals.Unknown++
+		}
+	}
 	running = running[:min(len(running), applied.MaxTasks)]
 	pendingLimit := min(applied.MaxPending, applied.MaxTasks-len(running))
 	pending = pending[:min(len(pending), pendingLimit)]
 	selected := append(append([]clusterTaskSummaryLimitedRow{}, running...), pending...)
 	return clusterTaskSummarySnapshot{
-		Rows:         selected,
-		RunningTotal: int64(runningTotal),
-		PendingTotal: int64(pendingTotal),
-		ObservedAt:   m.observedAt,
+		SectionTotals: totals,
+		Rows:          selected,
+		RunningTotal:  int64(runningTotal),
+		PendingTotal:  int64(pendingTotal),
+		ObservedAt:    m.observedAt,
 	}, nil
 }
 
@@ -233,13 +263,13 @@ func TestClusterTaskSummaryLimitedSelectionRules(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wantRunning := []int64{4, 2, 3, 5, 10}
+	wantRunning := []int64{10, 2, 3, 5, 4} // All lack attempt evidence: Unknown, oldest ownership first.
 	for i, id := range wantRunning {
 		if response.Running[i].ID != id {
 			t.Fatalf("running[%d] = %d, want %d", i, response.Running[i].ID, id)
 		}
 	}
-	if response.Running[0].AgeSeconds != nil {
+	if response.Running[4].AgeSeconds != nil {
 		t.Fatal("unknown running start unexpectedly acquired an age")
 	}
 	if response.Pending[0].ID != 1 {
