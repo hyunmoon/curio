@@ -104,7 +104,7 @@ func (s *SDRTask) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned 
 
 	// FAIL: api may be down
 	// FAIL-RESP: rely on harmony retry
-	ticket, ticketEpoch, err := GetTicket(ctx, s.api, maddr)
+	ticket, ticketEpoch, err := s.sdrTicket(ctx, taskID, sref, dealData.CommD, maddr)
 	if err != nil {
 		return false, xerrors.Errorf("getting ticket: %w", err)
 	}
@@ -119,7 +119,7 @@ func (s *SDRTask) Do(ctx context.Context, taskID harmonytask.TaskID, stillOwned 
 	//                Trees; After one retry, it should return the sector to the
 	// 			      SDR stage; max number of retries should be configurable
 
-	err = s.sc.GenerateSDR(ctx, taskID, storiface.FTCache, sref, ticket, dealData.CommD)
+	err = s.sc.GenerateSDR(ctx, taskID, storiface.FTCache, sref, ticket, dealData.CommD, ticketEpoch)
 	if err != nil {
 		return false, xerrors.Errorf("generating sdr: %w", err)
 	}
@@ -219,7 +219,7 @@ func (s *SDRTask) TypeDetails() harmonytask.TaskTypeDetails {
 			Cpu:     sdrCPUCostFromEnv(), // based on FIL_PROOFS_MULTICORE_SDR_PRODUCERS
 			Gpu:     0,
 			Ram:     (64 << 30) + (256 << 20),
-			Storage: s.sc.Storage(s.taskToSector, storiface.FTCache, storiface.FTNone, ssize, storiface.PathSealing, paths.MinFreeStoragePercentage),
+			Storage: s.sc.Storage(s.taskToSector, storiface.FTCache, storiface.FTNone, ssize, storiface.PathSealing, paths.MinFreeStoragePercentage).ForSDR(),
 		},
 		MaxFailures: 2,
 	}

@@ -48,7 +48,12 @@ type TaskStorage struct {
 	MinFreeStoragePercentage float64
 
 	Overheads map[storiface.SectorFileType]int
+	sdr       bool
 }
+
+// ForSDR requests fresh, attempt-owned scratch accounting instead of the
+// existing-file/fetch credit used by the later sealing stages.
+func (t *TaskStorage) ForSDR() *TaskStorage { t.sdr = true; return t }
 
 type ReleaseStorageFunc func() // free storage reservation
 
@@ -59,6 +64,7 @@ type StorageReservation struct {
 	PathIDs   storiface.SectorPaths
 
 	Alloc, Existing storiface.SectorFileType
+	SDR             *storagePaths.SDRReservation
 }
 
 func (sb *SealCalls) Storage(taskToSectorRef func(taskID harmonytask.TaskID) (SectorRef, error), alloc, existing storiface.SectorFileType, ssize abi.SectorSize, pathType storiface.PathType, MinFreeStoragePercentage float64) *TaskStorage {
@@ -203,7 +209,19 @@ func (t *TaskStorage) Claim(taskID int) (func() error, error) {
 		}
 
 		// reserve the space
-		release, err := t.sc.Sectors.localStore.Reserve(ctx, sectorRef.Ref(), requestedTypes, pathIDs, t.Overheads, t.MinFreeStoragePercentage)
+		var release func()
+		var sdr *storagePaths.SDRReservation
+		if t.sdr {
+			if t.existing != storiface.FTNone {
+				return nil, xerrors.New("SDR reservation cannot fetch existing files")
+			}
+			sdr, err = prepareSDRReservation(storiface.PathByType(pathsFs, t.alloc), sectorRef.Ref(), t.alloc)
+			if err == nil {
+				release, err = t.sc.Sectors.localStore.ReserveSDR(ctx, sectorRef.Ref(), requestedTypes, pathIDs, t.Overheads, t.MinFreeStoragePercentage, sdr)
+			}
+		} else {
+			release, err = t.sc.Sectors.localStore.Reserve(ctx, sectorRef.Ref(), requestedTypes, pathIDs, t.Overheads, t.MinFreeStoragePercentage)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -227,6 +245,7 @@ func (t *TaskStorage) Claim(taskID int) (func() error, error) {
 
 			Alloc:    t.alloc,
 			Existing: t.existing,
+			SDR:      sdr,
 		}
 
 		resvs = append(resvs, sres)

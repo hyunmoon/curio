@@ -143,7 +143,7 @@ func (t *TaskUnsealSdr) TypeDetails() harmonytask.TaskTypeDetails {
 			Cpu:     4, // todo multicore sdr
 			Gpu:     0,
 			Ram:     54 << 30,
-			Storage: t.sc.Storage(t.taskToSector, storiface.FTKey, storiface.FTNone, ssize, storiface.PathSealing, paths.MinFreeStoragePercentage),
+			Storage: t.sc.Storage(t.taskToSector, storiface.FTKey, storiface.FTNone, ssize, storiface.PathSealing, paths.MinFreeStoragePercentage).ForSDR(),
 		},
 		MaxFailures: 2,
 		IAmBored: passcall.Every(MinSchedInterval, func(taskFunc harmonytask.AddTaskFunc) error {

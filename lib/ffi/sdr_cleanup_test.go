@@ -78,7 +78,7 @@ func (f *sdrCleanupFixture) run(ctx context.Context, generate func(abi.Registere
 	pp, ids := storiface.SectorPaths{}, storiface.SectorPaths{}
 	storiface.SetPathByType(&pp, f.into, f.dest)
 	storiface.SetPathByType(&ids, f.into, "test-storage")
-	f.sb.Sectors.storageReservations.Store(1, []*StorageReservation{{SectorRef: SectorRef{SpID: 1000, SectorNumber: 42, RegSealProof: f.sector.ProofType}, Alloc: f.into, Paths: pp, PathIDs: ids, Release: func() {
+	f.sb.Sectors.storageReservations.Store(1, []*StorageReservation{{SDR: paths.NewSDRReservation(f.dest), SectorRef: SectorRef{SpID: 1000, SectorNumber: 42, RegSealProof: f.sector.ProofType}, Alloc: f.into, Paths: pp, PathIDs: ids, Release: func() {
 		once.Do(func() {
 			if f.onRelease != nil {
 				f.onRelease()
@@ -182,9 +182,9 @@ func TestSDRCleanupSuccessAndBoundaries(t *testing.T) {
 			require.NoError(t, err)
 			require.Empty(t, entries)
 			require.EqualValues(t, 1, f.index.declares.Load())
-			// Existing published output is preserved, including an empty cache directory.
-			require.Error(t, f.run(context.Background(), writeSDRTestLayers, os.RemoveAll))
-			require.EqualValues(t, 1, f.index.declares.Load())
+			// Known completion may be reused, but must not be regenerated.
+			require.NoError(t, f.run(context.Background(), func(abi.RegisteredSealProof, string, [32]byte) error { t.Error("native repeated"); return nil }, os.RemoveAll))
+			require.EqualValues(t, 2, f.index.declares.Load())
 			_, err = os.Stat(f.dest)
 			require.NoError(t, err)
 		})

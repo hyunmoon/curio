@@ -111,8 +111,9 @@ type path struct {
 	MaxStorage       uint64
 	personalCapacity *personalCapacityProfile
 
-	Reserved     int64
-	Reservations map[string]int64
+	Reserved        int64
+	Reservations    map[string]int64
+	SDRReservations map[*SDRReservation]int64 `json:"-"` // claim pointers are not JSON map keys
 
 	CanSeal    bool
 	AllowTypes []string
@@ -167,18 +168,6 @@ func (p *path) stat(ls LocalStorage, newReserve ...statExistingSectorForReservat
 			used = 0
 		}
 
-		// SDR writes into unique children of a per-sector scratch root. Credit
-		// those bytes as materialized reservation, even alongside legacy or
-		// published files; the caller still caps the credit at the reservation.
-		if fileType == storiface.FTCache || fileType == storiface.FTKey {
-			scratch, scratchErr := ls.DiskUsage(storiface.SDRTempRoot(sp))
-			if scratchErr == nil {
-				used += scratch
-			} else if !os.IsNotExist(scratchErr) {
-				log.Warnw("getting SDR scratch disk usage", "path", sp, "error", scratchErr)
-			}
-		}
-
 		log.Debugw("accounting existing files", "id", id, "fileType", fileType, "path", sp, "used", used, "overhead", overhead)
 		return used, nil
 	}
@@ -194,6 +183,19 @@ func (p *path) stat(ls LocalStorage, newReserve ...statExistingSectorForReservat
 			onDisk = oh
 		}
 
+		stat.Reserved -= onDisk
+	}
+	credited := map[string]bool{}
+	for r, oh := range p.SDRReservations {
+		path := r.creditPath()
+		if credited[path] {
+			continue
+		}
+		credited[path] = true
+		onDisk, err := sdrCredit(ls, path, oh)
+		if err != nil {
+			return fsutil.FsStat{}, 0, err
+		}
 		stat.Reserved -= onDisk
 	}
 	for _, reservation := range newReserve {
@@ -773,6 +775,11 @@ func (st *Local) reportStorage(ctx context.Context) {
 
 func (st *Local) Reserve(ctx context.Context, sid storiface.SectorRef, ft storiface.SectorFileType,
 	storageIDs storiface.SectorPaths, overheadTab map[storiface.SectorFileType]int, minFreePercentage float64) (userRelease func(), err error) {
+	return st.reserve(ctx, sid, ft, storageIDs, overheadTab, minFreePercentage, nil)
+}
+
+func (st *Local) reserve(ctx context.Context, sid storiface.SectorRef, ft storiface.SectorFileType,
+	storageIDs storiface.SectorPaths, overheadTab map[storiface.SectorFileType]int, minFreePercentage float64, sdr *SDRReservation) (userRelease func(), err error) {
 	ssize, err := sid.ProofType.SectorSize()
 	if err != nil {
 		return nil, err
@@ -801,7 +808,24 @@ func (st *Local) Reserve(ctx context.Context, sid storiface.SectorRef, ft storif
 
 		overhead := int64(overheadTab[fileType]) * int64(ssize) / storiface.FSOverheadDen
 
-		stat, resvOnDisk, err := p.stat(st.localStorage, statExistingSectorForReservation{sid.ID, fileType, overhead})
+		var stat fsutil.FsStat
+		var resvOnDisk int64
+		if sdr == nil {
+			stat, resvOnDisk, err = p.stat(st.localStorage, statExistingSectorForReservation{sid.ID, fileType, overhead})
+		} else {
+			stat, _, err = p.stat(st.localStorage)
+			if err == nil {
+				resvOnDisk, err = sdrCredit(st.localStorage, sdr.creditPath(), overhead)
+			}
+			for existing := range p.SDRReservations {
+				if existing == sdr {
+					return nil, xerrors.New("SDR reservation already registered")
+				}
+				if existing.creditPath() == sdr.creditPath() {
+					resvOnDisk = 0
+				}
+			}
+		}
 		if err != nil {
 			return nil, xerrors.Errorf("getting local storage stat: %w", err)
 		}
@@ -830,16 +854,30 @@ func (st *Local) Reserve(ctx context.Context, sid storiface.SectorRef, ft storif
 		log.Debugw("reserve add", "id", id, "sector", sid, "fileType", fileType, "overhead", overhead, "reserved-before", p.Reserved, "reserved-after", p.Reserved+overhead, "freepct", freePercentag)
 
 		p.Reserved += overhead
-		p.Reservations[resID.String()] = overhead
+		if sdr == nil {
+			p.Reservations[resID.String()] = overhead
+		} else {
+			if p.SDRReservations == nil {
+				p.SDRReservations = map[*SDRReservation]int64{}
+			}
+			p.SDRReservations[sdr] = overhead
+		}
 
 		old_r := release
+		var once sync.Once
 		release = func() {
-			old_r()
-			st.localLk.Lock()
-			defer st.localLk.Unlock()
-			log.Debugw("reserve release", "id", id, "sector", sid, "fileType", fileType, "overhead", overhead, "reserved-before", p.Reserved, "reserved-after", p.Reserved-overhead)
-			p.Reserved -= overhead
-			delete(p.Reservations, resID.String())
+			once.Do(func() {
+				old_r()
+				st.localLk.Lock()
+				defer st.localLk.Unlock()
+				log.Debugw("reserve release", "id", id, "sector", sid, "fileType", fileType, "overhead", overhead, "reserved-before", p.Reserved, "reserved-after", p.Reserved-overhead)
+				p.Reserved -= overhead
+				if sdr == nil {
+					delete(p.Reservations, resID.String())
+				} else {
+					delete(p.SDRReservations, sdr)
+				}
+			})
 		}
 	}
 
