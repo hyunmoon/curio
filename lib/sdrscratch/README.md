@@ -1,5 +1,12 @@
 # SDR scratch return certificates
 
+This page describes the default certificate-only mode. The optional
+**personal-only interrupted-output discard mode**, including the Linux
+launcher and explicit legacy maintenance executor, is documented in
+[PERSONAL-DISCARD.md](PERSONAL-DISCARD.md). Its stronger managed lifetime
+boundary also permits reclaiming unpublished success and crashed attempts;
+it does not change canonical output reuse or capacity profiles.
+
 Scope: new SDR cache/key attempts created by `Begin`, on local APFS (Darwin),
 ext4 or XFS (Linux). This is not a native execution tracker or sector GC.
 

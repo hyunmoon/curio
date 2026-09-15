@@ -155,12 +155,12 @@ func (l *storageProvider) AcquireSector(ctx context.Context, taskID *harmonytask
 }
 
 func (sb *SealCalls) GenerateSDR(ctx context.Context, taskID harmonytask.TaskID, into storiface.SectorFileType, sector storiface.SectorRef, ticket abi.SealRandomness, commDcid cid.Cid, ticketEpoch ...abi.ChainEpoch) error {
-	return sb.generateSDR(ctx, taskID, into, sector, ticket, commDcid, ffi.GenerateSDR, nil, nil, ticketEpoch...)
+	return sb.generateSDR(ctx, taskID, into, sector, ticket, commDcid, ffi.GenerateSDR, nil, sdrscratch.Options{}, ticketEpoch...)
 }
 
 // The injected operations keep filesystem/error interleavings testable without
 // running native proofs. Production always uses the synchronous FFI call above.
-func (sb *SealCalls) generateSDR(ctx context.Context, taskID harmonytask.TaskID, into storiface.SectorFileType, sector storiface.SectorRef, ticket abi.SealRandomness, commDcid cid.Cid, generate func(abi.RegisteredSealProof, string, [32]byte) error, beforeCleanup func(string) error, recordIO sdrscratch.RecordIO, ticketEpoch ...abi.ChainEpoch) (retErr error) {
+func (sb *SealCalls) generateSDR(ctx context.Context, taskID harmonytask.TaskID, into storiface.SectorFileType, sector storiface.SectorRef, ticket abi.SealRandomness, commDcid cid.Cid, generate func(abi.RegisteredSealProof, string, [32]byte) error, beforeCleanup func(string) error, scratchOptions sdrscratch.Options, ticketEpoch ...abi.ChainEpoch) (retErr error) {
 	if into != storiface.FTCache && into != storiface.FTKey {
 		return xerrors.Errorf("unsupported SDR output type: %s", into)
 	}
@@ -228,7 +228,7 @@ func (sb *SealCalls) generateSDR(ctx context.Context, taskID harmonytask.TaskID,
 		return xerrors.Errorf("mkdir SDR scratch root: %w", err)
 	}
 	intoTemp := reservation.Scratch
-	writer, err := sdrscratch.BeginWithRecordIO(intoTemp, recordIO)
+	writer, err := sdrscratch.BeginWithOptions(intoTemp, scratchOptions)
 	if err != nil {
 		return xerrors.Errorf("begin SDR scratch ownership: %w", err)
 	}
@@ -238,7 +238,7 @@ func (sb *SealCalls) generateSDR(ctx context.Context, taskID harmonytask.TaskID,
 		}
 	}()
 	// A panic/cancellation while native is active is not a return certificate.
-	// Successful but unpublished output must also survive a later API/I/O error.
+	// Without the personal policy successful unpublished outputs stay protected.
 	canCleanup := true // native has not been entered
 	defer func() {
 		if !canCleanup {
@@ -253,11 +253,19 @@ func (sb *SealCalls) generateSDR(ctx context.Context, taskID harmonytask.TaskID,
 		if cleanupErr == nil {
 			// The current writer directly observed return and still owns its FD
 			// and lock. A failed diagnostic write must not prevent own cleanup.
-			removed, cleanupErr = writer.ReclaimOwn()
+			if writer.DiscardInterrupted() {
+				removed, cleanupErr = writer.DiscardOwn()
+			} else {
+				removed, cleanupErr = writer.ReclaimOwn()
+			}
 		}
 		if recordErr != nil || cleanupErr != nil {
 			log.Errorw("SDR scratch return/cleanup result", "sector", sector.ID, "scratch", intoTemp,
 				"recordError", recordErr, "cleanupError", cleanupErr, "filesRemoved", removed, "operationError", retErr)
+		}
+		if writer.DiscardInterrupted() {
+			m := writer.Measurement()
+			log.Infow("SDR private discard observation", "scratch", intoTemp, "filesRemoved", removed, "allocatedBytes", m.AllocatedBytes, "freeBefore", m.FreeBefore, "freeAfter", m.FreeAfter, "cleanupError", cleanupErr)
 		}
 		if recordErr != nil {
 			retErr = errors.Join(retErr, xerrors.Errorf("recording SDR attempt return %s: %w", intoTemp, recordErr))
@@ -279,6 +287,10 @@ func (sb *SealCalls) generateSDR(ctx context.Context, taskID harmonytask.TaskID,
 		canCleanup = true // synchronous error return, not loss of ownership
 		return xerrors.Errorf("generating SDR %d (%s): %w", sector.ID.Number, intoTemp, err)
 	}
+	// In personal mode a synchronous success is also termination evidence.
+	// If publication fails, discard this private staging inode, never a renamed
+	// canonical inode. Returned rechecks the pathname/FD identity before cleanup.
+	canCleanup = writer.DiscardInterrupted()
 
 	onlyLastLayer := into == storiface.FTKey
 	if onlyLastLayer {

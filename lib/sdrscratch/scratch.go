@@ -29,13 +29,17 @@ type record struct {
 	Device    uint64
 	Inode     uint64
 	State     string
+	Run       *ManagedRun `json:",omitempty"`
 }
 
 type Result struct {
-	Path         string
-	Status       string
-	Reason       string
-	FilesRemoved int
+	Path           string
+	Status         string
+	Reason         string
+	FilesRemoved   int
+	AllocatedBytes uint64
+	FreeBefore     uint64
+	FreeAfter      uint64
 }
 
 // Writer owns a locked directory inode, not a replaceable lock file. Close
@@ -47,6 +51,9 @@ type Writer struct {
 	// Process-local authority, never reconstructed from a free lock or metadata.
 	returnedHere bool
 	recordIO     RecordIO
+	boundary     Boundary
+	basePath     string
+	measurement  Result
 }
 
 // RecordIO is the narrow persistence boundary for writer diagnostics. Nil uses
@@ -151,10 +158,28 @@ func Begin(path string) (*Writer, error) {
 // BeginWithRecordIO has the same ownership contract as Begin, with per-writer
 // persistence operations for deterministic I/O failure testing.
 func BeginWithRecordIO(path string, recordIO RecordIO) (*Writer, error) {
+	return BeginWithOptions(path, Options{RecordIO: recordIO})
+}
+
+func BeginWithOptions(path string, options Options) (*Writer, error) {
 	if !validName(filepath.Base(path)) || !strings.HasSuffix(filepath.Dir(path), ".sdr.tmp") {
 		return nil, fmt.Errorf("invalid SDR scratch name")
 	}
 	basePath := filepath.Dir(filepath.Dir(path))
+	boundary, err := configuredBoundary(options.Boundary)
+	if err != nil {
+		return nil, err
+	}
+	var run *ManagedRun
+	if boundary != nil {
+		run, err = boundary.Current(basePath)
+		if err != nil {
+			return nil, fmt.Errorf("managed SDR entry: %w", err)
+		}
+		if run == nil {
+			return nil, fmt.Errorf("managed SDR entry missing identity")
+		}
+	}
 	base, err := openDir(basePath)
 	if err != nil {
 		return nil, err
@@ -166,7 +191,7 @@ func BeginWithRecordIO(path string, recordIO RecordIO) (*Writer, error) {
 	if err := lock(base); err != nil {
 		return nil, fmt.Errorf("SDR scratch scan/creation busy: %w", err)
 	}
-	if _, err := sweepLocked(base, basePath, true); err != nil {
+	if _, err := sweepLockedWithBoundary(base, basePath, true, boundary); err != nil {
 		return nil, err
 	}
 	rootName := filepath.Base(filepath.Dir(path))
@@ -189,7 +214,10 @@ func BeginWithRecordIO(path string, recordIO RecordIO) (*Writer, error) {
 	if err != nil {
 		return nil, err
 	}
-	w := &Writer{dir: dir, path: path, recordIO: recordIO, r: record{Version: 1, Name: name, Root: rootName, State: "active"}}
+	w := &Writer{dir: dir, path: path, boundary: boundary, basePath: basePath, recordIO: options.RecordIO, r: record{Version: 1, Name: name, Root: rootName, State: "active", Run: run}}
+	if run != nil {
+		w.r.Version = 2
+	}
 	if err = lock(dir); err == nil {
 		w.r.Device, w.r.Inode, err = identity(dir)
 	}
@@ -239,17 +267,46 @@ func sameDevice(a, b *os.File) error {
 	return sameMount(a, b)
 }
 
+func privateFile(dir *os.File, name string) (unix.Stat_t, error) {
+	var st unix.Stat_t
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return st, err
+	}
+	f := os.NewFile(uintptr(fd), name)
+	defer func() { _ = f.Close() }()
+	if err = unix.Fstat(fd, &st); err != nil {
+		return st, err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 {
+		return st, fmt.Errorf("not a private regular file: %s", name)
+	}
+	if err = sameDevice(dir, f); err != nil {
+		return st, err
+	}
+	return st, nil
+}
+
 func (w *Writer) Close() error {
 	w.returnedHere = false
 	return w.dir.Close()
 }
 
-// Returned must be called only after a synchronous native ERROR return (or a
-// failure before entering native), or after a key was successfully published.
+// Returned is called after a synchronous native ERROR return/pre-native failure
+// or key publication. Managed discard also calls it after a successful native
+// return followed by publication failure, while the inode is still in scratch.
 // Never call it merely because context/ownership/heartbeat was lost.
 // A persistence error does not erase this writer's directly observed return.
 // Its lock and pinned FD must remain continuously held until cleanup finishes.
 func (w *Writer) Returned() error {
+	if err := w.checkPath(); err != nil {
+		return err
+	}
+	w.returnedHere = true
+	return w.save("returned")
+}
+
+func (w *Writer) checkPath() error {
 	current, err := openDir(w.path)
 	if err != nil {
 		return err
@@ -269,8 +326,7 @@ func (w *Writer) Returned() error {
 	if dev != w.r.Device || ino != w.r.Inode {
 		return fmt.Errorf("writer descriptor identity changed; preserve scratch")
 	}
-	w.returnedHere = true
-	return w.save("returned")
+	return nil
 }
 
 // ReclaimOwn uses only this writer's observed return, while its original pinned
@@ -297,12 +353,18 @@ func (w *Writer) reclaim(unlink func(int, string, int) error) (int, error) {
 }
 
 func (w *Writer) reclaimFiles(unlink func(int, string, int) error) (int, error) {
-	b, err := get(w.dir, completionAttribute)
-	if err != nil {
-		return 0, fmt.Errorf("unknown completion marker: %w", err)
-	}
-	if string(b) != "incomplete" {
-		return 0, fmt.Errorf("completed or unknown output preserved")
+	return w.reclaimFilesMode(unlink, false)
+}
+
+func (w *Writer) reclaimFilesMode(unlink func(int, string, int) error, discard bool) (int, error) {
+	if !discard {
+		b, err := get(w.dir, completionAttribute)
+		if err != nil {
+			return 0, fmt.Errorf("unknown completion marker: %w", err)
+		}
+		if string(b) != "incomplete" {
+			return 0, fmt.Errorf("completed or unknown output preserved")
+		}
 	}
 	if _, err := w.dir.Seek(0, 0); err != nil {
 		return 0, err
@@ -312,13 +374,29 @@ func (w *Writer) reclaimFiles(unlink func(int, string, int) error) (int, error) 
 		return 0, err
 	}
 	// Validate the entire flat directory before deleting any file.
+	var allocated uint64
+	var files []openIdentity
 	for _, e := range entries {
-		var st unix.Stat_t
-		if err := unix.Fstatat(int(w.dir.Fd()), e.Name(), &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		st, err := privateFile(w.dir, e.Name())
+		if err != nil {
 			return 0, err
 		}
 		if st.Mode&unix.S_IFMT != unix.S_IFREG || uint64(st.Dev) != w.r.Device || st.Nlink != 1 {
 			return 0, fmt.Errorf("non-private regular scratch file: %s", e.Name())
+		}
+		allocated += uint64(st.Blocks) * 512
+		files = append(files, openIdentity{uint64(st.Dev), st.Ino})
+	}
+	w.measurement.AllocatedBytes = allocated
+	w.measurement.FreeBefore, err = freeBytes(w.dir)
+	if err != nil {
+		return 0, err
+	}
+	var accounting *ManagedConfig
+	if b, ok := w.boundary.(interface{ accounting() *ManagedConfig }); discard && ok && allocated > 0 {
+		accounting = b.accounting()
+		if _, err = accounting.spaceStart(w.basePath, w.r.Device, w.r.Inode, w.measurement.FreeBefore+allocated, files); err != nil {
+			return 0, err
 		}
 	}
 	n := 0
@@ -331,8 +409,19 @@ func (w *Writer) reclaimFiles(unlink func(int, string, int) error) (int, error) 
 	if err := w.dir.Sync(); err != nil {
 		return n, err
 	}
+	w.measurement.FreeAfter, err = freeBytes(w.dir)
+	if err != nil {
+		return n, err
+	}
+	if accounting != nil {
+		if err = accounting.checkSpace(w.basePath); err != nil {
+			return n, err
+		}
+	}
 	return n, w.save("reclaimed")
 }
+
+func (w *Writer) Measurement() Result { return w.measurement }
 
 // Sweep scans one local cache/key directory. Unknown/active/completed entries
 // remain needs_review/live. Errors reclaiming certified remnants are returned
@@ -349,6 +438,24 @@ func Check(basePath string) error {
 }
 
 func scan(basePath string, reclaim bool) ([]Result, error) {
+	boundary, err := configuredBoundary(nil)
+	if err != nil {
+		return nil, err
+	}
+	return scanWithBoundary(basePath, reclaim, boundary)
+}
+
+// SweepWithBoundary exposes the same scanner to deterministic lifetime tests.
+func SweepWithBoundary(basePath string, reclaim bool, boundary Boundary) ([]Result, error) {
+	return scanWithBoundary(basePath, reclaim, boundary)
+}
+
+func scanWithBoundary(basePath string, reclaim bool, boundary Boundary) ([]Result, error) {
+	if b, ok := boundary.(interface{ checkBase(string) error }); ok {
+		if err := b.checkBase(basePath); err != nil {
+			return nil, err
+		}
+	}
 	base, err := openDir(basePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -363,10 +470,14 @@ func scan(basePath string, reclaim bool) ([]Result, error) {
 	if err := lock(base); err != nil {
 		return nil, fmt.Errorf("SDR scratch scan/creation busy: %w", err)
 	}
-	return sweepLocked(base, basePath, reclaim)
+	r, e := sweepLockedWithBoundary(base, basePath, reclaim, boundary)
+	if b, ok := boundary.(interface{ checkSpace(string) error }); ok {
+		e = errors.Join(e, b.checkSpace(basePath))
+	}
+	return r, e
 }
 
-func sweepLocked(base *os.File, basePath string, reclaim bool) ([]Result, error) {
+func sweepLockedWithBoundary(base *os.File, basePath string, reclaim bool, boundary Boundary) ([]Result, error) {
 	entries, err := base.ReadDir(-1)
 	if err != nil {
 		return nil, err
@@ -375,6 +486,21 @@ func sweepLocked(base *os.File, basePath string, reclaim bool) ([]Result, error)
 	var failures error
 	for _, e := range entries {
 		if !strings.HasSuffix(e.Name(), ".sdr.tmp") {
+			if boundary != nil && legacyRoot.MatchString(e.Name()) {
+				f, e2 := openDirAt(int(base.Fd()), e.Name())
+				if e2 != nil {
+					return results, e2
+				}
+				safeEmpty := maintenanceEmpty(f)
+				_, e2 = f.ReadDir(-1)
+				_ = f.Close()
+				if e2 != nil {
+					return results, e2
+				}
+				if !safeEmpty {
+					failures = errors.Join(failures, fmt.Errorf("legacy_requires_maintenance: %s", filepath.Join(basePath, e.Name())))
+				}
+			}
 			continue
 		}
 		root, err := openDirAt(int(base.Fd()), e.Name())
@@ -392,7 +518,10 @@ func sweepLocked(base *os.File, basePath string, reclaim bool) ([]Result, error)
 		}
 		for _, c := range children {
 			path := filepath.Join(basePath, e.Name(), c.Name())
-			r, err := inspect(root, c.Name(), reclaim)
+			r, err := inspectWithBoundary(root, c.Name(), reclaim, basePath, boundary)
+			if boundary != nil && r.Status == "needs_review" {
+				err = errors.Join(err, fmt.Errorf("legacy_requires_maintenance: %s", r.Reason))
+			}
 			r.Path = path
 			results = append(results, r)
 			if err != nil {
@@ -404,9 +533,26 @@ func sweepLocked(base *os.File, basePath string, reclaim bool) ([]Result, error)
 	return results, failures
 }
 
-func inspect(root *os.File, name string, reclaim bool) (Result, error) {
+func inspectWithBoundary(root *os.File, name string, reclaim bool, basePath string, boundary Boundary) (Result, error) {
 	r := Result{Status: "needs_review"}
 	if !validName(name) {
+		if boundary != nil && oldAttempt.MatchString(name) {
+			f, e := openDirAt(int(root.Fd()), name)
+			if e != nil {
+				return r, e
+			}
+			defer func() { _ = f.Close() }()
+			if e = sameDevice(root, f); e != nil {
+				return r, e
+			}
+			if e = lock(f); e != nil {
+				return r, e
+			}
+			if maintenanceEmpty(f) {
+				r.Status = "empty_legacy_tombstone"
+				return r, nil
+			}
+		}
 		r.Reason = "nonparticipating/legacy format"
 		return r, nil
 	}
@@ -428,7 +574,11 @@ func inspect(root *os.File, name string, reclaim bool) (Result, error) {
 		}
 		return r, err
 	}
-	w := &Writer{dir: dir}
+	if boundary != nil && maintenanceEmpty(dir) {
+		r.Status = "empty_legacy_tombstone"
+		return r, nil
+	}
+	w := &Writer{dir: dir, boundary: boundary, basePath: basePath}
 	b, err := get(dir, attribute)
 	if err != nil {
 		r.Reason = "missing writer metadata"
@@ -452,8 +602,42 @@ func inspect(root *os.File, name string, reclaim bool) (Result, error) {
 	if err != nil {
 		return r, err
 	}
-	if w.r.Version != 1 || w.r.Name != name || w.r.Root != root.Name() || w.r.RootInode != rootInode || w.r.Device != dev || w.r.Inode != ino {
+	if (w.r.Version != 1 && w.r.Version != 2) || (w.r.Version == 2) != (w.r.Run != nil) || w.r.Name != name || w.r.Root != root.Name() || w.r.RootInode != rootInode || w.r.Device != dev || w.r.Inode != ino {
 		r.Reason = "writer identity mismatch"
+		return r, nil
+	}
+	if w.r.Run != nil && w.r.State != "reclaimed" {
+		if w.r.State != "active" && w.r.State != "returned" {
+			return r, fmt.Errorf("unknown managed state")
+		}
+		if boundary == nil {
+			return r, fmt.Errorf("managed scratch requires its discard domain")
+		}
+		// Even returned certificates are validated against the enrolled domain.
+		stopped, err := boundary.Stopped(basePath, *w.r.Run)
+		if err != nil {
+			r.Reason = err.Error()
+			return r, err
+		}
+		if !stopped && w.r.State != "returned" {
+			r.Status = "termination_required"
+			r.Reason = "native process subtree is still populated"
+			return r, fmt.Errorf("%s", r.Reason)
+		}
+		if !reclaim {
+			r.Status = "cleanup_pending"
+			return r, fmt.Errorf("managed SDR discard pending")
+		}
+		r.FilesRemoved, err = w.reclaimFilesMode(unix.Unlinkat, true)
+		r.AllocatedBytes = w.measurement.AllocatedBytes
+		r.FreeBefore = w.measurement.FreeBefore
+		r.FreeAfter = w.measurement.FreeAfter
+		if err != nil {
+			r.Status = "cleanup_failed"
+			r.Reason = err.Error()
+			return r, err
+		}
+		r.Status = "reclaimed"
 		return r, nil
 	}
 	switch w.r.State {

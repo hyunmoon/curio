@@ -60,6 +60,7 @@ type sdrCleanupFixture struct {
 	releases  atomic.Int32
 	onRelease func()
 	recordIO  sdrscratch.RecordIO
+	boundary  sdrscratch.Boundary
 }
 
 func newSDRCleanupFixture(t *testing.T, into storiface.SectorFileType, dest string) *sdrCleanupFixture {
@@ -88,7 +89,7 @@ func (f *sdrCleanupFixture) run(ctx context.Context, generate func(abi.Registere
 			f.releases.Add(1)
 		})
 	}}})
-	return f.sb.generateSDR(ctx, 1, f.into, f.sector, make([]byte, 32), f.commD, generate, cleanup, f.recordIO)
+	return f.sb.generateSDR(ctx, 1, f.into, f.sector, make([]byte, 32), f.commD, generate, cleanup, sdrscratch.Options{RecordIO: f.recordIO, Boundary: f.boundary})
 }
 
 func writeSDRTestLayers(p abi.RegisteredSealProof, dir string, _ [32]byte) error {

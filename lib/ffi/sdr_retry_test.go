@@ -14,6 +14,7 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 
 	"github.com/filecoin-project/curio/lib/proofpaths"
+	"github.com/filecoin-project/curio/lib/sdrscratch"
 	"github.com/filecoin-project/curio/lib/storiface"
 )
 
@@ -66,7 +67,7 @@ func TestSDRPublishedInputMismatch(t *testing.T) {
 					require.NoError(t, os.Truncate(p, 0))
 				}
 				calls := 0
-				err := f.sb.generateSDR(context.Background(), 1, ft, sector, ticket, d, func(abi.RegisteredSealProof, string, [32]byte) error { calls++; return nil }, nil, nil)
+				err := f.sb.generateSDR(context.Background(), 1, ft, sector, ticket, d, func(abi.RegisteredSealProof, string, [32]byte) error { calls++; return nil }, nil, sdrscratch.Options{})
 				require.Error(t, err)
 				require.Zero(t, calls)
 			})
