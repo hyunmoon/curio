@@ -23,6 +23,7 @@ func (st *Local) PrepareSDRScratch() {
 		if err := sdrscratch.RegisterPersonalStorage(local, string(id)); err != nil {
 			log.Errorw("Personal SDR root registration retry failed", "path", local, "error", err)
 		}
+		st.autoDiscardSDR(local)
 		st.sweepSDRScratch(local)
 	}
 }

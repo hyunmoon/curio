@@ -369,6 +369,7 @@ func (st *Local) openPath(ctx context.Context, p string, declare bool) (storifac
 		if err := sdrscratch.RegisterPersonalStorage(p, string(meta.ID)); err != nil {
 			log.Errorw("Personal SDR root registration failed; SDR entry blocked for this root", "path", p, "error", err)
 		}
+		st.autoDiscardSDR(p)
 		st.sweepSDRScratch(p)
 	}
 	st.localLk.Lock()
@@ -639,6 +640,20 @@ func (st *Local) Redeclare(ctx context.Context, filterId *storiface.ID, dropMiss
 }
 
 func (st *Local) declareSectors(ctx context.Context, p string, id storiface.ID, primary, dropMissing bool) error {
+	managed := false
+	if on, err := sdrscratch.PersonalCleanupEnabled(); err != nil {
+		return err
+	} else if on {
+		var meta storiface.LocalStorageMeta
+		b, err := os.ReadFile(filepath.Join(p, MetaFile))
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(b, &meta); err != nil {
+			return err
+		}
+		managed = meta.CanSeal
+	}
 	indexed := map[storiface.Decl]struct{}{}
 	if dropMissing {
 		decls, err := st.index.StorageList(ctx, id)
@@ -681,6 +696,21 @@ func (st *Local) declareSectors(ctx context.Context, p string, id storiface.ID, 
 			if !ok {
 				log.Warnw("skipping unreadable storage entry", "path", p, "type", t, "name", ent.Name(), "info", info)
 				continue
+			}
+			if managed && (t == storiface.FTCache || t == storiface.FTKey) {
+				i, ok := st.index.(interface {
+					sdrExternallyReady(context.Context, abi.SectorID, storiface.SectorFileType) (bool, error)
+				})
+				if !ok {
+					return xerrors.New("managed cache readiness provider absent")
+				}
+				ready, err := i.sdrExternallyReady(ctx, sid, t)
+				if err != nil {
+					return err // no destructive declaration reconciliation on uncertainty
+				}
+				if !ready {
+					continue // do not advertise a pre-SDR canonical directory
+				}
 			}
 
 			delete(indexed, storiface.Decl{

@@ -1,11 +1,14 @@
 package sdrscratch
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
 	"golang.org/x/sys/unix"
 )
+
+func missingAttribute(err error) bool { return errors.Is(err, unix.ENODATA) }
 
 func supportedFS(f *os.File) error {
 	var st unix.Statfs_t

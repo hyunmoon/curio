@@ -191,7 +191,11 @@ func BeginWithOptions(path string, options Options) (*Writer, error) {
 	if err := lock(base); err != nil {
 		return nil, fmt.Errorf("SDR scratch scan/creation busy: %w", err)
 	}
-	if _, err := sweepLockedWithBoundary(base, basePath, true, boundary); err != nil {
+	sector := ""
+	if on, _ := PersonalCleanupEnabled(); on {
+		sector = strings.TrimSuffix(filepath.Base(filepath.Dir(path)), ".sdr.tmp")
+	}
+	if _, err := sweepSectorLocked(base, basePath, true, boundary, sector); err != nil {
 		return nil, err
 	}
 	rootName := filepath.Base(filepath.Dir(path))
@@ -437,6 +441,28 @@ func Check(basePath string) error {
 	return err
 }
 
+// CheckSector isolates legacy uncertainty to the requested sector. Physical
+// usage of retained files is still charged by Local; no reservation credit is
+// granted for another attempt. Root/mount/accounting errors remain fatal.
+func CheckSector(basePath, sector string) error {
+	on, err := PersonalCleanupEnabled()
+	if err != nil {
+		return err
+	}
+	if !on {
+		return Check(basePath)
+	}
+	if !canonicalSector.MatchString(sector) {
+		return fmt.Errorf("invalid SDR sector")
+	}
+	boundary, err := configuredBoundary(nil, basePath)
+	if err != nil {
+		return err
+	}
+	_, err = scanSectorWithBoundary(basePath, false, boundary, sector)
+	return err
+}
+
 func scan(basePath string, reclaim bool) ([]Result, error) {
 	boundary, err := configuredBoundary(nil, basePath)
 	if err != nil {
@@ -451,6 +477,10 @@ func SweepWithBoundary(basePath string, reclaim bool, boundary Boundary) ([]Resu
 }
 
 func scanWithBoundary(basePath string, reclaim bool, boundary Boundary) ([]Result, error) {
+	return scanSectorWithBoundary(basePath, reclaim, boundary, "")
+}
+
+func scanSectorWithBoundary(basePath string, reclaim bool, boundary Boundary, sector string) ([]Result, error) {
 	if b, ok := boundary.(interface{ checkBase(string) error }); ok {
 		if err := b.checkBase(basePath); err != nil {
 			if errors.Is(err, errRegisteredBaseMissing) {
@@ -476,7 +506,13 @@ func scanWithBoundary(basePath string, reclaim bool, boundary Boundary) ([]Resul
 	if err := lock(base); err != nil {
 		return nil, fmt.Errorf("SDR scratch scan/creation busy: %w", err)
 	}
-	r, e := sweepLockedWithBoundary(base, basePath, reclaim, boundary)
+	var r []Result
+	var e error
+	if sector == "" {
+		r, e = sweepLockedWithBoundary(base, basePath, reclaim, boundary)
+	} else {
+		r, e = sweepSectorLocked(base, basePath, reclaim, boundary, sector)
+	}
 	if b, ok := boundary.(interface{ checkSpace(string) error }); ok {
 		e = errors.Join(e, b.checkSpace(basePath))
 	}
@@ -484,6 +520,10 @@ func scanWithBoundary(basePath string, reclaim bool, boundary Boundary) ([]Resul
 }
 
 func sweepLockedWithBoundary(base *os.File, basePath string, reclaim bool, boundary Boundary) ([]Result, error) {
+	return sweepSectorLocked(base, basePath, reclaim, boundary, "")
+}
+
+func sweepSectorLocked(base *os.File, basePath string, reclaim bool, boundary Boundary, sector string) ([]Result, error) {
 	entries, err := base.ReadDir(-1)
 	if err != nil {
 		return nil, err
@@ -491,6 +531,9 @@ func sweepLockedWithBoundary(base *os.File, basePath string, reclaim bool, bound
 	var results []Result
 	var failures error
 	for _, e := range entries {
+		if sector != "" && e.Name() != sector+".tmp" && e.Name() != sector+".sdr.tmp" {
+			continue
+		}
 		if !strings.HasSuffix(e.Name(), ".sdr.tmp") {
 			if boundary != nil && legacyRoot.MatchString(e.Name()) {
 				f, e2 := openDirAt(int(base.Fd()), e.Name())

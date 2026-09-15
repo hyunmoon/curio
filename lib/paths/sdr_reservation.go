@@ -63,7 +63,7 @@ func (st *Local) ReserveSDR(ctx context.Context, sid storiface.SectorRef, ft sto
 	}
 	st.localLk.RUnlock()
 	if local != "" {
-		if err := sdrscratch.Check(filepath.Join(local, ft.String())); err != nil {
+		if err := sdrscratch.CheckSector(filepath.Join(local, ft.String()), storiface.SectorName(sid.ID)); err != nil {
 			return nil, fmt.Errorf("SDR scratch cleanup before reservation: %w", err)
 		}
 	}

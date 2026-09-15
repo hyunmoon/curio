@@ -146,6 +146,9 @@ func startPersonalAt(registered []string, state string) (*personalSession, error
 		}
 		return nil
 	}}
+	if err = publishAutoCapability(s, group, current); err != nil {
+		return nil, fmt.Errorf("publish automatic sector-access capability: %w", err)
+	}
 	ok = true
 	fmt.Fprintf(os.Stderr, "Personal SDR cleanup: same-process managed lifetime=%s state=%s; local CanSeal roots will be registered independently; observed accessor membership is not a complete inventory\n", current, state)
 	return s, nil

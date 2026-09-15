@@ -22,6 +22,7 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 
 	"github.com/filecoin-project/curio/lib/partialfile"
+	"github.com/filecoin-project/curio/lib/sdrscratch"
 	storiface "github.com/filecoin-project/curio/lib/storiface"
 
 	"github.com/filecoin-project/lotus/storage/sealer/fsutil"
@@ -203,6 +204,11 @@ func (r *Remote) AcquireSector(ctx context.Context, s storiface.SectorRef, exist
 		log.Debugw("Fetching sector data with existing reservation", "sector", s, "toFetch", toFetch, "fetchPaths", fetchPaths, "fetchIDs", fetchIDs)
 	}
 
+	accessRelease, err := sdrscratch.AccessPaths(fetchPaths.Cache, fetchPaths.Key)
+	if err != nil {
+		return storiface.SectorPaths{}, storiface.SectorPaths{}, err
+	}
+	defer accessRelease()
 	for _, fileType := range toFetch.AllSet() {
 		dest := storiface.PathByType(fetchPaths, fileType)
 		storageID := storiface.PathByType(fetchIDs, fileType)

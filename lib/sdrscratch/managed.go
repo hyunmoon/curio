@@ -382,7 +382,7 @@ func (c *ManagedConfig) spaceStart(base string, dev, ino uint64, target string, 
 
 func publishSpace(d *os.File, state, base string, dev, ino uint64, target string, files []openIdentity, read func(string, any) error) (string, error) {
 	name := fmt.Sprintf("%s%d-%d.json", spacePrefix(base), dev, ino)
-	if !validRelative(filepath.Join(filepath.Base(base), target)) {
+	if !validAccountingTarget(base, target) {
 		return "", fmt.Errorf("invalid witness target")
 	}
 	w := spaceWitness{Base: base, Device: dev, Files: files, Target: target}
@@ -514,7 +514,7 @@ func (c *ManagedConfig) checkSpaceWith(base string, access spaceAccess) error {
 func witnessEmpty(base *os.File, w spaceWitness, ino uint64) error {
 	var targets []string
 	if w.Target != "" {
-		if !validRelative(filepath.Join(filepath.Base(w.Base), w.Target)) {
+		if !validAccountingTarget(w.Base, w.Target) {
 			return fmt.Errorf("invalid witness target")
 		}
 		targets = []string{w.Target}
@@ -568,4 +568,8 @@ func witnessEmpty(base *os.File, w spaceWitness, ino uint64) error {
 		}
 	}
 	return fmt.Errorf("space_unconfirmed: original scratch tombstone missing or replaced")
+}
+
+func validAccountingTarget(base, target string) bool {
+	return validRelative(filepath.Join(filepath.Base(base), target)) || (filepath.Base(base) == "cache" && canonicalSector.MatchString(target))
 }

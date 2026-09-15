@@ -2,6 +2,7 @@ package paths
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 
 	"github.com/filecoin-project/curio/lib/partialfile"
+	"github.com/filecoin-project/curio/lib/sdrscratch"
 	"github.com/filecoin-project/curio/lib/storiface"
 	"github.com/filecoin-project/curio/lib/tarutil"
 )
@@ -132,6 +134,22 @@ func (handler *FetchHandler) remoteGetSector(w http.ResponseWriter, r *http.Requ
 		log.Error("acquired path was empty")
 		w.WriteHeader(500)
 		return
+	}
+	accessRelease, err := sdrscratch.AccessPaths(path)
+	if err != nil {
+		log.Warnw("remote sector access deferred", "sector", id, "error", err)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	defer accessRelease()
+	if local, ok := handler.Local.(interface {
+		SDRExternalRead(context.Context, string, abi.SectorID, storiface.SectorFileType) error
+	}); ok {
+		if err := local.SDRExternalRead(r.Context(), path, id, ft); err != nil {
+			log.Warnw("unready managed cache fetch refused", "sector", id, "error", err)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 	}
 
 	stat, err := os.Stat(path)
