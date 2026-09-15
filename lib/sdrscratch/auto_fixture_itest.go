@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/uuid"
@@ -17,6 +18,30 @@ import (
 )
 
 var AutoFixtureActive = false
+
+type autoFixtureUnlinkFailure struct {
+	remaining atomic.Int32
+	hit       atomic.Bool
+}
+
+var autoFixtureFailure atomic.Pointer[autoFixtureUnlinkFailure]
+
+// Test-only one-shot filesystem fault; actual successful unlink calls remain real.
+func AutoFixtureFailUnlinkAfter(t *testing.T, successes int32) *atomic.Bool {
+	f := &autoFixtureUnlinkFailure{}
+	f.remaining.Store(successes + 1)
+	old := autoFixtureFailure.Swap(f)
+	t.Cleanup(func() { autoFixtureFailure.Store(old) })
+	return &f.hit
+}
+
+func autoFixtureUnlink(fd int, name string, flags int) error {
+	if f := autoFixtureFailure.Load(); f != nil && f.remaining.Add(-1) == 0 {
+		f.hit.Store(true)
+		return unix.EIO
+	}
+	return unix.Unlinkat(fd, name, flags)
+}
 
 // Referenced by the Go overlay, not normal builds. Keeping a reference here
 // lets static analysis check the adapter without enabling it at runtime.
@@ -79,6 +104,6 @@ func autoFixtureRuntimeIO(c *ManagedConfig) autoIO {
 			defer func() { _ = d.Close() }()
 			return publishSpace(d, c.StateDir, base, dev, ino, target, files, autoFixtureRead)
 		},
-		func(base string) error { return c.checkSpaceWith(base, a) }, unix.Unlinkat,
+		func(base string) error { return c.checkSpaceWith(base, a) }, autoFixtureUnlink,
 		func(c *ManagedConfig) (Boundary, error) { return autoFixtureBoundary{c}, nil }}
 }

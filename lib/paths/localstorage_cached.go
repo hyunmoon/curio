@@ -2,6 +2,8 @@ package paths
 
 import (
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,6 +50,26 @@ type diskUsageEntry struct {
 type diskUsageResult struct {
 	usage int64
 	time  time.Time
+}
+
+// Drop pre-cleanup measurements, including detached in-flight DU promises.
+// Preserve the last usage as a conservative fallback if the fresh DU is slow.
+func (c *cachedLocalStorage) invalidate(root string) {
+	c.statLk.Lock()
+	defer c.statLk.Unlock()
+	within := func(p string) bool { return p == root || strings.HasPrefix(p, root+string(filepath.Separator)) }
+	for _, p := range c.stats.Keys() {
+		if within(p) {
+			c.stats.Remove(p)
+		}
+	}
+	for _, p := range c.pathDUs.Keys() {
+		if within(p) {
+			if old, ok := c.pathDUs.Peek(p); ok {
+				c.pathDUs.Add(p, &diskUsageEntry{last: diskUsageResult{usage: old.last.usage}})
+			}
+		}
+	}
 }
 
 func (c *cachedLocalStorage) GetStorage() (storiface.StorageConfig, error) {

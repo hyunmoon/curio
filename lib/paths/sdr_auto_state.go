@@ -95,28 +95,57 @@ func (dbi *DBIndex) withSDRDiscardState(ctx context.Context, t sdrscratch.AutoTa
 	return err
 }
 
-func (st *Local) autoDiscardSDR(local string) {
+func (st *Local) autoDiscardSDR(ctx context.Context, local string, root *sdrCleanupRoot, verbose bool) (changed bool) {
 	on, err := sdrscratch.PersonalCleanupEnabled()
 	if err != nil || !on {
 		return
 	}
 	db, ok := st.index.(sdrDiscardState)
 	if !ok {
-		log.Errorw("SDR automatic adoption unavailable", "reason", "pipeline state provider absent")
+		if verbose {
+			log.Errorw("SDR automatic adoption unavailable", "reason", "pipeline state provider absent")
+		}
 		return
 	}
+	now := time.Now()
+	for key, until := range root.protectedUntil {
+		if !now.Before(until) {
+			delete(root.protectedUntil, key)
+		}
+	}
 	for _, ft := range []storiface.SectorFileType{storiface.FTCache, storiface.FTKey} {
+		if ctx.Err() != nil {
+			break
+		}
 		base := filepath.Join(local, ft.String())
-		results, err := sdrscratch.AutoDiscard(base, func(t sdrscratch.AutoTarget, fn func(sdrscratch.AutoStage) error) error {
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		results, err := sdrscratch.AutoDiscardContext(ctx, base, func(t sdrscratch.AutoTarget, fn func(sdrscratch.AutoStage) error) error {
+			key := filepath.Join(t.Base, t.Relative)
+			if now.Before(root.protectedUntil[key]) {
+				return fn(sdrscratch.AutoStage{Reason: "recent protected pipeline state; deferred recheck"})
+			}
+			ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()
-			return db.withSDRDiscardState(ctx, t, fn)
+			return db.withSDRDiscardState(ctx, t, func(s sdrscratch.AutoStage) error {
+				if !s.Allowed && s.Reason == "SDR/later stage completed" {
+					if root.protectedUntil == nil {
+						root.protectedUntil = map[string]time.Time{}
+					}
+					if len(root.protectedUntil) < 100000 {
+						root.protectedUntil[key] = now.Add(sdrCleanupProtectedTTL)
+					}
+				}
+				return fn(s)
+			})
 		})
 		for _, r := range results {
-			log.Infow("SDR automatic adoption", "path", r.Path, "status", r.Status, "reason", r.Reason, "filesRemoved", r.FilesRemoved, "allocatedBytes", r.AllocatedBytes, "freeBefore", r.FreeBefore, "freeAfter", r.FreeAfter)
+			changed = changed || r.FilesRemoved > 0
+			if r.FilesRemoved > 0 || (verbose && r.Status != "protected") {
+				log.Infow("SDR automatic adoption", "path", r.Path, "status", r.Status, "reason", r.Reason, "filesRemoved", r.FilesRemoved, "allocatedBytes", r.AllocatedBytes, "freeBefore", r.FreeBefore, "freeAfter", r.FreeAfter)
+			}
 		}
-		if err != nil {
+		if err != nil && verbose {
 			log.Errorw("SDR root automatic adoption deferred", "type", ft, "error", err)
 		}
 	}
+	return changed
 }

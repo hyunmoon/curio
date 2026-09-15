@@ -53,8 +53,34 @@ against that root. Such a future uncooperative accessor cannot be fenced by
 advisory locks or a process census. Curio does not stop services for this
 transition. With participating services, ordinary simultaneous/sequential
 starts and one-service restarts use the same gates; legacy cleanup retries on
-normal preparation. No path list or manual preview/apply is required for
+normal preparation and independently during the Local lifecycle. No path list or manual preview/apply is required for
 provably incomplete legacy data.
+
+## Admission-independent retry
+
+After storage opens successfully, the existing option also enables a 30-second
+Local-context timer over currently registered `CanSeal` roots. No task, Claim,
+available CPU/slot, uncordon, or pacing admission is required. Capacity checks
+do not run cleanup. Startup, preparation and timer passes use one nonblocking
+in-process root guard; different roots run independently. A root still busy at
+a tick is skipped, not queued into unbounded concurrent scans.
+
+Each pass has a two-minute context budget and each pipeline observation retains
+its 15-second timeout. Shutdown stops new passes and new targets; an unlink
+already in progress finishes the existing witness/accounting protocol. These
+deadlines do not forcibly interrupt a blocked filesystem syscall. Partial or
+transient failures are reevaluated next tick. Completed-stage denials alone are
+cached for up to five minutes (bounded entries); cached state can only refuse
+removal, never authorize it. Filesystem gates, live state and termination
+evidence are required again before any removal. Routine deferral diagnostics
+are rate-limited to once per root per 15 minutes; actual unlinks are logged.
+
+After any unlink, including partial cleanup, the root's cached Stat/DU readings
+are expired and fresh health is reported to the allocation index. Old in-flight
+DU results cannot overwrite the refresh; a slow DU retains the previous usage
+as a conservative fallback. Health reporting errors still use the normal
+heartbeat retry. Deletion does not imply that all space is available: the
+existing open-inode/accounting checks still gate reservation.
 
 This contract requires host-visible procfs/cgroup v2, root, existing
 `Type=simple`, `Delegate=yes`, `KillMode=control-group`, `SendSIGKILL=yes`, and
@@ -98,6 +124,17 @@ database caller fixture connects real Local startup/preparation/reservation,
 real PostgreSQL migration/schema queries and `generateSDR` publication/reuse.
 Its native body and Linux host-lifetime evidence are explicitly substituted.
 That is not native proofs, Linux cgroup/XFS, or production execution.
+
+The retry fixture opens a real Local with pinned directories, then releases the
+startup blocker without invoking Claim. Real temporary file usage and the
+existing MaxStorage quota keep HasCapacity false until removal and index-health
+refresh. It then checks ordinary Claim/reservation separately. Short timer and
+OS-evidence overlays are test-only. Lifecycle fixtures cover transient state
+errors, per-root overlap/isolation, partial unlink, denial caching and shutdown.
+The review archive records an existing race in TaskStorage.Claim's captured
+context variable; that unchanged path is not fixed here. Normal Claim passed;
+the R1-only race run excludes just that post-recovery Claim subtest. Neither a
+narrow PASS nor a compile substitutes for a full connected/native race PASS.
 
 Build-tagged caller fixtures require `sdr_auto_itest,sdr_retry_itest` and the
 review archive's explicit Go overlay. They fail closed without it. Normal

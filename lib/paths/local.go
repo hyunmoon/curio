@@ -85,7 +85,9 @@ type Local struct {
 
 	paths map[storiface.ID]*path
 
-	localLk sync.RWMutex
+	localLk         sync.RWMutex
+	sdrCleanupCtx   context.Context
+	sdrCleanupRoots sync.Map // canonical local path -> *sdrCleanupRoot
 }
 
 type sectorFile struct {
@@ -328,6 +330,7 @@ func NewLocal(ctx context.Context, ls LocalStorage, index SectorIndex, url strin
 		log.Warnw("Personal virtual storage accounting enabled", "profile", profile.name, "virtualCapacity", profile.capacity)
 	}
 	l := &Local{
+		sdrCleanupCtx:    ctx,
 		localStorage:     newCachedLocalStorage(ls),
 		index:            index,
 		personalCapacity: profile,
@@ -366,11 +369,7 @@ func (st *Local) openPath(ctx context.Context, p string, declare bool) (storifac
 	// Reclamation performs local filesystem I/O, never under localLk. Failure
 	// is visible and retried by ReserveSDR; other storage/task roles still open.
 	if meta.CanSeal {
-		if err := sdrscratch.RegisterPersonalStorage(p, string(meta.ID)); err != nil {
-			log.Errorw("Personal SDR root registration failed; SDR entry blocked for this root", "path", p, "error", err)
-		}
-		st.autoDiscardSDR(p)
-		st.sweepSDRScratch(p)
+		st.prepareSDRRoot(ctx, p, meta.ID, false)
 	}
 	st.localLk.Lock()
 	defer st.localLk.Unlock()
@@ -546,6 +545,9 @@ func (st *Local) open(ctx context.Context) error {
 	go st.reportHealth(ctx)
 
 	go st.startPeriodicRedeclare(ctx)
+	if on, err := sdrscratch.PersonalCleanupEnabled(); err == nil && on {
+		go st.retrySDRCleanup(ctx)
+	}
 
 	return nil
 }

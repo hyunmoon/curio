@@ -1,6 +1,7 @@
 package sdrscratch
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +37,12 @@ type AutoState func(AutoTarget, func(AutoStage) error) error
 // Private old attempts and demonstrably incomplete canonical cache are checked
 // per sector. A rejected target does not become a root-wide admission veto.
 func AutoDiscard(base string, state AutoState) ([]Result, error) {
+	return AutoDiscardContext(context.Background(), base, state)
+}
+
+// Cancellation stops between targets; an in-flight unlink retains the existing
+// durable journal/checkSpace protocol. It is never abandoned mid-protocol.
+func AutoDiscardContext(ctx context.Context, base string, state AutoState) ([]Result, error) {
 	on, err := PersonalCleanupEnabled()
 	if err != nil || !on {
 		return nil, err
@@ -48,7 +55,7 @@ func AutoDiscard(base string, state AutoState) ([]Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	return autoDiscard(c, base, state, autoIO{autoParticipants, trustedDir, c.spaceStart, c.checkSpace, unix.Unlinkat, platformBoundary})
+	return autoDiscardContext(ctx, c, base, state, autoIO{autoParticipants, trustedDir, c.spaceStart, c.checkSpace, unix.Unlinkat, platformBoundary})
 }
 
 type autoIO struct {
@@ -96,6 +103,13 @@ func autoTargets(base string, f *os.File) ([]AutoTarget, error) {
 }
 
 func autoDiscard(c *ManagedConfig, base string, state AutoState, io autoIO) ([]Result, error) {
+	return autoDiscardContext(context.Background(), c, base, state, io)
+}
+
+func autoDiscardContext(ctx context.Context, c *ManagedConfig, base string, state AutoState, io autoIO) ([]Result, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if state == nil {
 		return nil, fmt.Errorf("pipeline state provider absent")
 	}
@@ -113,6 +127,9 @@ func autoDiscard(c *ManagedConfig, base string, state AutoState, io autoIO) ([]R
 	}
 	var out []Result
 	for _, t := range targets {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
 		t.StorageID = c.Storage[0].ID
 		r := Result{Path: filepath.Join(base, t.Relative), Status: "deferred"}
 		if t.observationError != nil {
