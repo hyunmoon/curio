@@ -82,9 +82,12 @@ func CaptureManagedConfig(state string, roots, units []string) (*ManagedConfig, 
 	return c, nil
 }
 
-type linuxBoundary struct{ c *ManagedConfig }
+type linuxBoundary struct {
+	c       *ManagedConfig
+	leaseFD int
+}
 
-func platformBoundary(c *ManagedConfig) (Boundary, error) { return &linuxBoundary{c}, nil }
+func platformBoundary(c *ManagedConfig) (Boundary, error) { return &linuxBoundary{c: c}, nil }
 
 func hostBoot() (string, string, error) {
 	h, err := os.ReadFile("/etc/machine-id")
@@ -224,6 +227,9 @@ func (b *linuxBoundary) Current(base string) (*ManagedRun, error) {
 	// The launcher passes an already-locked domain lease into the worker. It
 	// remains open for the entire process. This is exclusion, NOT termination.
 	fd, err := strconv.Atoi(os.Getenv("CURIO_SDR_DOMAIN_LEASE_FD"))
+	if b.leaseFD >= 3 {
+		fd, err = b.leaseFD, nil
+	}
 	if err != nil || fd < 3 {
 		return nil, fmt.Errorf("managed launcher lease missing")
 	}
@@ -285,7 +291,7 @@ func (b *linuxBoundary) Stopped(base string, r ManagedRun) (bool, error) {
 func unitProperties(unit string) (map[string]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	b, err := exec.CommandContext(ctx, "systemctl", "show", unit, "--property=ActiveState,SubState,UnitFileState,ControlGroup,Delegate,KillMode,SendSIGKILL").CombinedOutput()
+	b, err := exec.CommandContext(ctx, "systemctl", "show", unit, "--property=ActiveState,SubState,UnitFileState,ControlGroup,Delegate,KillMode,SendSIGKILL,Type").CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("systemctl show %s: %w", unit, err)
 	}
@@ -302,6 +308,9 @@ func unitProperties(unit string) (map[string]string, error) {
 // MaintenanceGuard checks every explicitly inventoried accessor. The inventory
 // must be complete and storage local; no PID, task or SQL inference is used.
 func MaintenanceGuard(c *ManagedConfig) error {
+	if c.Automatic {
+		return fmt.Errorf("explicit complete accessor inventory required for legacy maintenance")
+	}
 	h, _, err := hostBoot()
 	if err != nil {
 		return err

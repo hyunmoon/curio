@@ -54,6 +54,8 @@ class ClusterTasks extends LitElement {
     return css`
       :host {
         display: block;
+        min-width: 0;
+        max-width: 100%;
       }
 
       .controls {
@@ -193,7 +195,7 @@ class ClusterTasks extends LitElement {
       table {
         width: 100%;
         min-width: 36rem;
-        table-layout: fixed;
+        table-layout: auto;
       }
 
       th,

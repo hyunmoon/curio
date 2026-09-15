@@ -24,6 +24,7 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 
 	"github.com/filecoin-project/curio/lib/contextlock"
+	"github.com/filecoin-project/curio/lib/sdrscratch"
 	"github.com/filecoin-project/curio/lib/storiface"
 
 	"github.com/filecoin-project/lotus/storage/sealer/fsutil"
@@ -365,6 +366,9 @@ func (st *Local) openPath(ctx context.Context, p string, declare bool) (storifac
 	// Reclamation performs local filesystem I/O, never under localLk. Failure
 	// is visible and retried by ReserveSDR; other storage/task roles still open.
 	if meta.CanSeal {
+		if err := sdrscratch.RegisterPersonalStorage(p, string(meta.ID)); err != nil {
+			log.Errorw("Personal SDR root registration failed; SDR entry blocked for this root", "path", p, "error", err)
+		}
 		st.sweepSDRScratch(p)
 	}
 	st.localLk.Lock()

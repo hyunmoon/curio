@@ -12,14 +12,17 @@ import (
 // paths and unrelated task types are not globally disabled.
 func (st *Local) PrepareSDRScratch() {
 	st.localLk.RLock()
-	var locals []string
-	for _, p := range st.paths {
+	locals := map[string]storiface.ID{}
+	for id, p := range st.paths {
 		if p.CanSeal {
-			locals = append(locals, p.Local)
+			locals[p.Local] = id
 		}
 	}
 	st.localLk.RUnlock()
-	for _, local := range locals {
+	for local, id := range locals {
+		if err := sdrscratch.RegisterPersonalStorage(local, string(id)); err != nil {
+			log.Errorw("Personal SDR root registration retry failed", "path", local, "error", err)
+		}
 		st.sweepSDRScratch(local)
 	}
 }

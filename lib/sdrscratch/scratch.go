@@ -166,7 +166,7 @@ func BeginWithOptions(path string, options Options) (*Writer, error) {
 		return nil, fmt.Errorf("invalid SDR scratch name")
 	}
 	basePath := filepath.Dir(filepath.Dir(path))
-	boundary, err := configuredBoundary(options.Boundary)
+	boundary, err := configuredBoundary(options.Boundary, basePath)
 	if err != nil {
 		return nil, err
 	}
@@ -438,7 +438,7 @@ func Check(basePath string) error {
 }
 
 func scan(basePath string, reclaim bool) ([]Result, error) {
-	boundary, err := configuredBoundary(nil)
+	boundary, err := configuredBoundary(nil, basePath)
 	if err != nil {
 		return nil, err
 	}
@@ -453,6 +453,12 @@ func SweepWithBoundary(basePath string, reclaim bool, boundary Boundary) ([]Resu
 func scanWithBoundary(basePath string, reclaim bool, boundary Boundary) ([]Result, error) {
 	if b, ok := boundary.(interface{ checkBase(string) error }); ok {
 		if err := b.checkBase(basePath); err != nil {
+			if errors.Is(err, errRegisteredBaseMissing) {
+				if accounting, ok := boundary.(interface{ checkSpace(string) error }); ok {
+					return nil, accounting.checkSpace(basePath)
+				}
+				return nil, nil
+			}
 			return nil, err
 		}
 	}

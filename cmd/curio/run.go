@@ -81,6 +81,11 @@ var runCmd = &cli.Command{
 		}()
 		// Close the app level shutdown handler
 		cmdShutdownChan <- struct{}{}
+		if cctx.Command.Name == "run" && !cctx.Bool("db-readonly") {
+			if err := startPersonalSDRCleanup(cctx.String(deps.FlagRepoPath)); err != nil {
+				return err
+			}
+		}
 
 		if !cctx.Bool("enable-gpu-proving") {
 			err := os.Setenv("BELLMAN_NO_GPU", "true")

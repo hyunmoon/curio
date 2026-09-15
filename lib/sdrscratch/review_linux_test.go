@@ -307,7 +307,7 @@ func TestManagedLinuxReviewConnected(t *testing.T) {
 	require.NoError(t, f.Close())
 	var record record
 	require.NoError(t, json.Unmarshal(data, &record))
-	boundary := &linuxBoundary{c}
+	boundary := &linuxBoundary{c: c}
 	require.NotNil(t, record.Run)
 	require.Eventually(t, func() bool { stopped, e := boundary.Stopped(base, *record.Run); return e == nil && stopped }, 12*time.Second, 25*time.Millisecond)
 	require.NoError(t, unix.Kill(pid, unix.SIGCONT))

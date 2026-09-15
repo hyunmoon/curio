@@ -53,6 +53,8 @@ type ManagedConfig struct {
 	StateDir     string
 	Storage      []ManagedStorage
 	Units        []ManagedUnit
+	// Automatic membership is observation, not a complete maintenance inventory.
+	Automatic bool `json:",omitempty"`
 }
 
 func decodeStrict(b []byte, v any) error {
@@ -97,6 +99,7 @@ func readPrivateJSON(path string, v any) error {
 }
 
 var unitName = regexp.MustCompile(`^[A-Za-z0-9_.@-]+\.service$`)
+var errRegisteredBaseMissing = errors.New("registered cache/key directory absent")
 
 func LoadManagedConfig(path string) (*ManagedConfig, error) {
 	var c ManagedConfig
@@ -196,6 +199,9 @@ func (c *ManagedConfig) pinStorageBaseWith(base string, edge func(*os.File, *os.
 		}
 		child, err := openDirAt(int(root.Fd()), filepath.Base(base))
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("%w: %v", errRegisteredBaseMissing, err)
+			}
 			return nil, err
 		}
 		if err = edge(root, child); err != nil {
@@ -242,9 +248,16 @@ func pinRelative(base *os.File, relative string) (*os.File, error) {
 	return parent, nil
 }
 
-func configuredBoundary(injected Boundary) (Boundary, error) {
+func configuredBoundary(injected Boundary, base string) (Boundary, error) {
 	if injected != nil {
 		return injected, nil
+	}
+	on, err := PersonalCleanupEnabled()
+	if err != nil {
+		return nil, err
+	}
+	if on {
+		return personalBoundary(base)
 	}
 	p := os.Getenv(PersonalPolicyEnv)
 	if p == "" {

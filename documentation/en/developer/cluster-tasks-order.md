@@ -77,6 +77,28 @@ service. Browser results and SQL results must be reported separately.
 
 ## Application boundary
 
+### Owner width and drawer sizing
+
+The two Cluster Tasks drawer call sites opt into `cluster-tasks-drawer` sizing;
+other drawers are unchanged. Desktop panels allow up to 64rem. The overlay keeps
+viewport margins; below 1100px, the Overview push panel becomes an overlay rather
+than being squeezed beside the navigation sidebar. Horizontal overflow belongs
+to each section's table wrapper, not the page or dialog. Automatic table layout
+allows long hostname/IPv6 owners to contribute their intrinsic width; no address
+or node link is shortened, rewritten or substituted.
+
+`web/test/cluster-tasks-owner-browser.mjs` loads the real Drawer, navigation shell,
+both call-site HTML structures, bootstrap/main/dark CSS and local Inter fonts.
+All HTTP and WebSocket calls are intercepted offline. It checks computed styles,
+link/cell/wrapper bounding boxes, scroll reach, controls/close-button bounds,
+all four sections and coalescing at 1280, 640 and 390px. Set the existing browser
+environment variables plus `CLUSTER_OWNER_OUTPUT` (an output directory). Optional
+`CLUSTER_BASELINE` serves a Git tree and expects the desktop visibility assertion
+to fail; it does not call a screenshot alone a regression result. This fixture
+does not load unrelated pipeline components or connect to any actual backend.
+
+### Deployment scope
+
 Only the WebRPC service and its static UI need this change. No worker,
 scheduler, attempt writer/CAS, SDR, pacing, scratch, schema or index change is
 included. Static files use the existing embedded `http.ServeContent` path;

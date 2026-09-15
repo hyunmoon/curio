@@ -294,6 +294,38 @@ Drawer.styles = [
       max-height: 50vh;
       border: 1px solid var(--color-border-default);
     }
+
+    /* Cluster Tasks needs room for all columns; long owners scroll in its table. */
+    :host(.cluster-tasks-drawer:not([push])) dialog[anchor="right"] {
+      width: min(64rem, calc(100vw - 2rem));
+      max-width: calc(100vw - 2rem);
+      right: 1rem;
+      overflow-x: hidden;
+    }
+
+    :host(.cluster-tasks-drawer[push][isOpen]) {
+      width: 64rem;
+      max-width: calc(100% - 1.5rem);
+    }
+
+    :host(.cluster-tasks-drawer[push]) dialog {
+      overflow-x: hidden;
+    }
+
+    @media (max-width: 1100px) {
+      :host(.cluster-tasks-drawer[push][isOpen]) {
+        width: 0;
+        max-width: 0;
+      }
+
+      :host(.cluster-tasks-drawer[push]) dialog[anchor="right"] {
+        position: fixed;
+        inset: 0 1rem 0 auto;
+        width: calc(100vw - 2rem);
+        max-width: calc(100vw - 2rem);
+        border: 1px solid var(--color-border-default);
+      }
+    }
   `
 ]
 

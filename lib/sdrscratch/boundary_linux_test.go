@@ -82,7 +82,7 @@ func TestManagedLinuxKernelCrashAndChild(t *testing.T) {
 	dev, ino, err := identity(g)
 	require.NoError(t, err)
 	r := ManagedRun{c.Domain, h, boot, parent + "/" + name, dev, ino}
-	b := &linuxBoundary{c}
+	b := &linuxBoundary{c: c}
 	p := filepath.Join(base, "s-t01000-42.sdr.tmp", Prefix+uuid.NewString())
 	encoded, err := json.Marshal(r)
 	require.NoError(t, err)

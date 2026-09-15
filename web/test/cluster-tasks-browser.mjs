@@ -32,6 +32,13 @@ try {
   const errors=[],calls=[],held=[];
   page.on('pageerror',e=>errors.push(e.message));
   await page.clock.install({time:new Date('2026-09-16T04:00:00Z')});
+  await page.routeWebSocket('**/*',ws=>{
+    assert.equal(new URL(ws.url()).host,'cluster.invalid');
+    ws.onMessage(raw=>{
+      const req=JSON.parse(raw);assert.equal(req.method,'CurioWeb.Version');
+      ws.send(JSON.stringify({jsonrpc:'2.0',id:req.id,result:'offline fixture'}));
+    });
+  });
   let hold=false;
   await page.route('**/*',async route=>{
     const u=new URL(route.request().url());
