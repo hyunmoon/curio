@@ -123,6 +123,10 @@ type path struct {
 	lastSinfo     *storiface.StorageInfo
 }
 
+func (p *path) activeReservations() int {
+	return len(p.Reservations) + len(p.SDRReservations)
+}
+
 // statExistingSectorForReservation is optional parameter for stat method
 // which will make it take into account existing sectors when calculating
 // available space for new reservations
@@ -223,7 +227,7 @@ func (p *path) stat(ls LocalStorage, newReserve ...statExistingSectorForReservat
 	}
 
 	if stat.Reserved < 0 {
-		log.Warnw("negative reserved storage", "reserved", stat.Reserved, "origResv", p.Reserved, "newReserveOnDisk", newReserveOnDisk, "reservations", p.Reservations)
+		log.Warnw("negative reserved storage", "reserved", stat.Reserved, "origResv", p.Reserved, "newReserveOnDisk", newReserveOnDisk, "reservations", p.Reservations, "sdrReservations", len(p.SDRReservations))
 		stat.Reserved = 0
 	}
 
@@ -257,7 +261,7 @@ func (p *path) stat(ls LocalStorage, newReserve ...statExistingSectorForReservat
 	}
 
 	if time.Since(start) > 5*time.Second {
-		log.Warnw("slow storage stat", "took", time.Since(start), "reservations", len(p.Reservations))
+		log.Warnw("slow storage stat", "took", time.Since(start), "reservations", p.activeReservations())
 	}
 
 	return stat, newReserveOnDisk, err
@@ -1034,10 +1038,6 @@ func (st *Local) AcquireSector(ctx context.Context, sid storiface.SectorRef, exi
 			return true
 		})
 
-		activeReservations := lo.Map(sis, func(si storiface.StorageInfo, _ int) int {
-			return len(st.paths[si.ID].Reservations)
-		})
-
 		var best string
 		var bestID storiface.ID
 
@@ -1045,7 +1045,7 @@ func (st *Local) AcquireSector(ctx context.Context, sid storiface.SectorRef, exi
 		// we use stable sort to preferentially sort it by write workload also
 		// least active storage first
 		sort.SliceStable(sis, func(i, j int) bool {
-			return activeReservations[i] < activeReservations[j]
+			return st.paths[sis[i].ID].activeReservations() < st.paths[sis[j].ID].activeReservations()
 		})
 
 		for _, si := range sis {
