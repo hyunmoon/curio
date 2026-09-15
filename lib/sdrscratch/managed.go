@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -147,41 +148,98 @@ func (c *ManagedConfig) validate() error {
 }
 
 func (c *ManagedConfig) checkStorage(base string) error {
+	f, err := c.pinStorageBase(base)
+	if err == nil {
+		_ = f.Close()
+	}
+	return err
+}
+
+func (c *ManagedConfig) pinStorageBase(base string) (*os.File, error) {
+	return c.pinStorageBaseWith(base, sameDevice)
+}
+
+// The returned FD is the verified child of the enrolled root, not a second
+// pathname lookup. Keep this FD through scanning/creation/legacy traversal.
+func (c *ManagedConfig) pinStorageBaseWith(base string, edge func(*os.File, *os.File) error) (*os.File, error) {
 	for _, s := range c.Storage {
 		if base != filepath.Join(s.Root, "cache") && base != filepath.Join(s.Root, "key") {
 			continue
 		}
 		root, err := openDir(s.Root)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		defer func() { _ = root.Close() }()
 		dev, ino, err := identity(root)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if dev != s.Device || ino != s.Inode {
-			return fmt.Errorf("storage root identity changed")
+			return nil, fmt.Errorf("storage root identity changed")
 		}
 		if err := supportedFS(root); err != nil {
-			return err
+			return nil, err
 		}
 		fd, err := unix.Openat(int(root.Fd()), "sectorstore.json", unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		f := os.NewFile(uintptr(fd), "sectorstore.json")
 		defer func() { _ = f.Close() }()
 		var meta struct{ ID string }
 		if err := json.NewDecoder(io.LimitReader(f, 65536)).Decode(&meta); err != nil {
-			return err
+			return nil, err
 		}
 		if meta.ID != s.ID {
-			return fmt.Errorf("storage ID changed")
+			return nil, fmt.Errorf("storage ID changed")
 		}
-		return nil
+		child, err := openDirAt(int(root.Fd()), filepath.Base(base))
+		if err != nil {
+			return nil, err
+		}
+		if err = edge(root, child); err != nil {
+			_ = child.Close()
+			return nil, err
+		}
+		return child, nil
 	}
-	return fmt.Errorf("storage not enrolled in personal discard domain")
+	return nil, fmt.Errorf("storage not enrolled in personal discard domain")
+}
+
+func pinBoundaryBase(boundary Boundary, base string) (*os.File, error) {
+	if b, ok := boundary.(interface {
+		pinBase(string) (*os.File, error)
+	}); ok {
+		return b.pinBase(base)
+	}
+	return openDir(base)
+}
+
+// Traverse each component from an already pinned base, validating mount IDs
+// as well as devices. Neither a bind mount nor a mount-back can be skipped.
+func pinRelative(base *os.File, relative string) (*os.File, error) {
+	if relative == "." || filepath.IsAbs(relative) || filepath.Clean(relative) != relative || strings.HasPrefix(relative, "..") {
+		return nil, fmt.Errorf("invalid relative scratch path")
+	}
+	parent := base
+	for _, name := range strings.Split(relative, string(os.PathSeparator)) {
+		child, err := openDirAt(int(parent.Fd()), name)
+		if err == nil {
+			err = sameDevice(parent, child)
+		}
+		if parent != base {
+			_ = parent.Close()
+		}
+		if err != nil {
+			if child != nil {
+				_ = child.Close()
+			}
+			return nil, err
+		}
+		parent = child
+	}
+	return parent, nil
 }
 
 func configuredBoundary(injected Boundary) (Boundary, error) {
@@ -281,9 +339,12 @@ func AcquireDomain(c *ManagedConfig, exclusive bool) (*os.File, error) {
 }
 
 type spaceWitness struct {
-	Base                string
+	Base string
+	// MinimumFree is accepted only for reading old witnesses. It is not an
+	// admission floor: concurrent writers make that old measurement obsolete.
 	Device, MinimumFree uint64
 	Files               []openIdentity
+	Target              string `json:",omitempty"`
 }
 type openIdentity struct{ Device, Inode uint64 }
 
@@ -295,39 +356,69 @@ func freeBytes(f *os.File) (uint64, error) {
 	return uint64(st.Bavail) * uint64(st.Bsize), nil
 }
 
-// The watermark is a conservative admission guard, not attributable disk
-// recovery accounting: unrelated writers may change filesystem free space.
-func (c *ManagedConfig) spaceStart(base string, dev, ino, minimum uint64, files []openIdentity) (string, error) {
+func spacePrefix(base string) string { return fmt.Sprintf("space-%x-", sha256.Sum256([]byte(base))) }
+
+func (c *ManagedConfig) spaceStart(base string, dev, ino uint64, target string, files []openIdentity) (string, error) {
 	d, err := trustedDir(c.StateDir)
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = d.Close() }()
-	name := fmt.Sprintf("space-%x-%d-%d.json", sha256.Sum256([]byte(base)), dev, ino)
-	b, err := json.Marshal(spaceWitness{base, dev, minimum, files})
+	return publishSpace(d, c.StateDir, base, dev, ino, target, files, readPrivateJSON)
+}
+
+func publishSpace(d *os.File, state, base string, dev, ino uint64, target string, files []openIdentity, read func(string, any) error) (string, error) {
+	name := fmt.Sprintf("%s%d-%d.json", spacePrefix(base), dev, ino)
+	if !validRelative(filepath.Join(filepath.Base(base), target)) {
+		return "", fmt.Errorf("invalid witness target")
+	}
+	w := spaceWitness{Base: base, Device: dev, Files: files, Target: target}
+	b, err := json.Marshal(w)
 	if err != nil {
 		return "", err
 	}
-	fd, err := unix.Openat(int(d.Fd()), name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
-	if errors.Is(err, unix.EEXIST) {
-		var w spaceWitness
-		if e := readPrivateJSON(filepath.Join(c.StateDir, name), &w); e != nil {
-			return "", e
-		}
-		if w.Base != base || w.Device != dev {
-			return "", fmt.Errorf("space witness mismatch")
-		}
-		return name, nil
-	}
+	// Pending files cannot authorize unlink. A crash before the atomic rename
+	// leaves scratch intact; a subsequent scanner publishes a fresh complete
+	// witness. Orphan pending files are diagnostics, never parsed as witnesses.
+	temp := ".space-pending-" + uuid.NewString()
+	fd, err := unix.Openat(int(d.Fd()), temp, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
 	if err != nil {
 		return "", fmt.Errorf("unresolved cleanup accounting: %w", err)
 	}
-	f := os.NewFile(uintptr(fd), name)
+	defer func() { _ = unix.Unlinkat(int(d.Fd()), temp, 0) }()
+	f := os.NewFile(uintptr(fd), temp)
 	_, err = f.Write(b)
 	if err == nil {
 		err = f.Sync()
 	}
 	_ = f.Close()
+	if err == nil {
+		err = publishNoReplace(d, temp, name)
+	}
+	if errors.Is(err, unix.EEXIST) {
+		var existing spaceWitness
+		if e := read(filepath.Join(state, name), &existing); e != nil {
+			return "", e
+		}
+		if existing.Base != base || existing.Device != dev || (existing.Target != "" && existing.Target != target) {
+			return "", fmt.Errorf("space witness mismatch")
+		}
+		// On partial cleanup retain ALL original inodes, including already
+		// unlinked files which may still have open descriptors. No new files.
+		for _, key := range files {
+			found := false
+			for _, old := range existing.Files {
+				if old == key {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return "", fmt.Errorf("space witness file identity changed")
+			}
+		}
+		err = nil
+	}
 	if err == nil {
 		err = d.Sync()
 	}
@@ -335,7 +426,20 @@ func (c *ManagedConfig) spaceStart(base string, dev, ino, minimum uint64, files 
 }
 
 func (c *ManagedConfig) checkSpace(base string) error {
-	d, err := trustedDir(c.StateDir)
+	return c.checkSpaceWith(base, spaceAccess{trustedDir, readPrivateJSON, platformOpenFiles, freeBytes})
+}
+
+// Only OS evidence boundaries are injectable; production always uses the
+// root-owned state directory and the host-wide Linux descriptor inspection.
+type spaceAccess struct {
+	dir  func(string) (*os.File, error)
+	read func(string, any) error
+	open func([]openIdentity) (bool, error)
+	free func(*os.File) (uint64, error)
+}
+
+func (c *ManagedConfig) checkSpaceWith(base string, access spaceAccess) error {
+	d, err := access.dir(c.StateDir)
 	if err != nil {
 		return err
 	}
@@ -345,43 +449,43 @@ func (c *ManagedConfig) checkSpace(base string) error {
 		return err
 	}
 	for _, e := range es {
-		if !strings.HasPrefix(e.Name(), "space-") {
+		if !strings.HasPrefix(e.Name(), spacePrefix(base)) {
 			continue
 		}
 		var w spaceWitness
-		if err = readPrivateJSON(filepath.Join(c.StateDir, e.Name()), &w); err != nil {
+		if err = access.read(filepath.Join(c.StateDir, e.Name()), &w); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			} // another scanner completed it
 			return err
 		}
-		if w.Base != base {
-			continue
+		parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(e.Name(), spacePrefix(base)), ".json"), "-")
+		if len(parts) != 2 || !strings.HasSuffix(e.Name(), ".json") {
+			return fmt.Errorf("invalid witness name")
 		}
-		open, openErr := platformOpenFiles(w.Files)
+		dev, de := strconv.ParseUint(parts[0], 10, 64)
+		ino, ie := strconv.ParseUint(parts[1], 10, 64)
+		if w.Base != base || de != nil || ie != nil || w.Device != dev || ino == 0 {
+			return fmt.Errorf("space witness identity mismatch")
+		}
+		open, openErr := access.open(w.Files)
 		if openErr != nil {
 			return openErr
 		}
 		if open {
 			return fmt.Errorf("space_unconfirmed: deleted scratch still has an open descriptor; no further SDR admission")
 		}
-		f, err := openDir(base)
+		f, err := c.pinStorageBase(base)
 		if err != nil {
 			return err
 		}
-		dev, _, err := identity(f)
-		free, se := freeBytes(f)
+		err = witnessEmpty(f, w, ino)
+		_, statErr := access.free(f) // observation health only, not historical admission policy
 		_ = f.Close()
-		if err != nil {
-			return err
+		if err != nil || statErr != nil {
+			return errors.Join(err, statErr)
 		}
-		if se != nil {
-			return se
-		}
-		if dev != w.Device {
-			return fmt.Errorf("space witness device changed")
-		}
-		if free < w.MinimumFree {
-			return fmt.Errorf("space_unconfirmed: %s free=%d required=%d; no further SDR admission", base, free, w.MinimumFree)
-		}
-		if err = unix.Unlinkat(int(d.Fd()), e.Name(), 0); err != nil {
+		if err = unix.Unlinkat(int(d.Fd()), e.Name(), 0); err != nil && !errors.Is(err, unix.ENOENT) {
 			return err
 		}
 		if err = d.Sync(); err != nil {
@@ -389,4 +493,66 @@ func (c *ManagedConfig) checkSpace(base string) error {
 		}
 	}
 	return nil
+}
+
+// Empty tombstones are retained by both cleanup paths. Their inode is encoded
+// in the witness name. Old witnesses lacked a target path; locate that exact
+// inode only in allowed scratch namespaces, never canonical outputs.
+func witnessEmpty(base *os.File, w spaceWitness, ino uint64) error {
+	var targets []string
+	if w.Target != "" {
+		if !validRelative(filepath.Join(filepath.Base(w.Base), w.Target)) {
+			return fmt.Errorf("invalid witness target")
+		}
+		targets = []string{w.Target}
+	} else {
+		es, err := base.ReadDir(-1)
+		if err != nil {
+			return err
+		}
+		for _, e := range es {
+			if legacyRoot.MatchString(e.Name()) {
+				targets = append(targets, e.Name())
+			}
+			if sectorRoot.MatchString(e.Name()) {
+				r, err := pinRelative(base, e.Name())
+				if err != nil {
+					return err
+				}
+				children, err := r.ReadDir(-1)
+				_ = r.Close()
+				if err != nil {
+					return err
+				}
+				for _, child := range children {
+					if validName(child.Name()) || oldAttempt.MatchString(child.Name()) {
+						targets = append(targets, filepath.Join(e.Name(), child.Name()))
+					}
+				}
+			}
+		}
+	}
+	for _, target := range targets {
+		f, err := pinRelative(base, target)
+		if err != nil {
+			return err
+		}
+		dev, id, err := identity(f)
+		if err == nil && dev == w.Device && id == ino {
+			es, e := f.ReadDir(-1)
+			_ = f.Close()
+			if e != nil {
+				return e
+			}
+			if len(es) != 0 {
+				return fmt.Errorf("space_unconfirmed: scratch files remain")
+			}
+			return nil
+		}
+		_ = f.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("space_unconfirmed: original scratch tombstone missing or replaced")
 }

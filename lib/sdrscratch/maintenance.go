@@ -88,23 +88,16 @@ func pinLegacy(c *ManagedConfig, root, relative string) (*os.File, LegacyTarget,
 		return nil, t, fmt.Errorf("not an exact private SDR temporary namespace: %s", relative)
 	}
 	base := filepath.Join(root, strings.Split(relative, "/")[0])
-	if err := c.checkStorage(base); err != nil {
+	b, err := c.pinStorageBase(base)
+	if err != nil {
 		return nil, t, err
 	}
-	f, err := openDir(filepath.Join(root, relative))
+	f, err := pinRelative(b, strings.TrimPrefix(relative, filepath.Base(base)+"/"))
+	_ = b.Close()
 	if err != nil {
 		return nil, t, err
 	}
 	fail := func(e error) (*os.File, LegacyTarget, error) { _ = f.Close(); return nil, t, e }
-	b, err := openDir(base)
-	if err != nil {
-		return fail(err)
-	}
-	err = sameDevice(b, f)
-	_ = b.Close()
-	if err != nil {
-		return fail(err)
-	}
 	if err = lock(f); err != nil {
 		return fail(fmt.Errorf("termination_required: directory busy: %w", err))
 	}
@@ -253,13 +246,13 @@ func executeLegacy(c *ManagedConfig, p *LegacyPlan, journal string, in io.Reader
 		r := &results[i]
 		r.AllocatedBytes = allocatedFiles(t.Files)
 		r.FreeBefore, err = freeBytes(f)
-		if err == nil && account && r.AllocatedBytes > 0 {
+		if err == nil && account && len(t.Files) > 0 {
 			base := filepath.Join(t.Root, strings.Split(t.Relative, "/")[0])
 			var keys []openIdentity
 			for _, file := range t.Files {
 				keys = append(keys, openIdentity{file.Device, file.Inode})
 			}
-			_, err = c.spaceStart(base, t.Device, t.Inode, r.FreeBefore+r.AllocatedBytes, keys)
+			_, err = c.spaceStart(base, t.Device, t.Inode, strings.TrimPrefix(t.Relative, filepath.Base(base)+"/"), keys)
 		}
 		if err != nil {
 			_ = f.Close()

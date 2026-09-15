@@ -245,9 +245,10 @@ func (b *linuxBoundary) Current(base string) (*ManagedRun, error) {
 	return r, nil
 }
 
-func (b *linuxBoundary) checkBase(base string) error  { return b.c.checkStorage(base) }
-func (b *linuxBoundary) checkSpace(base string) error { return b.c.checkSpace(base) }
-func (b *linuxBoundary) accounting() *ManagedConfig   { return b.c }
+func (b *linuxBoundary) checkBase(base string) error           { return b.c.checkStorage(base) }
+func (b *linuxBoundary) pinBase(base string) (*os.File, error) { return b.c.pinStorageBase(base) }
+func (b *linuxBoundary) checkSpace(base string) error          { return b.c.checkSpace(base) }
+func (b *linuxBoundary) accounting() *ManagedConfig            { return b.c }
 
 func (b *linuxBoundary) Stopped(base string, r ManagedRun) (bool, error) {
 	if err := b.validateRun(base, r); err != nil {

@@ -72,15 +72,32 @@ Logs and journals separate removed-file count, allocated bytes (`st_blocks`),
 and filesystem free bytes before/after. Linux additionally checks open inode
 references through root-visible procfs. A durable per-attempt space witness
 outside scratch blocks admission while a handle remains, evidence cannot be
-read, or free space is below the pre-unlink-plus-allocation watermark. Later
+read, or the original scratch inode is not an empty retained tombstone. Later
 scans retry remaining files and recheck the witness; never manually delete a
 witness to force admission. A torn/unwritable journal fails closed. Return
 diagnostic I/O and this independent accounting journal are different stores.
 Loss of the latter may prevent cleanup rather than lose the admission guard.
 
-This watermark is conservative and **not attributable freed-byte accounting**:
-unrelated filesystem writes, snapshots and delayed accounting can require
-maintenance even after successful unlink. No GC marks/approval/sweep, storage
+Free-before/after are observations, **not attributable freed-byte accounting**
+or a historical admission floor. Other writers may consume space concurrently.
+Normal current-capacity/reservation checks still apply, with the unchanged
+personal virtual-capacity policy; this adds no physical-space clamp. Old
+watermark witnesses retain their file inode checks and require the original
+empty directory, located only in allowed scratch namespaces. Missing/replaced
+tombstones fail closed. Even zero-block files receive a witness.
+
+Witness filenames are scoped by the exact base-path hash before parsing; a
+corrupt record blocks its own base, not a healthy sibling. Publication uses
+file Sync, atomic no-replace rename and directory Sync before unlink. A crash
+before publication can leave `.space-pending-*` metadata, which never authorizes
+deletion and is retained for diagnosis; the still-present scratch is rescanned
+under the normal termination rules. Handled errors remove only their own
+temporary metadata. Never delete a final witness to bypass admission. Concurrent
+scanners may finish an already-cleared witness. Root, cache/key, every target
+component and files are pinned and checked on the same supported mount; a
+separate cache/key bind mount is not implicitly enrolled by its parent root.
+
+No GC marks/approval/sweep, storage
 delete API, queue changes or automatic resume/restart are introduced.
 
 ## Build and first transition (operator-only; not executed by this change)

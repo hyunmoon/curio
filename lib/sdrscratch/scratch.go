@@ -180,7 +180,7 @@ func BeginWithOptions(path string, options Options) (*Writer, error) {
 			return nil, fmt.Errorf("managed SDR entry missing identity")
 		}
 	}
-	base, err := openDir(basePath)
+	base, err := pinBoundaryBase(boundary, basePath)
 	if err != nil {
 		return nil, err
 	}
@@ -393,9 +393,9 @@ func (w *Writer) reclaimFilesMode(unlink func(int, string, int) error, discard b
 		return 0, err
 	}
 	var accounting *ManagedConfig
-	if b, ok := w.boundary.(interface{ accounting() *ManagedConfig }); discard && ok && allocated > 0 {
+	if b, ok := w.boundary.(interface{ accounting() *ManagedConfig }); discard && ok && len(files) > 0 {
 		accounting = b.accounting()
-		if _, err = accounting.spaceStart(w.basePath, w.r.Device, w.r.Inode, w.measurement.FreeBefore+allocated, files); err != nil {
+		if _, err = accounting.spaceStart(w.basePath, w.r.Device, w.r.Inode, filepath.Join(w.r.Root, w.r.Name), files); err != nil {
 			return 0, err
 		}
 	}
@@ -456,7 +456,7 @@ func scanWithBoundary(basePath string, reclaim bool, boundary Boundary) ([]Resul
 			return nil, err
 		}
 	}
-	base, err := openDir(basePath)
+	base, err := pinBoundaryBase(boundary, basePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
