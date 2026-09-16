@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -134,21 +135,32 @@ func openCgroup(path string) (*os.File, error) {
 }
 
 func readAt(dir *os.File, name string) ([]byte, error) {
+	path := filepath.Join(dir.Name(), name)
 	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open kernel record %q: %w", path, err)
 	}
 	f := os.NewFile(uintptr(fd), name)
 	defer func() { _ = f.Close() }()
-	b := make([]byte, 4097)
-	n, err := f.Read(b)
+	b, err := readKernelRecord(f)
+	if err != nil {
+		return nil, fmt.Errorf("read kernel record %q: %w", path, err)
+	}
+	return b, nil
+}
+
+// EOF terminates a record, including an empty direct-PID list. It is not
+// execution-termination evidence; callers must still validate the contents
+// and participating child cgroups. Bound the whole read, not just one Read.
+func readKernelRecord(r io.Reader) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, 4097))
 	if err != nil {
 		return nil, err
 	}
-	if n > 4096 {
+	if len(b) > 4096 {
 		return nil, fmt.Errorf("oversized kernel record")
 	}
-	return b[:n], nil
+	return b, nil
 }
 
 func populated(f *os.File) (bool, error) {
@@ -164,7 +176,7 @@ func populated(f *os.File) (bool, error) {
 			return true, nil
 		}
 	}
-	return false, fmt.Errorf("missing populated kernel evidence")
+	return false, fmt.Errorf("missing populated kernel evidence in %q", filepath.Join(f.Name(), "cgroup.events"))
 }
 
 func (b *linuxBoundary) validateRun(base string, r ManagedRun) error {

@@ -72,8 +72,9 @@ func autoParticipants(c *ManagedConfig) error {
 			continue
 		}
 		var a autoCapability
-		if err := readPrivateJSON(filepath.Join(c.StateDir, e.Name()), &a); err != nil {
-			return err
+		path := filepath.Join(c.StateDir, e.Name())
+		if err := readPrivateJSON(path, &a); err != nil {
+			return fmt.Errorf("auto cleanup capability %q: %w", path, err)
 		}
 		if a.Version != 1 || a.Run.Host != h || a.Run.Domain != c.Domain {
 			return fmt.Errorf("invalid automatic access capability")
