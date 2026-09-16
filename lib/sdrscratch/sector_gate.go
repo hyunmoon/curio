@@ -1,15 +1,53 @@
 package sdrscratch
 
 import (
+	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+// ErrAccessBusy identifies lock contention only, not identity/permission errors.
+var ErrAccessBusy = errors.New("sector access busy")
+
+const accessWaitLimit = 30 * time.Second
+const accessRetryInterval = 25 * time.Millisecond
+
+// AccessPathsContext waits only for transient gate contention. Every failed
+// attempt releases all partial acquisitions before waiting. Once acquired,
+// cancellation never releases the gate: the caller must finish its actual I/O.
+func AccessPathsContext(ctx context.Context, paths ...string) (func(), error) {
+	if on, err := PersonalCleanupEnabled(); err != nil || !on {
+		return func() {}, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, accessWaitLimit)
+	defer cancel()
+	var lastBusy error
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.Join(lastBusy, err)
+		}
+		release, err := AccessPaths(paths...)
+		if !errors.Is(err, ErrAccessBusy) {
+			return release, err
+		}
+		lastBusy = err
+		timer := time.NewTimer(accessRetryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("waiting for sector access: %w", errors.Join(ErrAccessBusy, ctx.Err()))
+		case <-timer.C:
+		}
+	}
+}
 
 // AccessPaths must span actual file access, not just path selection or context
 // ownership. Cancellation does not release it; callers close it after native IO
@@ -100,6 +138,9 @@ func sectorGate(c *ManagedConfig, sector string, exclusive bool, open func(strin
 	}
 	if err == nil {
 		err = unix.Flock(fd, mode|unix.LOCK_NB)
+		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+			err = fmt.Errorf("%w: %w", ErrAccessBusy, err)
+		}
 	}
 	if err != nil {
 		_ = f.Close()

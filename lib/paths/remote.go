@@ -204,7 +204,7 @@ func (r *Remote) AcquireSector(ctx context.Context, s storiface.SectorRef, exist
 		log.Debugw("Fetching sector data with existing reservation", "sector", s, "toFetch", toFetch, "fetchPaths", fetchPaths, "fetchIDs", fetchIDs)
 	}
 
-	accessRelease, err := sdrscratch.AccessPaths(fetchPaths.Cache, fetchPaths.Key)
+	accessRelease, err := sdrscratch.AccessPathsContext(ctx, fetchPaths.Cache, fetchPaths.Key)
 	if err != nil {
 		return storiface.SectorPaths{}, storiface.SectorPaths{}, err
 	}

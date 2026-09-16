@@ -135,7 +135,7 @@ func (handler *FetchHandler) remoteGetSector(w http.ResponseWriter, r *http.Requ
 		w.WriteHeader(500)
 		return
 	}
-	accessRelease, err := sdrscratch.AccessPaths(path)
+	accessRelease, err := sdrscratch.AccessPathsContext(r.Context(), path)
 	if err != nil {
 		log.Warnw("remote sector access deferred", "sector", id, "error", err)
 		w.WriteHeader(http.StatusServiceUnavailable)

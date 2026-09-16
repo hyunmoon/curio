@@ -131,7 +131,7 @@ func (l *storageProvider) AcquireSector(ctx context.Context, taskID *harmonytask
 	}
 
 	log.Debugf("acquired sector %d (e:%d; a:%d): %v", sector, existing, allocate, sectorPaths)
-	accessRelease, err := sdrscratch.AccessPaths(sectorPaths.Cache, sectorPaths.Key)
+	accessRelease, err := sdrscratch.AccessPathsContext(ctx, sectorPaths.Cache, sectorPaths.Key)
 	if err != nil {
 		releaseStorage()
 		return storiface.SectorPaths{}, storiface.SectorPaths{}, nil, err

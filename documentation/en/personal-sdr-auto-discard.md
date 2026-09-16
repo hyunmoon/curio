@@ -39,6 +39,24 @@ exclusive gate. Neither cancellation nor expired DB ownership releases a
 native operation's gate. There is no scheduler sleep or host-wide exclusive
 lease upgrade.
 
+SDR storage Claim acquires its shared gate nonblockingly, before reservation
+and Do-entry. Contention abandons that preparation through the existing
+admission cancellation path: no Do failure/history, failure-budget charge or
+pacing-start commit occurs. A successful Claim retains the gate through
+prepared admission and synchronous SDR I/O; pre-entry cancellation releases
+only its reservation. Cleanup therefore cannot take the exclusive gate in
+the gap between Claim and native entry.
+
+Other accessors (FFI acquisition, remote fetch, HTTP serving) retry only the
+typed lock-contention error, at 25ms intervals for at most 30 seconds or the
+caller's earlier deadline. Partial multi-path locks are released before each
+wait. Timeout/cancellation returns a classified error, never permission to
+ignore a gate; HTTP retains its existing 503 response. Identity, filesystem
+and permission errors are not retried as contention. A timeout on these
+non-admission accessors does not retroactively refund an SDR Do-entry. The
+production SDR Claim gate prevents cleanup contention after that entry.
+Once access succeeds, cancellation alone cannot release a live I/O gate.
+
 For metadata-free legacy files, the scanner checks participating live parents,
 unconverted Curio executables, registered service subtrees and all managed
 subtrees (including children whose parent died before registration). The
@@ -131,10 +149,13 @@ existing MaxStorage quota keep HasCapacity false until removal and index-health
 refresh. It then checks ordinary Claim/reservation separately. Short timer and
 OS-evidence overlays are test-only. Lifecycle fixtures cover transient state
 errors, per-root overlap/isolation, partial unlink, denial caching and shutdown.
-The review archive records an existing race in TaskStorage.Claim's captured
-context variable; that unchanged path is not fixed here. Normal Claim passed;
-the R1-only race run excludes just that post-recovery Claim subtest. Neither a
-narrow PASS nor a compile substitutes for a full connected/native race PASS.
+TaskStorage.Claim now passes the timer goroutine an immutable context argument;
+the existing timeout, lock and reservation semantics are unchanged. The
+follow-up review reproduces the old race and restores the post-recovery Claim
+case to connected race validation. Cleanup-gate barriers exercise actual SDR
+acquisition and receipt reuse, cancellation/reservation release, and the
+preparation gate lifetime. Native and Linux evidence remain substituted in
+those tests; a connected fixture PASS is not native execution evidence.
 
 Build-tagged caller fixtures require `sdr_auto_itest,sdr_retry_itest` and the
 review archive's explicit Go overlay. They fail closed without it. Normal

@@ -12,6 +12,7 @@ import (
 	"github.com/filecoin-project/curio/harmony/harmonytask"
 	"github.com/filecoin-project/curio/harmony/resources"
 	storagePaths "github.com/filecoin-project/curio/lib/paths"
+	"github.com/filecoin-project/curio/lib/sdrscratch"
 	storiface "github.com/filecoin-project/curio/lib/storiface"
 )
 
@@ -159,14 +160,14 @@ func (t *TaskStorage) Claim(taskID int) (func() error, error) {
 	lockAcquireTimuout := time.Second * 60
 	lockAcquireTimer := time.NewTimer(lockAcquireTimuout)
 
-	go func() {
+	go func(waitCtx context.Context) {
 		defer cancel()
 
 		select {
 		case <-lockAcquireTimer.C:
-		case <-ctx.Done():
+		case <-waitCtx.Done():
 		}
-	}()
+	}(ctx)
 
 	for _, sectorRef := range sectorRefs {
 		ok, err := t.sc.Sectors.sindex.StorageTryLock(lkctx, sectorRef.ID(), storiface.FTNone, requestedTypes)
@@ -214,9 +215,17 @@ func (t *TaskStorage) Claim(taskID int) (func() error, error) {
 		// reserve the space
 		var release func()
 		var sdr *storagePaths.SDRReservation
+		accessRelease := func() {}
 		if t.sdr {
 			if t.existing != storiface.FTNone {
 				return nil, xerrors.New("SDR reservation cannot fetch existing files")
+			}
+			// Nonblocking: never wait under ReservationCtxLock. A busy gate
+			// rejects preparation before Do-entry/pacing commit or failure
+			// accounting. Hold successful access through actual SDR I/O.
+			accessRelease, err = sdrscratch.AccessPaths(pathsFs.Cache, pathsFs.Key)
+			if err != nil {
+				return nil, err
 			}
 			sdr, err = prepareSDRReservation(storiface.PathByType(pathsFs, t.alloc), sectorRef.Ref(), t.alloc)
 			if err == nil {
@@ -226,8 +235,11 @@ func (t *TaskStorage) Claim(taskID int) (func() error, error) {
 			release, err = t.sc.Sectors.localStore.Reserve(ctx, sectorRef.Ref(), requestedTypes, pathIDs, t.Overheads, t.MinFreeStoragePercentage)
 		}
 		if err != nil {
+			accessRelease()
 			return nil, err
 		}
+		releaseSpace := release
+		release = func() { defer accessRelease(); releaseSpace() }
 
 		prevCleanup := cleanup
 		cleanup = func() {

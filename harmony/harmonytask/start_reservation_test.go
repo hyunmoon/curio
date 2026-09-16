@@ -14,6 +14,7 @@ import (
 	"github.com/filecoin-project/curio/harmony/harmonytask/internal/runregistry"
 	"github.com/filecoin-project/curio/harmony/resources"
 	"github.com/filecoin-project/curio/harmony/taskhelp"
+	"github.com/filecoin-project/curio/lib/sdrscratch"
 )
 
 type startReservationStub struct {
@@ -200,20 +201,29 @@ func TestStartReservationRealSchedulerCacheRecoveryAndResources(t *testing.T) {
 	}
 }
 
-type startReservationStorage struct{ claims int }
+type startReservationStorage struct {
+	claims int
+	err    error
+}
 
 func (*startReservationStorage) HasCapacity() bool { return true }
 
 func (s *startReservationStorage) Claim(int) (func() error, error) {
 	s.claims++
+	if s.err != nil {
+		return nil, s.err
+	}
 	return nil, errors.New("synthetic storage claim failure")
 }
 
 func TestStartReservationRealClaimAndStorageFailures(t *testing.T) {
-	for _, mode := range []string{"claim-lost", "claim-error", "context-cancelled", "attempt-prepare-error", "storage-error", "release-error", "recovery-storage-error"} {
+	for _, mode := range []string{"claim-lost", "claim-error", "context-cancelled", "attempt-prepare-error", "storage-error", "release-error", "recovery-storage-error", "cleanup-gate-busy"} {
 		t.Run(mode, func(t *testing.T) {
 			reserved, started, cancelled, claims, releases := 0, 0, 0, 0, 0
 			storage := &startReservationStorage{}
+			if mode == "cleanup-gate-busy" {
+				storage.err = sdrscratch.ErrAccessBusy
+			}
 			stub := startReservationStub{TaskInterface: &stubAcceptTask{}, reserve: func(TaskID) (func(context.Context) error, func(), bool) {
 				reserved++
 				return func(context.Context) error { started++; return nil }, func() { cancelled++ }, true
@@ -262,11 +272,11 @@ func TestStartReservationRealClaimAndStorageFailures(t *testing.T) {
 					return nil
 				}, store)
 			settleAdmissions(t, h)
-			pending := mode == "attempt-prepare-error" || mode == "storage-error" || mode == "release-error" || mode == "recovery-storage-error"
+			pending := mode == "attempt-prepare-error" || mode == "storage-error" || mode == "release-error" || mode == "recovery-storage-error" || mode == "cleanup-gate-busy"
 			if ok != pending || reserved != 1 || started != 0 || cancelled != 1 || h.Max.Active() != 0 {
 				t.Fatalf("accepted=%v reserved=%d started=%d cancelled=%d active=%d", ok, reserved, started, cancelled, h.Max.Active())
 			}
-			storagePhase := mode == "storage-error" || mode == "release-error" || mode == "recovery-storage-error"
+			storagePhase := mode == "storage-error" || mode == "release-error" || mode == "recovery-storage-error" || mode == "cleanup-gate-busy"
 			if (storagePhase && (storage.claims != 1 || releases != 1)) || (!storagePhase && (storage.claims != 0 || releases != 0)) {
 				t.Fatalf("storage claims=%d ownership releases=%d", storage.claims, releases)
 			}

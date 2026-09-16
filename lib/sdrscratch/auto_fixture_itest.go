@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -18,6 +19,46 @@ import (
 )
 
 var AutoFixtureActive = false
+
+type autoFixturePause struct {
+	root             string
+	entered, release chan struct{}
+}
+
+var autoFixturePauseNext atomic.Pointer[autoFixturePause]
+
+// Probe the same exclusive lock used by automatic cleanup without creating
+// conflicting files that independently prohibit a new SDR attempt.
+func AutoFixtureExclusiveAccess(root, sector string) error {
+	c, err := personalSessionPtr.Load().load(root)
+	if err != nil {
+		return err
+	}
+	f, err := sectorGate(c, sector, true, openDir)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// Hold an actual cleanup after its exclusive sector gate and live DB state
+// have been acquired. Tests release it explicitly, not by hoping a timer races.
+func AutoFixtureHoldNextCleanup(t *testing.T, root string) (<-chan struct{}, func()) {
+	p := &autoFixturePause{root: root, entered: make(chan struct{}), release: make(chan struct{})}
+	old := autoFixturePauseNext.Swap(p)
+	var once sync.Once
+	release := func() { once.Do(func() { close(p.release) }) }
+	t.Cleanup(func() { release(); autoFixturePauseNext.Store(old) })
+	return p.entered, release
+}
+
+func autoFixtureParticipants(c *ManagedConfig) error {
+	if p := autoFixturePauseNext.Load(); p != nil && c.Storage[0].Root == p.root && autoFixturePauseNext.CompareAndSwap(p, nil) {
+		close(p.entered)
+		<-p.release
+	}
+	return nil
+}
 
 type autoFixtureUnlinkFailure struct {
 	remaining atomic.Int32
@@ -95,7 +136,7 @@ func autoFixtureRead(p string, v any) error {
 }
 func autoFixtureRuntimeIO(c *ManagedConfig) autoIO {
 	a := spaceAccess{openDir, autoFixtureRead, func([]openIdentity) (bool, error) { return false, nil }, freeBytes}
-	return autoIO{func(*ManagedConfig) error { return nil }, openDir,
+	return autoIO{autoFixtureParticipants, openDir,
 		func(base string, dev, ino uint64, target string, files []openIdentity) (string, error) {
 			d, e := openDir(c.StateDir)
 			if e != nil {
