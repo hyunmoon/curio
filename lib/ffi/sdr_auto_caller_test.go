@@ -78,6 +78,13 @@ func TestSDRAutoCallerDB(t *testing.T) {
 				require.NoError(t, os.MkdirAll(target, 0700))
 				file := filepath.Join(target, proofpaths.LayerFileName(1))
 				require.NoError(t, os.WriteFile(file, make([]byte, 2048), 0600))
+				if shape == "legacy" || shape == "attempt" || shape == "owned" {
+					// Real native temporary naming plus a future backend artifact:
+					// disposal authority belongs to the private folder, not names.
+					for _, name := range []string{"sc-02-data-layer-11..tmp", "backend-interrupted-work"} {
+						require.NoError(t, os.WriteFile(filepath.Join(target, name), []byte("partial"), 0600))
+					}
+				}
 				_, e = db.Exec(ctx, `DELETE FROM sectors_sdr_pipeline WHERE sp_id=1000 AND sector_number=42`)
 				require.NoError(t, e)
 				_, e = db.Exec(ctx, `DELETE FROM sectors_unseal_pipeline WHERE sp_id=1000 AND sector_number=42`)

@@ -19,7 +19,6 @@ import (
 
 	"github.com/filecoin-project/curio/harmony/harmonytask"
 	"github.com/filecoin-project/curio/lib/paths"
-	"github.com/filecoin-project/curio/lib/proofpaths"
 	"github.com/filecoin-project/curio/lib/sdrscratch"
 	"github.com/filecoin-project/curio/lib/storiface"
 
@@ -45,7 +44,9 @@ func TestSDRAutoRetryWithoutAdmissionDB(t *testing.T) {
 		sector := abi.SectorID{Miner: 1000, Number: n}
 		target := filepath.Join(root, "cache", storiface.SectorName(sector)+".tmp")
 		require.NoError(t, os.MkdirAll(target, 0700))
-		require.NoError(t, os.WriteFile(filepath.Join(target, proofpaths.LayerFileName(1)), make([]byte, 2048), 0600))
+		// No canonical layer: recovery must remove the actual native temporary
+		// name through the timer and republish capacity without a new admission.
+		require.NoError(t, os.WriteFile(filepath.Join(target, "sc-02-data-layer-1..tmp"), make([]byte, 2048), 0600))
 		_, err := db.Exec(context.Background(), `INSERT INTO sectors_sdr_pipeline(sp_id,sector_number,reg_seal_proof,after_sdr) VALUES(1000,$1,5,$2)`, n, complete)
 		require.NoError(t, err)
 		return target

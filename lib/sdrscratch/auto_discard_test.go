@@ -287,6 +287,7 @@ func TestAutoDiscardRecordedLiveRun(t *testing.T) {
 	c, base, io, state := autoFixture(t)
 	rel := filepath.Join("s-t01000-42.sdr.tmp", Prefix+uuid.NewString())
 	p := autoWrite(t, base, rel, 1)
+	require.NoError(t, os.WriteFile(filepath.Join(p, "native-interrupted-work"), []byte("private"), 0600))
 	d, e := openDir(p)
 	require.NoError(t, e)
 	defer func() { _ = d.Close() }()
@@ -337,6 +338,7 @@ func TestAutoDiscardENOSPCAndOtherRoot(t *testing.T) {
 func TestAutoDiscardReplacementAfterState(t *testing.T) {
 	c, base, io, state := autoFixture(t)
 	p := autoWrite(t, base, "s-t01000-42.tmp", 1)
+	require.NoError(t, os.WriteFile(filepath.Join(p, "native-interrupted-work"), []byte("private"), 0600))
 	calls := 0
 	io.participants = func(*ManagedConfig) error {
 		calls++
@@ -351,4 +353,5 @@ func TestAutoDiscardReplacementAfterState(t *testing.T) {
 	require.Zero(t, r[0].FilesRemoved)
 	require.FileExists(t, filepath.Join(p, "sc-02-data-layer-1.dat"))
 	require.FileExists(t, filepath.Join(p+".preserved", "sc-02-data-layer-1.dat"))
+	require.FileExists(t, filepath.Join(p+".preserved", "native-interrupted-work"))
 }

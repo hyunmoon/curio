@@ -65,6 +65,8 @@ func TestAutoLinuxWorker(t *testing.T) {
 	require.NoError(t, os.Remove(badCapability)) // only this test-created file
 	base := filepath.Join(root, "cache")
 	p := autoWrite(t, base, "s-t01000-42.tmp", 1)
+	require.NoError(t, os.WriteFile(filepath.Join(p, "sc-02-data-layer-11..tmp"), []byte("partial"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(p, "backend-work-in-progress"), []byte("private"), 0600))
 	keep := autoWrite(t, base, "s-t02000-42", 2)
 	r, e := AutoDiscard(base, func(target AutoTarget, apply func(AutoStage) error) error {
 		return apply(AutoStage{Allowed: target.Sector == "s-t01000-42", Reason: "disposable pipeline fixture", LayerNames: []string{"sc-02-data-layer-1.dat", "sc-02-data-layer-2.dat"}, LayerBytes: 2048})

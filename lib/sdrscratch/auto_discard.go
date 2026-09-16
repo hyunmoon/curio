@@ -292,6 +292,12 @@ func removeAutoDirectory(base *os.File, relative string, device, inode uint64) e
 }
 
 func autoFiles(d *os.File, t AutoTarget, s AutoStage) ([]LegacyFile, error) {
+	// Only GenerateSDR's unpublished staging namespaces permit name-independent
+	// discard. Canonical cache may be a published TreeRC input despite a stale DB
+	// stage; it retains the stricter receipt/layout checks below.
+	if !t.Canonical && !validRelative(filepath.Join(filepath.Base(t.Base), t.Relative)) {
+		return nil, fmt.Errorf("not a private SDR temporary namespace")
+	}
 	// A marker is a reason to preserve, never merely an xattr-presence proof of
 	// successful SDR. Normal reuse still performs full receipt validation in FFI.
 	b, e := get(d, completionAttribute)
@@ -313,9 +319,9 @@ func autoFiles(d *os.File, t AutoTarget, s AutoStage) ([]LegacyFile, error) {
 		return nil, fmt.Errorf("SDR layout unknown")
 	}
 	var files []LegacyFile
-	complete := len(es) == len(allowed)
+	completeLayers := 0
 	for _, entry := range es {
-		if !allowed[entry.Name()] {
+		if t.Canonical && !allowed[entry.Name()] {
 			return nil, fmt.Errorf("non-SDR layer preserved: %s", entry.Name())
 		}
 		st, e := privateFile(d, entry.Name())
@@ -325,10 +331,12 @@ func autoFiles(d *os.File, t AutoTarget, s AutoStage) ([]LegacyFile, error) {
 		if st.Size < 0 || st.Size > s.LayerBytes {
 			return nil, fmt.Errorf("unexpected layer size")
 		}
-		complete = complete && st.Size == s.LayerBytes
+		if allowed[entry.Name()] && st.Size == s.LayerBytes {
+			completeLayers++
+		}
 		files = append(files, LegacyFile{entry.Name(), uint64(st.Dev), st.Ino, st.Size, st.Blocks})
 	}
-	if t.Canonical && complete {
+	if t.Canonical && completeLayers == len(allowed) {
 		return nil, fmt.Errorf("possible successful legacy SDR: full layer layout preserved")
 	}
 	return files, nil
