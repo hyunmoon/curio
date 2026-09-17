@@ -11,7 +11,8 @@ import (
 )
 
 const PREPARE_TASK_ATTEMPT = `UPDATE harmony_task
-SET attempt_id=$1, attempt_started_at=NULL, attempt_start_source='prepared'
+SET attempt_id=$1, attempt_started_at=NULL, attempt_start_source='prepared',
+    attempt_session=NULLIF($5,''), sdr_execution=NULLIF($6,'')
 WHERE id=$2 AND owner_id=$3 AND owner_generation=$4
   AND (attempt_id IS NULL OR attempt_id=$1)
   AND attempt_started_at IS NULL AND attempt_start_source IN ('claimed', 'prepared')`
@@ -33,6 +34,8 @@ type harmonyTaskAttemptStore struct {
 	// Populated by the claim/recovery statement, immutable before workers start.
 	generations map[TaskID]int64
 	token       string
+	session     string
+	execution   func() (string, error)
 }
 
 func (s harmonyTaskAttemptStore) prepare(ctx context.Context, id TaskID, token string) error {
@@ -40,7 +43,15 @@ func (s harmonyTaskAttemptStore) prepare(ctx context.Context, id TaskID, token s
 	if !ok {
 		return fmt.Errorf("missing acquisition generation for task %d", id)
 	}
-	n, err := s.db.Exec(ctx, PREPARE_TASK_ATTEMPT, token, id, s.owner, generation)
+	var execution string
+	if s.execution != nil {
+		var err error
+		execution, err = s.execution()
+		if err != nil {
+			return err
+		}
+	}
+	n, err := s.db.Exec(ctx, PREPARE_TASK_ATTEMPT, token, id, s.owner, generation, s.session, execution)
 	if err != nil {
 		return err
 	}

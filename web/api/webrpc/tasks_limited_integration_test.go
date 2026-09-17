@@ -7,8 +7,6 @@ import (
 	"encoding/json"
 	"net"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -38,7 +36,7 @@ func clusterTaskSQLFixture(t *testing.T) (*harmonydb.DB, *pgx.Conn, context.Cont
 	opts := harmonydb.ItestOptions{Hosts: []string{host}, Port: port, Database: database, Username: user,
 		Password: os.Getenv(prefix + "PASSWORD"), ITestID: harmonydb.ITestNewID()}
 	cfg := opts.HarmonyConfig()
-	cfg.ReadOnly, cfg.LoadBalance = true, false
+	cfg.ReadOnly, cfg.LoadBalance = false, false
 	db, err := harmonydb.NewFromConfig(cfg)
 	require.NoError(t, err)
 	t.Cleanup(db.ITestDeleteAll)
@@ -56,14 +54,12 @@ func clusterTaskSQLFixture(t *testing.T) (*harmonydb.DB, *pgx.Conn, context.Cont
 		defer stop()
 		require.NoError(t, conn.Close(closeCtx))
 	})
-	_, path, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	for _, name := range []string{"20230719-harmony.sql", "20260909-task-ownership-age.sql", "20260909-task-attempt-start.sql"} {
-		contents, err := os.ReadFile(filepath.Join(filepath.Dir(path), "..", "..", "..", "harmony", "harmonydb", "sql", name))
-		require.NoError(t, err)
-		_, err = conn.Exec(ctx, string(contents))
-		require.NoError(t, err)
-	}
+	// The real migration runner above, not direct Exec of selected SQL files.
+	// These fixture-only defaults model process provenance for the old ordering
+	// matrix; explicit NULL/old values in the lifetime tests remain meaningful.
+	_, err = conn.Exec(ctx, `ALTER TABLE harmony_machines ALTER COLUMN process_session SET DEFAULT 'fixture-process';
+ALTER TABLE harmony_task ALTER COLUMN attempt_session SET DEFAULT 'fixture-process'`)
+	require.NoError(t, err)
 	_, err = db.Exec(ctx, `INSERT INTO harmony_machines (id,host_and_port,cpu,ram,gpu) VALUES (101,'worker.example:12300',8,1024,0)`)
 	require.NoError(t, err)
 	var schema string
@@ -133,9 +129,11 @@ func TestClusterTaskOrderSQL(t *testing.T) {
  attempt_id='a-'||id,attempt_started_at=NOW()-INTERVAL '15 minutes',attempt_start_source='do_entry' WHERE id<=510;
  UPDATE harmony_task SET owner_id=102 WHERE id=510;
  UPDATE harmony_task SET work_start=NOW()-INTERVAL '3 hours',attempt_id='long',
- attempt_started_at=NOW()-INTERVAL '3 hours',attempt_start_source='do_entry' WHERE id=510;
+ attempt_started_at=NOW()-INTERVAL '3 hours',attempt_start_source='do_entry',attempt_session='fixture-process' WHERE id=510;
  UPDATE harmony_task SET attempt_start_source='prepared',attempt_started_at=NULL WHERE id=507;
- UPDATE harmony_task SET attempt_start_source=NULL WHERE id=508;`)
+ UPDATE harmony_task SET attempt_start_source=NULL WHERE id=508;
+ INSERT INTO sectors_sdr_pipeline(sp_id,sector_number,reg_seal_proof,task_id_sdr,create_time)
+ SELECT 1000,id,8,id,NOW()-INTERVAL '2 days' FROM harmony_task WHERE name='SDR';`)
 	require.NoError(t, err)
 	source := harmonyClusterTaskSummarySource{db: db}
 	applied := ClusterTaskSummaryApplied{MaxTasks: 500, MaxPending: 30}
@@ -230,7 +228,7 @@ func TestClusterTaskOrderSQL(t *testing.T) {
 		Seconds    *int64    `db:"seconds"`
 		ObservedAt time.Time `db:"observed_at"`
 	}
-	require.NoError(t, db.Select(ctx, &sqlRows, `WITH classified AS (SELECT t.*,statement_timestamp() AS observed_at FROM harmony_task t), states AS (SELECT *, `+clusterTaskTookStateSQL+` AS took_state FROM classified)
+	require.NoError(t, db.Select(ctx, &sqlRows, `WITH classified AS (SELECT t.*,hm.process_session,1::bigint AS sdr_references,true AS sdr_ready,statement_timestamp() AS observed_at FROM harmony_task t LEFT JOIN harmony_machines hm ON hm.id=t.owner_id), states AS (SELECT *, `+clusterTaskTookStateSQL+` AS took_state FROM classified)
  SELECT id,took_state,observed_at,CASE WHEN took_state='running' THEN FLOOR(EXTRACT(EPOCH FROM observed_at-attempt_started_at))::BIGINT END AS seconds FROM states`))
 	for _, r := range sqlRows {
 		for _, row := range snap.Rows {

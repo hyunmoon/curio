@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/samber/lo"
 	"go.opencensus.io/stats"
@@ -218,6 +219,7 @@ type taskEngineConfig struct {
 	reg                   *resources.Reg
 	ownerID               int
 	hostAndPort           string
+	session               string
 	preferredTaskRunOrder map[string][]string
 }
 
@@ -310,6 +312,7 @@ func NewWithReg(
 			reg:         reg,
 			ownerID:     reg.MachineID,
 			hostAndPort: hostnameAndPort,
+			session:     uuid.NewString(),
 		},
 		state: taskEngineState{
 			preemptBids: preemptbids.New(),
@@ -322,6 +325,12 @@ func NewWithReg(
 	}
 	e.atomics.pollDuration.Store(pollRarely)
 	e.atomics.lastCleanup.Store(time.Now())
+	if !db.ReadOnly() {
+		if _, err := db.Exec(ctx, `UPDATE harmony_machines SET process_session=$1 WHERE id=$2`, e.cfg.session, reg.MachineID); err != nil {
+			grace()
+			return nil, fmt.Errorf("register task process session: %w", err)
+		}
+	}
 
 	mayFollows := make(map[string][]string)
 
@@ -417,6 +426,11 @@ func NewWithReg(
 	e.startScheduler()
 	e.schedulerChannel <- schedulerEvent{Source: schedulerSourceInitialPoll}
 	go e.singletonRunNowPoller()
+	if h := e.taskMap["SDR"]; h != nil {
+		if boundary, ok := h.TaskInterface.(taskExecutionBoundary); ok {
+			go h.retireStoppedSDRLoop(boundary)
+		}
+	}
 
 	return e, nil
 }

@@ -17,7 +17,21 @@ test('Took uses only confirmed current-attempt seconds, never Posted or ownershi
     assert.equal(value.seconds,null);
     assert.ok(value.text==='unknown'||value.text==='—');
   }
-  assert.equal(clusterTaskAge({...task,OwnerID:null},clock).seconds,10802);
+  assert.equal(clusterTaskAge({...task,OwnerID:null},clock).seconds,null);
+  assert.equal(clusterTaskAge({...task,OwnerID:null,WaitingSeconds:60,WaitingState:'queue-entry'},clock).seconds,62);
+});
+
+test('legacy queue key is not waiting evidence; no fallback or retry-first-start claim', () => {
+  const clock=resetClusterTaskDisplayClock(1);
+  const old={ID:3,OwnerID:null,AgeSeconds:58836*3600+537};
+  assert.equal(clusterTaskAge(old,clock).seconds,null);
+  assert.match(clusterTaskAge(old,clock).title,/queue-order key/);
+  assert.doesNotMatch(clusterTaskAge(old,clock).title,/has not started/);
+  for(const state of ['previous-process','unreferenced','invalid-reference']) {
+    const result=clusterTaskAge({...old,OwnerID:7,TookState:state,TookSeconds:150000,ExecutionReason:'unconfirmed prior execution'},clock);
+    assert.equal(result.seconds,null);
+    assert.equal(result.title,'unconfirmed prior execution');
+  }
 });
 
 test('new same-owner attempt replaces Took with a lower authoritative baseline', () => {

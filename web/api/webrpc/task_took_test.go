@@ -12,6 +12,8 @@ func TestTaskTookCurrentAttemptOnly(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	owner := int64(7)
 	base := clusterTaskSummaryLimitedRow{ID: 1, Name: "task", State: "running", OwnerID: &owner, PostedTime: now.Add(-3 * time.Hour), WorkStart: sql.NullTime{Time: now.Add(-2 * time.Hour), Valid: true}, WorkStartSource: sql.NullString{String: "claim", Valid: true}, AttemptID: sql.NullString{String: "new-attempt", Valid: true}, AttemptStartedAt: sql.NullTime{Time: now.Add(-10 * time.Minute), Valid: true}, AttemptStartSource: sql.NullString{String: "do_entry", Valid: true}}
+	base.AttemptSession = sql.NullString{String: "current-process", Valid: true}
+	base.ProcessSession = base.AttemptSession
 	for _, tc := range []struct {
 		name    string
 		change  func(*clusterTaskSummaryLimitedRow)
