@@ -122,7 +122,7 @@ func TestAutoDiscardPrivateTmpOnlyAndUnpublished(t *testing.T) {
 }
 
 func TestAutoDiscardCanonicalNotPrivate(t *testing.T) {
-	for _, mode := range []string{"complete", "complete-with-tmp", "complete-with-unknown", "partial-with-tmp", "receipt"} {
+	for _, mode := range []string{"complete", "complete-with-tmp", "complete-with-unknown", "partial-with-tmp", "receipt", "oversize"} {
 		t.Run(mode, func(t *testing.T) {
 			c, base, io, state := autoFixture(t)
 			n := 2
@@ -137,6 +137,8 @@ func TestAutoDiscardCanonicalNotPrivate(t *testing.T) {
 				require.NoError(t, os.WriteFile(filepath.Join(p, "tree-rc-input"), []byte("keep"), 0600))
 			case "receipt":
 				require.NoError(t, unix.Setxattr(p, completionAttribute, []byte(`{"Version":1}`), 0))
+			case "oversize":
+				require.NoError(t, os.WriteFile(filepath.Join(p, "sc-02-data-layer-1.dat"), make([]byte, 2049), 0600))
 			}
 			before, e := os.ReadDir(p)
 			require.NoError(t, e)
@@ -153,7 +155,7 @@ func TestAutoDiscardCanonicalNotPrivate(t *testing.T) {
 }
 
 func TestAutoDiscardPrivateGuards(t *testing.T) {
-	for _, mode := range []string{"symlink", "hardlink", "directory", "oversize", "unconverted", "db-error", "completed-stage", "gate", "unknown-owner"} {
+	for _, mode := range []string{"symlink", "hardlink", "directory", "unconverted", "db-error", "state-denied", "gate", "unknown-owner"} {
 		t.Run(mode, func(t *testing.T) {
 			c, base, io, state := autoFixture(t)
 			p := autoWrite(t, base, "s-t01000-42.tmp", 1)
@@ -165,8 +167,6 @@ func TestAutoDiscardPrivateGuards(t *testing.T) {
 				require.NoError(t, os.Link(filepath.Join(p, "sc-02-data-layer-1.dat"), name))
 			case "directory":
 				require.NoError(t, os.Mkdir(name, 0700))
-			case "oversize":
-				require.NoError(t, os.WriteFile(name, make([]byte, 2049), 0600))
 			default:
 				require.NoError(t, os.WriteFile(name, []byte("private"), 0600))
 				switch mode {
@@ -174,8 +174,8 @@ func TestAutoDiscardPrivateGuards(t *testing.T) {
 					io.participants = func(*ManagedConfig) error { return errors.New("live foreign run") }
 				case "db-error":
 					state = func(AutoTarget, func(AutoStage) error) error { return errors.New("unavailable") }
-				case "completed-stage":
-					state = func(_ AutoTarget, fn func(AutoStage) error) error { return fn(AutoStage{Reason: "TreeRC input"}) }
+				case "state-denied":
+					state = func(_ AutoTarget, fn func(AutoStage) error) error { return fn(AutoStage{Reason: "ambiguous state"}) }
 				case "gate":
 					f, e := sectorGate(c, "s-t01000-42", false, openDir)
 					require.NoError(t, e)

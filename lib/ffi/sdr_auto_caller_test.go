@@ -102,11 +102,14 @@ func TestSDRAutoCallerDB(t *testing.T) {
 				index := paths.NewDBIndex(nil, db)
 				local, e := paths.NewLocal(ctx, ls, index, "")
 				require.NoError(t, e)
-				if shape == "complete" || shape == "tree-rc-failed" || shape == "missing" {
+				if shape == "complete" || shape == "tree-rc-failed" {
 					require.FileExists(t, file)
 					return
 				}
 				require.NoDirExists(t, target, "startup must really remove legacy/partial canonical, not hide the error")
+				if shape == "missing" {
+					return // private orphan reclaimed, no pipeline manufactured for it
+				}
 				local.PrepareSDRScratch() // idempotent admission preparation, no pacing delay
 				sr := storiface.SectorRef{ID: sector, ProofType: abi.RegisteredSealProof_StackedDrg2KiBV1_1}
 				pp, ids, e := local.AcquireSector(ctx, sr, storiface.FTNone, ft, storiface.PathSealing, storiface.AcquireMove)

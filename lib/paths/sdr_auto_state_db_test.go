@@ -39,7 +39,7 @@ func TestSDRAutoStateRowFence(t *testing.T) {
 	_, e = db.Exec(ctx, `INSERT INTO sectors_sdr_pipeline(sp_id,sector_number,reg_seal_proof) VALUES(1000,42,5)`)
 	require.NoError(t, e)
 	index := NewDBIndex(nil, db)
-	target := sdrscratch.AutoTarget{Base: filepath.Join(t.TempDir(), "cache"), Sector: "s-t01000-42"}
+	target := sdrscratch.AutoTarget{Base: filepath.Join(t.TempDir(), "cache"), Sector: "s-t01000-42", Relative: "s-t01000-42", Canonical: true}
 	locked, release, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
 	go func() {
 		done <- index.withSDRDiscardState(ctx, target, func(s sdrscratch.AutoStage) error {

@@ -28,7 +28,7 @@ import (
 )
 
 func TestSDRCleanupGateCallerDB(t *testing.T) {
-	for _, mode := range []string{"fresh", "receipt", "claim", "cancel", "deadline"} {
+	for _, mode := range []string{"fresh", "receipt", "claim", "orphan-claim", "cancel", "deadline"} {
 		t.Run(mode, func(t *testing.T) {
 			db := SDRRetryTestDB(t)
 			root := t.TempDir()
@@ -39,8 +39,10 @@ func TestSDRCleanupGateCallerDB(t *testing.T) {
 			sdrscratch.AutoFixtureSetup(t, []string{root})
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			_, e = db.Exec(ctx, `INSERT INTO sectors_sdr_pipeline(sp_id,sector_number,reg_seal_proof) VALUES(1000,42,5)`)
-			require.NoError(t, e)
+			if mode != "orphan-claim" {
+				_, e = db.Exec(ctx, `INSERT INTO sectors_sdr_pipeline(sp_id,sector_number,reg_seal_proof) VALUES(1000,42,5)`)
+				require.NoError(t, e)
+			}
 			index := paths.NewDBIndex(nil, db)
 			local, e := paths.NewLocal(ctx, &autoCallerStorage{storiface.StorageConfig{StoragePaths: []storiface.LocalPath{{Path: root}}}}, index, "")
 			require.NoError(t, e)
@@ -75,7 +77,7 @@ func TestSDRCleanupGateCallerDB(t *testing.T) {
 				t.Cleanup(release)
 				sb.Sectors.storageReservations.Store(1, []*StorageReservation{{SectorRef: SectorRef{SpID: 1000, SectorNumber: 42, RegSealProof: sr.ProofType}, Alloc: storiface.FTCache, Paths: pp, PathIDs: ids, SDR: r, Release: func() { released.Add(1); release() }}})
 			}
-			if mode != "claim" {
+			if mode != "claim" && mode != "orphan-claim" {
 				prepare()
 			}
 			if mode == "receipt" {
@@ -94,7 +96,15 @@ func TestSDRCleanupGateCallerDB(t *testing.T) {
 			case <-time.After(2 * time.Second):
 				t.Fatal("cleanup did not reach exclusive-gate barrier")
 			}
-			if mode == "claim" {
+			if mode == "claim" || mode == "orphan-claim" {
+				if mode == "orphan-claim" {
+					// A SELECT FOR UPDATE returning no rows does not fence a future
+					// INSERT. Use another connection while cleanup holds its gate.
+					insertCtx, stop := context.WithTimeout(ctx, time.Second)
+					_, e = db.Exec(insertCtx, `INSERT INTO sectors_sdr_pipeline(sp_id,sector_number,reg_seal_proof) VALUES(1000,42,5)`)
+					stop()
+					require.NoError(t, e, "absent-row read must not be represented as an INSERT lock")
+				}
 				storage := sb.Storage(func(harmonytask.TaskID) (SectorRef, error) {
 					return SectorRef{SpID: 1000, SectorNumber: 42, RegSealProof: sr.ProofType}, nil
 				}, storiface.FTCache, storiface.FTNone, 2048, storiface.PathSealing, 0).ForSDR()
@@ -119,6 +129,7 @@ func TestSDRCleanupGateCallerDB(t *testing.T) {
 				require.NoError(t, release())
 				require.NoError(t, sdrscratch.AutoFixtureExclusiveAccess(root, storiface.SectorName(sr.ID)))
 				local.PrepareSDRScratch()
+				require.FileExists(t, filepath.Join(dest, proofpaths.LayerFileName(1)), "new publication survives subsequent cleanup")
 				return
 			}
 			if mode == "receipt" {
@@ -203,6 +214,14 @@ func TestSDRCleanupGateClaimFailureDB(t *testing.T) {
 			}
 			require.NoError(t, os.MkdirAll(blocked, 0700))
 			require.NoError(t, os.WriteFile(filepath.Join(blocked, "unknown-protected-file"), []byte("preserve"), 0600))
+			if mode == "reservation" {
+				// Missing DB state no longer protects private scratch. Preserve an
+				// actual live writer lock so reservation must still fail safely.
+				f, e := os.Open(blocked)
+				require.NoError(t, e)
+				require.NoError(t, unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB))
+				defer func() { require.NoError(t, f.Close()) }()
+			}
 			storage := sb.StorageMulti(func(harmonytask.TaskID) ([]SectorRef, error) {
 				return []SectorRef{{SpID: 1000, SectorNumber: 42, RegSealProof: 5}, {SpID: 1000, SectorNumber: 43, RegSealProof: 5}}, nil
 			}, storiface.FTCache, storiface.FTNone, 2048, storiface.PathSealing, 0, storiface.FSOverheadSeal).ForSDR()

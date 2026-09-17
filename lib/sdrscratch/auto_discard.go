@@ -15,9 +15,10 @@ import (
 
 var canonicalSector = regexp.MustCompile(`^s-t0[0-9]+-[0-9]+$`)
 
-// AutoStage is supplied inside a locked, live pipeline read by the storage
-// layer. It is not native termination evidence. Receipt/unknown layout checks
-// remain independent. No pipeline or task is removed by this package.
+// AutoStage is supplied inside a live DB read by the storage layer. An existing
+// row is locked; a missing row does not fence future INSERTs. It is not native
+// termination evidence. Canonical layout checks remain independent. No pipeline
+// or task is removed by this package.
 type AutoStage struct {
 	Allowed    bool
 	Reason     string
@@ -32,6 +33,17 @@ type AutoTarget struct {
 	observationError       error
 }
 type AutoState func(AutoTarget, func(AutoStage) error) error
+
+// PrivateTemporary identifies only GenerateSDR's unpublished namespaces under
+// cache/key. It is a scope check, not execution-termination or access evidence;
+// registered-root identity, participant census, gates and pinned files still
+// have to pass. Canonical cache/key and other sectors cannot inherit this policy.
+func (t AutoTarget) PrivateTemporary() bool {
+	if t.Canonical || !canonicalSector.MatchString(t.Sector) || !validRelative(filepath.Join(filepath.Base(t.Base), t.Relative)) {
+		return false
+	}
+	return t.Relative == t.Sector+".tmp" || filepath.Dir(t.Relative) == t.Sector+".sdr.tmp"
+}
 
 // AutoDiscard performs bounded namespace discovery, never recursive glob/rm.
 // Private old attempts and demonstrably incomplete canonical cache are checked
@@ -202,7 +214,7 @@ func autoDiscardContext(ctx context.Context, c *ManagedConfig, base string, stat
 					return removeAutoDirectory(f, t.Relative, dev, ino)
 				}
 				// Repin immediately before removal, while the sector gate and
-				// pipeline row are still held. No pathname-only recursive removal.
+				// any existing pipeline row are still held. No pathname-only removal.
 				if e = io.participants(c); e != nil {
 					return e
 				}
@@ -295,7 +307,7 @@ func autoFiles(d *os.File, t AutoTarget, s AutoStage) ([]LegacyFile, error) {
 	// Only GenerateSDR's unpublished staging namespaces permit name-independent
 	// discard. Canonical cache may be a published TreeRC input despite a stale DB
 	// stage; it retains the stricter receipt/layout checks below.
-	if !t.Canonical && !validRelative(filepath.Join(filepath.Base(t.Base), t.Relative)) {
+	if !t.Canonical && !t.PrivateTemporary() {
 		return nil, fmt.Errorf("not a private SDR temporary namespace")
 	}
 	// A marker is a reason to preserve, never merely an xattr-presence proof of
@@ -315,7 +327,7 @@ func autoFiles(d *os.File, t AutoTarget, s AutoStage) ([]LegacyFile, error) {
 	for _, n := range s.LayerNames {
 		allowed[n] = true
 	}
-	if len(allowed) == 0 || s.LayerBytes <= 0 {
+	if t.Canonical && (len(allowed) == 0 || s.LayerBytes <= 0) {
 		return nil, fmt.Errorf("SDR layout unknown")
 	}
 	var files []LegacyFile
@@ -328,7 +340,9 @@ func autoFiles(d *os.File, t AutoTarget, s AutoStage) ([]LegacyFile, error) {
 		if e != nil {
 			return nil, e
 		}
-		if st.Size < 0 || st.Size > s.LayerBytes {
+		// Private folders are disposed as a unit, even after their proof row
+		// disappears. A guessed proof/size must not become deletion authority.
+		if st.Size < 0 || (t.Canonical && st.Size > s.LayerBytes) {
 			return nil, fmt.Errorf("unexpected layer size")
 		}
 		if allowed[entry.Name()] && st.Size == s.LayerBytes {

@@ -16,6 +16,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/filecoin-project/go-state-types/abi"
+
 	"github.com/filecoin-project/curio/lib/sdrscratch"
 	"github.com/filecoin-project/curio/lib/storiface"
 
@@ -43,6 +45,9 @@ func (*retryStateIndex) BatchStorageDeclareSectors(context.Context, []SectorDecl
 }
 func (*retryStateIndex) StorageReportHealth(context.Context, storiface.ID, storiface.HealthReport) error {
 	return nil
+}
+func (*retryStateIndex) sdrExternallyReady(context.Context, abi.SectorID, storiface.SectorFileType) (bool, error) {
+	return true, nil // completed canonical fixture; no chain/native assertion
 }
 func (i *retryStateIndex) withSDRDiscardState(ctx context.Context, target sdrscratch.AutoTarget, apply func(sdrscratch.AutoStage) error) error {
 	m := i.roots[filepath.Dir(target.Base)]
@@ -80,6 +85,9 @@ func TestSDRAutoRetryLifecycle(t *testing.T) {
 				ls.c.StoragePaths = append(ls.c.StoragePaths, storiface.LocalPath{Path: root})
 				index.roots[root] = &retryStateMode{}
 				target := filepath.Join(root, "cache", "s-t01000-42.tmp")
+				if mode == "completed-denial-cache" {
+					target = filepath.Join(root, "cache", "s-t01000-42")
+				}
 				require.NoError(t, os.MkdirAll(target, 0700))
 				for _, name := range []string{"sc-02-data-layer-1.dat", "sc-02-data-layer-2.dat"} {
 					require.NoError(t, os.WriteFile(filepath.Join(target, name), make([]byte, 2048), 0600))

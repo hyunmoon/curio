@@ -26,6 +26,9 @@ func (dbi *DBIndex) withSDRDiscardState(ctx context.Context, t sdrscratch.AutoTa
 	if err != nil {
 		return err
 	}
+	if !t.Canonical && !t.PrivateTemporary() {
+		return fmt.Errorf("not a private SDR temporary namespace")
+	}
 	_, err = dbi.harmonyDB.BeginTransaction(ctx, func(tx *harmonydb.Tx) (bool, error) {
 		var rows []struct {
 			Proof int64 `db:"reg_seal_proof"`
@@ -44,6 +47,22 @@ func (dbi *DBIndex) withSDRDiscardState(ctx context.Context, t sdrscratch.AutoTa
 			return false, readErr
 		}
 		s := sdrscratch.AutoStage{Reason: "pipeline absent or ambiguous"}
+		if t.PrivateTemporary() && len(rows) <= 1 {
+			// The private path is never a TreeRC input, even if another attempt
+			// completed or normal GC removed the pipeline. Keep the real DB read
+			// (errors are NOT absence), but do not invent a proof for missing rows.
+			// An absent-row FOR UPDATE does not fence INSERT/claim: the caller's
+			// physical sector gate excludes Claim, native access and publication.
+			// Participant/termination, pinned identity and file checks still run.
+			stage := "pipeline absent (cause unknown)"
+			if len(rows) == 1 {
+				stage = "pre-SDR pipeline"
+				if rows[0].Done {
+					stage = "SDR/later stage completed"
+				}
+			}
+			return false, apply(sdrscratch.AutoStage{Allowed: true, Reason: "unpublished SDR temporary directory; " + stage})
+		}
 		if len(rows) != 1 {
 			return false, apply(s)
 		}
@@ -120,13 +139,13 @@ func (st *Local) autoDiscardSDR(ctx context.Context, local string, root *sdrClea
 		base := filepath.Join(local, ft.String())
 		results, err := sdrscratch.AutoDiscardContext(ctx, base, func(t sdrscratch.AutoTarget, fn func(sdrscratch.AutoStage) error) error {
 			key := filepath.Join(t.Base, t.Relative)
-			if now.Before(root.protectedUntil[key]) {
+			if t.Canonical && now.Before(root.protectedUntil[key]) {
 				return fn(sdrscratch.AutoStage{Reason: "recent protected pipeline state; deferred recheck"})
 			}
 			ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()
 			return db.withSDRDiscardState(ctx, t, func(s sdrscratch.AutoStage) error {
-				if !s.Allowed && s.Reason == "SDR/later stage completed" {
+				if t.Canonical && !s.Allowed && s.Reason == "SDR/later stage completed" {
 					if root.protectedUntil == nil {
 						root.protectedUntil = map[string]time.Time{}
 					}
@@ -139,7 +158,9 @@ func (st *Local) autoDiscardSDR(ctx context.Context, local string, root *sdrClea
 		})
 		for _, r := range results {
 			changed = changed || r.FilesRemoved > 0
-			if r.FilesRemoved > 0 || (verbose && r.Status != "protected") {
+			// Include protected reasons at startup and the existing 15-minute
+			// root interval, not once per file on every 30-second retry.
+			if r.FilesRemoved > 0 || verbose {
 				log.Infow("SDR automatic adoption", "path", r.Path, "status", r.Status, "reason", r.Reason, "filesRemoved", r.FilesRemoved, "allocatedBytes", r.AllocatedBytes, "freeBefore", r.FreeBefore, "freeAfter", r.FreeAfter)
 			}
 		}

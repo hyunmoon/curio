@@ -43,15 +43,21 @@ func TestSDRAutoRetryWithoutAdmissionDB(t *testing.T) {
 	write := func(n abi.SectorNumber, complete bool) string {
 		sector := abi.SectorID{Miner: 1000, Number: n}
 		target := filepath.Join(root, "cache", storiface.SectorName(sector)+".tmp")
+		if complete {
+			target = filepath.Join(root, "cache", storiface.SectorName(sector))
+		}
 		require.NoError(t, os.MkdirAll(target, 0700))
 		// No canonical layer: recovery must remove the actual native temporary
 		// name through the timer and republish capacity without a new admission.
 		require.NoError(t, os.WriteFile(filepath.Join(target, "sc-02-data-layer-1..tmp"), make([]byte, 2048), 0600))
-		_, err := db.Exec(context.Background(), `INSERT INTO sectors_sdr_pipeline(sp_id,sector_number,reg_seal_proof,after_sdr) VALUES(1000,$1,5,$2)`, n, complete)
-		require.NoError(t, err)
+		if n != 100 { // orphan with no surviving proof/layout row
+			_, err := db.Exec(context.Background(), `INSERT INTO sectors_sdr_pipeline(sp_id,sector_number,reg_seal_proof,after_sdr) VALUES(1000,$1,5,$2)`, n, complete)
+			require.NoError(t, err)
+		}
 		return target
 	}
 	old := write(100, false)
+	require.NoError(t, os.WriteFile(filepath.Join(old, "another-native-work"), make([]byte, 2048), 0600))
 	live := write(101, false)
 	complete := write(102, true)
 	lockDir := func(p string) *os.File {
@@ -90,17 +96,19 @@ func TestSDRAutoRetryWithoutAdmissionDB(t *testing.T) {
 	require.DirExists(t, old)
 	require.False(t, storage.HasCapacity())
 	require.Zero(t, claims.Load())
+	fault := sdrscratch.AutoFixtureFailUnlinkAfter(t, 1)
 	require.NoError(t, oldLock.Close())
 	require.Eventually(t, func() bool {
 		_, err := os.Stat(old)
 		return os.IsNotExist(err) && storage.HasCapacity()
 	}, 3*time.Second, 10*time.Millisecond, "R1: same Local must retry without Claim and publish reclaimed capacity")
 	require.Zero(t, claims.Load(), "cleanup must not manufacture task admission")
+	require.True(t, fault.Load(), "timer must retry the partial actual unlink failure")
 	require.DirExists(t, live)
 	require.DirExists(t, complete)
 	usedAfter, e := ls.DiskUsage(root)
 	require.NoError(t, e)
-	require.Equal(t, int64(2048), usedBefore-usedAfter, "actual layer bytes removed, not fixed available-space stub")
+	require.Equal(t, int64(4096), usedBefore-usedAfter, "actual private bytes removed, not fixed available-space stub")
 	after, e := local.FsStat(ctx, id)
 	require.NoError(t, e)
 	require.GreaterOrEqual(t, after.Available, int64(need))
@@ -114,6 +122,6 @@ func TestSDRAutoRetryWithoutAdmissionDB(t *testing.T) {
 	var pipelines, tasks int
 	require.NoError(t, db.QueryRow(ctx, `SELECT count(*) FROM sectors_sdr_pipeline`).Scan(&pipelines))
 	require.NoError(t, db.QueryRow(ctx, `SELECT count(*) FROM harmony_task`).Scan(&tasks))
-	require.Equal(t, 3, pipelines)
+	require.Equal(t, 2, pipelines)
 	require.Zero(t, tasks)
 }
