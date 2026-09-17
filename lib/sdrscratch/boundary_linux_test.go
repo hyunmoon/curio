@@ -105,6 +105,19 @@ func TestManagedLinuxKernelCrashAndChild(t *testing.T) {
 	line, err := bufio.NewReader(stdout).ReadString('\n')
 	require.NoError(t, err)
 	require.Equal(t, "child-ready", strings.TrimSpace(line))
+	// Task retirement uses the same real kernel subtree without consulting a
+	// scratch path. This test remains explicitly gated to the disposable unit.
+	session := &personalSession{host: h, domain: c.Domain, unit: c.Units[0]}
+	taskStopped := func(run ManagedRun) (bool, error) {
+		raw, e := json.Marshal(run)
+		if e != nil {
+			return false, e
+		}
+		return taskExecutionStopped(session, string(raw))
+	}
+	taskEnded, err := taskStopped(r)
+	require.NoError(t, err)
+	require.False(t, taskEnded)
 	require.NoError(t, cmd.Process.Signal(syscall.SIGSTOP))
 	stopped, err := b.Stopped(base, r)
 	require.NoError(t, err)
@@ -114,11 +127,21 @@ func TestManagedLinuxKernelCrashAndChild(t *testing.T) {
 	stopped, err = b.Stopped(base, r)
 	require.NoError(t, err)
 	require.False(t, stopped, "real descendant still executing after parent SIGKILL")
+	taskEnded, err = taskStopped(r)
+	require.NoError(t, err)
+	require.False(t, taskEnded, "task retirement also protects the live descendant")
 	result, err := sweepKernelTest(base, b)
 	require.Error(t, err)
 	require.Equal(t, "termination_required", result[0].Status)
 	require.FileExists(t, filepath.Join(p, "layer-child"))
 	require.Eventually(t, func() bool { ended, e := b.Stopped(base, r); return e == nil && ended }, 12*time.Second, 20*time.Millisecond)
+	taskEnded, err = taskStopped(r)
+	require.NoError(t, err)
+	require.True(t, taskEnded)
+	replaced := r
+	replaced.Inode++
+	_, err = taskStopped(replaced)
+	require.Error(t, err, "same path is not the same execution inode")
 	result, err = sweepKernelTest(base, b)
 	require.NoError(t, err)
 	require.Equal(t, 2, result[0].FilesRemoved)
@@ -127,9 +150,14 @@ func TestManagedLinuxKernelCrashAndChild(t *testing.T) {
 	stopped, err = b.Stopped(base, r)
 	require.NoError(t, err)
 	require.True(t, stopped)
+	taskEnded, err = taskStopped(r)
+	require.NoError(t, err)
+	require.True(t, taskEnded)
 	r.Host = "wrong"
 	_, err = b.Stopped(base, r)
 	require.Error(t, err)
+	_, err = taskStopped(r)
+	require.Error(t, err, "foreign host is not retirement evidence")
 }
 
 // Kernel lifetime test uses the actual scanner, but excludes accounting state

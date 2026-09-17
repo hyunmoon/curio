@@ -391,7 +391,7 @@ test('four execution sections coalesce only inside each section', () => {
   assert.equal(coalesced[0].ageLabel, 'Took');
   assert.equal(coalesced[3].ageLabel, 'Waiting');
   assert.match(RUNNING_AGE_TOOLTIP, /Do attempt/);
-  assert.match(PENDING_AGE_TOOLTIP, /posted/);
+  assert.match(PENDING_AGE_TOOLTIP, /verified unowned-queue entry/);
   assert.equal(
       CLUSTER_TASK_ORDER_POLICY,
       'Running: longest Took first across all task types and owners. Do entry is not a native liveness check.',

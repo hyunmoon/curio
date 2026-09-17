@@ -100,6 +100,9 @@ type ClusterTaskSummaryLimitedTask struct {
 	TookSeconds          *int64
 	TookState            string
 	AttemptID            *string
+	WaitingSeconds       *int64
+	WaitingState         string
+	ExecutionReason      string
 	Owner                *string
 	OwnerID              *int64
 }
@@ -137,6 +140,13 @@ type clusterTaskSummaryLimitedRow struct {
 	AttemptStartedAt   sql.NullTime
 	AttemptID          sql.NullString
 	AttemptStartSource sql.NullString
+	AttemptSession     sql.NullString
+	ProcessSession     sql.NullString
+	SDRReferences      sql.NullInt64
+	SDRReady           bool
+	SectorCreated      sql.NullTime
+	CreatedAt          sql.NullTime
+	QueuedAt           sql.NullTime
 	Owner              *string
 	OwnerID            *int64
 	State              string
@@ -172,6 +182,13 @@ type clusterTaskSummaryDBRow struct {
 	AttemptStartedAt   sql.NullTime   `db:"attempt_started_at"`
 	AttemptID          sql.NullString `db:"attempt_id"`
 	AttemptStartSource sql.NullString `db:"attempt_start_source"`
+	AttemptSession     sql.NullString `db:"attempt_session"`
+	ProcessSession     sql.NullString `db:"process_session"`
+	SDRReferences      sql.NullInt64  `db:"sdr_references"`
+	SDRReady           sql.NullBool   `db:"sdr_ready"`
+	SectorCreated      sql.NullTime   `db:"sector_created"`
+	CreatedAt          sql.NullTime   `db:"created_at"`
+	QueuedAt           sql.NullTime   `db:"queued_at"`
 	Owner              sql.NullString `db:"owner"`
 	OwnerID            sql.NullInt64  `db:"owner_id"`
 	State              sql.NullString `db:"state"`
@@ -184,6 +201,10 @@ type clusterTaskSummaryDBRow struct {
 const clusterTaskSummaryLimitedQuery = `
 WITH observed AS (
 	SELECT statement_timestamp() AS observed_at
+), sdr_links AS (
+	SELECT task_id_sdr, count(*) AS sdr_references,
+		bool_and(NOT after_sdr AND NOT failed) AS sdr_ready, max(create_time) AS sector_created
+	FROM sectors_sdr_pipeline WHERE task_id_sdr IS NOT NULL GROUP BY task_id_sdr
 ), raw_matching AS (
 	SELECT
 		t.id,
@@ -194,10 +215,16 @@ WITH observed AS (
 		t.attempt_started_at,
 		t.attempt_id,
 		t.attempt_start_source,
+		t.attempt_session, hm.process_session,
+		CASE WHEN t.name='SDR' THEN COALESCE(sl.sdr_references,0) END AS sdr_references,
+		COALESCE(sl.sdr_ready,false) AS sdr_ready, sl.sector_created,
+		t.created_at, t.queued_at,
 		t.owner_id,
 		o.observed_at,
 		CASE WHEN t.name::TEXT = ANY($5::TEXT[]) THEN 0 ELSE 1 END AS display_priority
 	FROM harmony_task t
+	LEFT JOIN harmony_machines hm ON hm.id=t.owner_id
+	LEFT JOIN sdr_links sl ON t.name='SDR' AND sl.task_id_sdr=t.id
 	CROSS JOIN observed o
 	WHERE ($1::BOOLEAN OR t.name NOT LIKE 'bg:%')
 		AND ($2::TEXT IS NULL OR t.name = $2)
@@ -215,7 +242,7 @@ WITH observed AS (
 		COUNT(*) FILTER (WHERE owner_id IS NULL) AS pending_total,
 		COUNT(*) FILTER (WHERE took_state = 'running') AS execution_total,
 		COUNT(*) FILTER (WHERE took_state = 'awaiting-start') AS awaiting_start_total,
-		COUNT(*) FILTER (WHERE took_state IN ('unknown', 'future-start')) AS unknown_total
+		COUNT(*) FILTER (WHERE owner_id IS NOT NULL AND took_state NOT IN ('running','awaiting-start')) AS unknown_total
 	FROM matching
 ),
 running AS (
@@ -251,6 +278,8 @@ SELECT
 	s.attempt_started_at,
 	s.attempt_id,
 	s.attempt_start_source,
+	s.attempt_session, s.process_session, s.sdr_references, s.sdr_ready,
+	s.sector_created, s.created_at, s.queued_at,
 	hm.host_and_port AS owner,
 	s.owner_id,
 	s.state,
@@ -319,10 +348,13 @@ func (s harmonyClusterTaskSummarySource) LoadSnapshot(ctx context.Context, appli
 			AttemptStartedAt:   row.AttemptStartedAt,
 			AttemptID:          row.AttemptID,
 			AttemptStartSource: row.AttemptStartSource,
-			Owner:              owner,
-			OwnerID:            ownerID,
-			State:              row.State.String,
-			DisplayPriority:    int(row.DisplayPriority.Int64),
+			AttemptSession:     row.AttemptSession, ProcessSession: row.ProcessSession,
+			SDRReferences: row.SDRReferences, SDRReady: row.SDRReady.Bool,
+			SectorCreated: row.SectorCreated, CreatedAt: row.CreatedAt, QueuedAt: row.QueuedAt,
+			Owner:           owner,
+			OwnerID:         ownerID,
+			State:           row.State.String,
+			DisplayPriority: int(row.DisplayPriority.Int64),
 		})
 	}
 
@@ -494,6 +526,8 @@ func buildLimitedTaskSummary(row clusterTaskSummaryLimitedRow, observedAt time.T
 	}
 
 	task.TookSeconds, task.TookState = taskTookAge(row, observedAt)
+	task.ExecutionReason = taskExecutionReason(task.TookState)
+	task.WaitingSeconds, task.WaitingState = taskWaitingAge(row, observedAt)
 	if row.AttemptID.Valid {
 		id := row.AttemptID.String
 		task.AttemptID = &id

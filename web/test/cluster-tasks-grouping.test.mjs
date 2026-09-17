@@ -25,6 +25,16 @@ test('coalescing handles empty and single-entry input', () => {
   assert.deepEqual(groupConsecutiveTasks([task]), [[task]]);
 });
 
+test('coalescing does not hide distinct execution or waiting provenance', () => {
+  const base = {State: 'running', Name: 'SDR', OwnerID: 7, SpID: ''};
+  const rows = ['previous-process', 'unreferenced', 'unknown'].map((TookState, ID) => ({...base, ID, TookState}));
+  assert.equal(groupConsecutiveTasks(rows).length, 3);
+  assert.equal(groupConsecutiveTasks([
+    {...base, State: 'pending', WaitingState: 'queue-entry'},
+    {...base, State: 'pending', WaitingState: 'unknown-provenance'},
+  ]).length, 2);
+});
+
 test('all grouping identity fields form group boundaries', () => {
   const tasks = [
     {ID: 1, State: 'pending', SpID: '1000', Name: 'SDR', OwnerID: null},

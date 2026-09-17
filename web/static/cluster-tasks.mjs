@@ -777,7 +777,8 @@ class ClusterTasks extends LitElement {
 
   renderRow(entry) {
     const hasOwner = entry.OwnerID !== null && entry.OwnerID !== undefined;
-    const state = clusterTaskExecutionSection(entry).replace('awaiting-start', 'Awaiting start');
+    const reasonLabels = {'previous-process': 'Previous process', unreferenced: 'Unreferenced', 'invalid-reference': 'Invalid reference'};
+    const state = reasonLabels[entry.TookState] || clusterTaskExecutionSection(entry).replace('awaiting-start', 'Awaiting start');
     const miner = entry.Miners?.length ? entry.Miners.join(', ') : entry.SpID ? entry.Miner : 'n/a';
     const ageValue = clusterTaskAge(entry, this.displayClock);
     const age = ageValue.text ?? formatTaskAgeSeconds(ageValue.seconds);

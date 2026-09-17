@@ -13,7 +13,7 @@ export const CLUSTER_TASK_ORDER_POLICY =
 export const RUNNING_AGE_TOOLTIP =
   'Took starts at entry into the current task Do attempt, matching new History records; not at claim or FFI entry.';
 export const PENDING_AGE_TOOLTIP =
-  'Waiting time starts when the task was posted.';
+  'Waiting starts at a verified unowned-queue entry, including retries. Posted remains a queue-order key; legacy waiting can be unknown.';
 export const UNKNOWN_RUNNING_AGE_TOOLTIP =
   'Ownership age is unknown because the timestamp or its provenance is unavailable.';
 export const INTERPOLATED_AGE_TOOLTIP =

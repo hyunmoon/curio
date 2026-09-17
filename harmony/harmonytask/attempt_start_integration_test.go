@@ -112,6 +112,14 @@ func TestTaskAttemptSQLMigrationAndIdentity(t *testing.T) {
 	read(1)
 	require.False(t, start.Valid || token.Valid || source.Valid, "upgrade must not backfill execution provenance")
 	applyAttemptMigration(t, ctx, conn, "20260912-task-acquisition-generation.sql")
+	// This historical partial-schema fixture needs the new columns used by
+	// today's attempt store; the normal integration fixture uses the full runner.
+	applyAttemptMigration(t, ctx, conn, "20231217-sdr-pipeline.sql")
+	applyAttemptMigration(t, ctx, conn, "20260917-task-lifetime.sql")
+	var invented bool
+	require.NoError(t, conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM harmony_task
+WHERE created_at IS NOT NULL OR queued_at IS NOT NULL OR attempt_session IS NOT NULL OR sdr_execution IS NOT NULL)`).Scan(&invented))
+	require.False(t, invented, "no invented queue/execution provenance for pre-migration rows")
 	var generation int64
 	require.NoError(t, db.QueryRow(ctx, RECOVER_TASK_ACQUISITION, 1, 101, 0).Scan(&generation))
 	first := harmonyTaskAttemptStore{db: db, owner: 101, generations: map[TaskID]int64{1: generation}}
@@ -201,7 +209,7 @@ func TestTaskAttemptSQLDoEntryAndRollback(t *testing.T) {
 	require.True(t, done)
 	require.True(t, history.Equal(entry), "live and new History starts must share the same instant")
 	committed, err := db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (bool, error) {
-		_, err := tx.Exec(PREPARE_TASK_ATTEMPT, "rolled-back", 1, 101, 0)
+		_, err := tx.Exec(PREPARE_TASK_ATTEMPT, "rolled-back", 1, 101, 0, "", "")
 		return false, err
 	})
 	require.NoError(t, err)
