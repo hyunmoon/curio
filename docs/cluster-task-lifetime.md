@@ -74,6 +74,25 @@ unknown to the new UI and ineligible for automatic retirement. Keep additive
 schema/tombstones if reverting binaries; do not remove them while new workers
 or the new API still depend on them. Never reset sequences/reuse retired IDs.
 
+Stage the rollout, rather than treating this as a static-page replacement:
+
+1. An approved new process must finish the ordinary startup migration runner
+   before new workers or WebRPC query the additional columns. Preserve the
+   migration ledger and existing task rows; do not backfill their provenance.
+2. Replace selected workers under the operator's normal drain/restart policy,
+   not an unconditional fleet restart. Only attempts prepared by a new worker
+   carry its session. An old worker may execute normally while showing Unknown.
+   Automatic retirement additionally requires the supported managed Linux
+   execution boundary on that worker; a WebRPC upgrade cannot supply it.
+3. Deploy the matching WebRPC and static UI together after schema readiness.
+   Existing pending rows remain Waiting=unknown without verified creation/queue
+   provenance. No fallback to posted_time or fabricated historical timestamps
+   is permitted. Unknown is a provenance classification, not proof of failure.
+4. If returning to an earlier binary, retain the additive columns, triggers,
+   ledger and tombstones. Old registration clears process_session; it must not
+   inherit a newer process's identity. SQL compatibility does not establish
+   concurrent mixed-version native safety or prove prior executions ended.
+
 In particular, pre-protocol orphan tasks lacking recorded execution identity
 remain protected. The observed old tasks cannot be declared ended solely from
 restart time, owner absence, age, `n/a`, or a missing pipeline. This candidate
@@ -82,7 +101,7 @@ non-Linux worker yields no automatic task-retirement evidence.
 
 ## Verification
 
-The integration-tag tests use an explicit disposable loopback PostgreSQL and
+The integration-tag tests use an explicit disposable loopback database and
 the actual migration runner. They cover real AddTask/claim/preparation/SDR
 success SQL, startup while cordoned/pacing-blocked, valid recovery, registry
 protection, independent-connection reclaim/reconnect races in both orders,
@@ -96,3 +115,13 @@ parent/descendant, subtree exit, replaced inode and foreign host. Cross-building
 that fixture is not executing it. Linux/native and Yugabyte execution remain
 separate validation gates; consult the external review archive for actual run
 results, commands, negative controls and offline browser screenshots.
+
+The follow-up migration fixture runs the real loader from the pre-lifetime
+embedded migration set through current startup, restart and return to the old
+startup set. It checks legacy row/ledger preservation, NULL provenance and
+retained tombstones. The old-worker fixture executes the frozen registration
+and preparation SQL plus the unchanged claim/completion functions. This is
+sequential SQL compatibility, not an old/new native scheduler fleet test.
+Lock observers use PostgreSQL backend dependencies or Yugabyte transaction
+UUID dependencies, with a real row-lock barrier rather than advisory locks.
+An observer or setup failure is not a successful contention test.

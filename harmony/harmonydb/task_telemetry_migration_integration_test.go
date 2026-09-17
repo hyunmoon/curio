@@ -96,12 +96,20 @@ func newTaskMigrationFixture(t *testing.T) *taskMigrationFixture {
 	_, err = rand.Read(nonce[:])
 	require.NoError(t, err)
 	schema := "itest_task_migration_" + hex.EncodeToString(nonce[:])
+	if os.Getenv("CURIO_DISPOSABLE_CURIO_SCHEMA") == "1" {
+		schema = "curio"
+		var exists bool
+		require.NoError(t, conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname='curio')`).Scan(&exists))
+		require.False(t, exists, "never adopt an existing curio schema")
+	}
 	_, err = conn.Exec(ctx, "SET search_path TO "+pgx.Identifier{schema}.Sanitize())
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		cleanupCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		cleanupCtx, stop := context.WithTimeout(context.Background(), 60*time.Second)
 		defer stop()
-		_, err := conn.Exec(cleanupCtx, "DROP SCHEMA IF EXISTS "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
+		_, err := conn.Exec(cleanupCtx, "SET statement_timeout='55s'")
+		require.NoError(t, err)
+		_, err = conn.Exec(cleanupCtx, "DROP SCHEMA IF EXISTS "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
 		require.NoError(t, err)
 	})
 	var version, isolation string
@@ -123,9 +131,17 @@ func (f *taskMigrationFixture) startup(t *testing.T, migrations *embed.FS) {
 	cfg.SqlEmbedFS = migrations // nil selects Curio's complete production embed.
 	db, err := NewFromConfig(cfg)
 	require.NoError(t, err)
+	var schema, path, host string
+	require.NoError(t, db.QueryRow(f.ctx, `SELECT current_schema(),current_setting('search_path'),host(inet_server_addr())`).Scan(&schema, &path, &host))
+	require.Equal(t, f.schema, schema)
+	require.Equal(t, f.schema, strings.Trim(path, "\""))
+	require.Equal(t, "127.0.0.1", host)
+	t.Logf("startup pool schema=%s search_path=%s", schema, path)
 	// HarmonyQuery's only public pool cleanup also drops this owned schema.
 	// Cleanup runs after all assertions; repeated owned-schema drops are harmless.
-	t.Cleanup(db.ITestDeleteAll)
+	if f.schema != "curio" {
+		t.Cleanup(db.ITestDeleteAll)
+	}
 }
 
 func (f *taskMigrationFixture) seed(t *testing.T, attempt, ownership bool) {

@@ -5,11 +5,14 @@ package harmonytask
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/yugabyte/pgx/v5"
 
 	"github.com/filecoin-project/curio/harmony/harmonydb"
 	"github.com/filecoin-project/curio/harmony/harmonytask/internal/runregistry"
@@ -98,6 +101,32 @@ func TestSDRRetirementSQLStartupDespiteCordonAndPacing(t *testing.T) {
 type retirementBoundaryFixture struct {
 	stopped bool
 	err     error
+}
+
+// Observe a real row-lock dependency, not a goroutine merely failing to finish.
+// Yugabyte exposes transaction UUIDs in pg_locks; PostgreSQL uses backend PIDs.
+func retirementLockHolder(t *testing.T, ctx context.Context, tx pgx.Tx, pid uint32) (bool, string) {
+	t.Helper()
+	var version string
+	require.NoError(t, tx.QueryRow(ctx, `SELECT version()`).Scan(&version))
+	yb := strings.Contains(version, "-YB-")
+	id := fmt.Sprint(pid)
+	if yb {
+		require.NoError(t, tx.QueryRow(ctx, `SELECT yb_get_current_transaction()::text`).Scan(&id))
+		_, err := tx.Exec(ctx, `SET LOCAL yb_locks_min_txn_age=0`)
+		require.NoError(t, err)
+	}
+	return yb, id
+}
+
+func retirementWaiter(ctx context.Context, tx pgx.Tx, yb bool, holder string) (string, error) {
+	var waiter string
+	q := `SELECT pid::text FROM pg_stat_activity WHERE $1::int=ANY(pg_blocking_pids(pid)) LIMIT 1`
+	if yb {
+		q = `SELECT ybdetails->>'transactionid' FROM pg_locks WHERE NOT granted AND (ybdetails->'blocked_by') ? $1 LIMIT 1`
+	}
+	err := tx.QueryRow(ctx, q, holder).Scan(&waiter)
+	return waiter, err
 }
 
 func (b retirementBoundaryFixture) TaskExecutionIdentity() (string, error) {
@@ -226,7 +255,7 @@ CREATE TRIGGER reject_retirement_fixture BEFORE DELETE ON harmony_task FOR EACH 
 }
 
 func TestSDRRetirementSQLReconnectAndClaimRace(t *testing.T) {
-	ctx, db, observer, conn := attemptSQLFixture(t)
+	ctx, db, _, conn := attemptSQLFixture(t)
 	for _, action := range []string{"reconnect", "reclaim"} {
 		t.Run(action, func(t *testing.T) {
 			h, r := newRetirementTask(t, ctx, db)
@@ -243,6 +272,7 @@ func TestSDRRetirementSQLReconnectAndClaimRace(t *testing.T) {
 				_, err = tx.Exec(ctx, `UPDATE harmony_task SET owner_generation=owner_generation+1 WHERE id=$1`, r.ID)
 			}
 			require.NoError(t, err)
+			yb, holder := retirementLockHolder(t, ctx, tx, conn.PgConn().PID())
 			type result struct {
 				ok  bool
 				err error
@@ -253,10 +283,10 @@ func TestSDRRetirementSQLReconnectAndClaimRace(t *testing.T) {
 				done <- result{ok, err}
 			}()
 			require.Eventually(t, func() bool {
-				var linked bool
-				err := observer.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) AND wait_event_type='Lock' AND query LIKE 'SELECT to_jsonb(t)%')`, conn.PgConn().PID()).Scan(&linked)
-				return err == nil && linked
+				_, err := retirementWaiter(ctx, tx, yb, holder)
+				return err == nil
 			}, time.Second, 5*time.Millisecond, "actual retirement lock wait not observed")
+			t.Logf("retirement blocked by %s transaction %s; Yugabyte=%v", action, holder, yb)
 			require.NoError(t, tx.Commit(ctx))
 			select {
 			case result := <-done:
@@ -277,14 +307,17 @@ func TestSDRRetirementSQLWinsReconnect(t *testing.T) {
 	h, r := newRetirementTask(t, ctx, db)
 	_, err := db.Exec(ctx, `UPDATE sectors_sdr_pipeline SET task_id_sdr=NULL WHERE task_id_sdr=$1`, r.ID)
 	require.NoError(t, err)
-	_, err = conn.Exec(ctx, `CREATE FUNCTION retirement_barrier_fixture() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(716019); RETURN NEW; END $$;
+	_, err = conn.Exec(ctx, `CREATE TABLE retirement_barrier_row(id INT PRIMARY KEY);
+INSERT INTO retirement_barrier_row VALUES(1);
+CREATE FUNCTION retirement_barrier_fixture() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM id FROM retirement_barrier_row WHERE id=1 FOR UPDATE; RETURN NEW; END $$;
 CREATE TRIGGER retirement_barrier_fixture BEFORE INSERT ON harmony_sdr_task_retirements FOR EACH ROW EXECUTE FUNCTION retirement_barrier_fixture()`)
 	require.NoError(t, err)
 	lock, err := conn.Begin(ctx)
 	require.NoError(t, err)
 	defer func() { _ = lock.Rollback(context.Background()) }()
-	_, err = lock.Exec(ctx, `SELECT pg_advisory_xact_lock(716019)`)
+	_, err = lock.Exec(ctx, `SELECT id FROM retirement_barrier_row WHERE id=1 FOR UPDATE`)
 	require.NoError(t, err)
+	yb, holder := retirementLockHolder(t, ctx, lock, conn.PgConn().PID())
 	retired := make(chan error, 1)
 	go func() {
 		ok, e := h.retireStoppedSDR(ctx, r, retirementBoundaryFixture{stopped: true})
@@ -293,9 +326,11 @@ CREATE TRIGGER retirement_barrier_fixture BEFORE INSERT ON harmony_sdr_task_reti
 		}
 		retired <- e
 	}()
-	var retirementPID int
+	var retirementID string
 	require.Eventually(t, func() bool {
-		return other.QueryRow(ctx, `SELECT pid FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) AND query LIKE 'INSERT INTO harmony_sdr_task_retirements%'`, conn.PgConn().PID()).Scan(&retirementPID) == nil
+		var e error
+		retirementID, e = retirementWaiter(ctx, lock, yb, holder)
+		return e == nil
 	}, time.Second, 5*time.Millisecond)
 	linked := make(chan error, 1)
 	go func() {
@@ -303,10 +338,10 @@ CREATE TRIGGER retirement_barrier_fixture BEFORE INSERT ON harmony_sdr_task_reti
 		linked <- e
 	}()
 	require.Eventually(t, func() bool {
-		var blocked bool
-		e := lock.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))`, retirementPID).Scan(&blocked)
-		return e == nil && blocked
+		_, e := retirementWaiter(ctx, lock, yb, retirementID)
+		return e == nil
 	}, time.Second, 5*time.Millisecond, "reconnection trigger must actually wait for retirement")
+	t.Logf("reconnection waits for retirement %s, which waits for barrier %s; Yugabyte=%v", retirementID, holder, yb)
 	require.NoError(t, lock.Commit(ctx))
 	require.NoError(t, <-retired)
 	require.ErrorContains(t, <-linked, "retired SDR")
