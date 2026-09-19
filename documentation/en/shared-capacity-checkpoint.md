@@ -1,5 +1,11 @@
 # Shared-filesystem capacity: implementation checkpoint, NOT deployable
 
+Historical checkpoint for `1efd33598c26cb62ad6a59203929995aacd8bc5c`.
+For the subsequent review fixes and updated source availability, see
+[shared-capacity-rework.md](shared-capacity-rework.md). Claims below about the
+missing crate and the original API/test coverage describe that earlier tree,
+not the subsequent rework. Neither checkpoint enables runtime admission.
+
 ## Status and source
 
 Baseline: personal `3631dd287043e1bd622c0c44dc23a301970c6cab`, tree

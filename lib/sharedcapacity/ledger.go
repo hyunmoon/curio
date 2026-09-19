@@ -20,7 +20,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const VERSION = 1
+const VERSION = 2
 const MAX_LEDGER_BYTES = 8 << 20
 
 var ErrCapacity = errors.New("WAIT_CAPACITY")
@@ -54,6 +54,7 @@ type State struct {
 	LockInode  uint64
 	Sequence   uint64
 	Entries    map[string]Entry
+	Receipts   map[string]Receipt `json:",omitempty"`
 }
 
 // Sample must be fresh, uncached and measured while the authority lock is held.
@@ -73,6 +74,9 @@ type Sampler func(context.Context, State) (Sample, error)
 type Decision struct {
 	Free, Credit, Future, Margin, Additional, Headroom int64
 	Sequence                                           uint64
+	// Set only after this allocator has validated the complete sample. A
+	// sampler error (even ErrCapacity) cannot manufacture this disposition.
+	validatedPressure bool
 }
 
 // Authority owns an already initialized, privately writable domain directory.
@@ -254,6 +258,12 @@ func (a *Authority) read() (State, error) {
 			return state, errors.New("unknown capacity entry state")
 		}
 	}
+	for client, r := range state.Receipts {
+		digest, err := hex.DecodeString(r.Digest)
+		if client == "" || len(client) > 256 || r.Sequence == 0 || r.Sequence == math.MaxUint64 || err != nil || len(digest) != sha256.Size {
+			return state, errors.New("invalid capacity receipt")
+		}
+	}
 	return state, nil
 }
 
@@ -299,6 +309,11 @@ func (a *Authority) write(s State) error {
 	if _, err = f.Write(b); err != nil {
 		return err
 	}
+	if a.fault != nil {
+		if err := a.fault("before-file-sync"); err != nil {
+			return err
+		}
+	}
 	if err = f.Sync(); err != nil {
 		return err
 	}
@@ -315,10 +330,18 @@ func (a *Authority) write(s State) error {
 	}
 	if a.fault != nil {
 		if err := a.fault("after-rename"); err != nil {
-			return err
+			return &publishedError{err}
 		}
 	}
-	return a.dir.Sync()
+	if err := a.dir.Sync(); err != nil {
+		return &publishedError{err}
+	}
+	if a.fault != nil {
+		if err := a.fault("after-sync"); err != nil {
+			return &publishedError{err}
+		}
+	}
+	return nil
 }
 
 func add(a, b int64) (int64, error) {
@@ -331,6 +354,8 @@ func add(a, b int64) (int64, error) {
 func (a *Authority) measure(ctx context.Context, s State, additional int64) (Decision, error) {
 	d := Decision{Margin: s.Policy.Margin, Additional: additional, Sequence: s.Sequence}
 	view := s
+	// Receipts are not sampler inputs; do not share a mutable map with it.
+	view.Receipts = nil
 	view.Entries = make(map[string]Entry, len(s.Entries))
 	for key, entry := range s.Entries {
 		view.Entries[key] = entry
@@ -366,6 +391,7 @@ func (a *Authority) measure(ctx context.Context, s State, additional int64) (Dec
 	}
 	d.Headroom = max(int64(0), d.Free-required)
 	if d.Free < required || d.Headroom < additional {
+		d.validatedPressure = true
 		return d, ErrCapacity
 	}
 	return d, nil
@@ -383,122 +409,4 @@ func (a *Authority) Inspect(ctx context.Context) (State, Decision, error) {
 		return err
 	})
 	return s, d, err
-}
-
-// Reserve grants only a tentative execution; no I/O is permitted before Start.
-// An existing resident sector is not charged a second complete envelope.
-func (a *Authority) Reserve(ctx context.Context, sector, boot string, envelope int64) (string, Decision, error) {
-	var d Decision
-	if sector == "" || boot == "" || envelope <= 0 {
-		return "", d, errors.New("invalid capacity request")
-	}
-	token, err := randomToken()
-	if err != nil {
-		return "", d, err
-	}
-	err = a.lock(ctx, func() error {
-		s, err := a.read()
-		if err != nil {
-			return err
-		}
-		old, ok := s.Entries[sector]
-		if ok && old.State != "resident" {
-			return ErrBusy
-		}
-		additional := envelope
-		if ok {
-			additional = max(int64(0), envelope-old.Envelope)
-			envelope = max(envelope, old.Envelope)
-		}
-		d, err = a.measure(ctx, s, additional)
-		// Existing protected growth is already promised. A physical free-space
-		// alarm must not revoke it or hand its budget to a new sector.
-		if err != nil && (!ok || additional != 0 || !errors.Is(err, ErrCapacity)) {
-			return err
-		}
-		s.Entries[sector] = Entry{Envelope: envelope, Prior: old.Envelope, Token: token, Boot: boot, State: "tentative"}
-		return a.write(s)
-	})
-	if err != nil {
-		return "", d, err
-	}
-	return token, d, nil
-}
-
-func (a *Authority) transition(ctx context.Context, sector, token, from, to string) error {
-	return a.lock(ctx, func() error {
-		s, err := a.read()
-		if err != nil {
-			return err
-		}
-		e, ok := s.Entries[sector]
-		if !ok || e.Token != token || e.State != from {
-			return ErrIdentity
-		}
-		e.State = to
-		s.Entries[sector] = e
-		return a.write(s)
-	})
-}
-
-func (a *Authority) Start(ctx context.Context, sector, token string) error {
-	return a.transition(ctx, sector, token, "tentative", "running")
-}
-
-// Returned requires synchronous completion of all writes, not cancellation,
-// loss of task ownership, heartbeat expiration or release of an OS lock.
-func (a *Authority) Returned(ctx context.Context, sector, token string) error {
-	return a.transition(ctx, sector, token, "running", "resident")
-}
-
-// Cancel rolls back only an unstarted request. No writer (including fetch) may
-// write before Start. It cannot remove a previous sector residency commitment.
-func (a *Authority) Cancel(ctx context.Context, sector, token string) error {
-	return a.lock(ctx, func() error {
-		s, err := a.read()
-		if err != nil {
-			return err
-		}
-		e, ok := s.Entries[sector]
-		if !ok || e.Token != token || e.State != "tentative" {
-			return ErrIdentity
-		}
-		if e.Prior == 0 {
-			delete(s.Entries, sector)
-		} else {
-			e.Envelope, e.Prior, e.State = e.Prior, 0, "resident"
-			s.Entries[sector] = e
-		}
-		return a.write(s)
-	})
-}
-
-// Reconcile lowers an envelope only after the caller proves the old writer has
-// ended AND the new footprint/future-write bound. It must also retain any debt
-// from unlinked-but-open files. Neither age nor process death supplies that proof.
-// proof executes under the short authority lock; it must not wait for native I/O.
-func (a *Authority) Reconcile(ctx context.Context, sector, token string, envelope int64, proof func(Entry) error) error {
-	if envelope < 0 || proof == nil {
-		return errors.New("missing capacity reconciliation proof")
-	}
-	return a.lock(ctx, func() error {
-		s, err := a.read()
-		if err != nil {
-			return err
-		}
-		e, ok := s.Entries[sector]
-		if !ok || e.Token != token || envelope > e.Envelope {
-			return ErrIdentity
-		}
-		if err := proof(e); err != nil {
-			return err
-		}
-		if envelope == 0 {
-			delete(s.Entries, sector)
-		} else {
-			e.Envelope, e.Prior, e.State = envelope, 0, "resident"
-			s.Entries[sector] = e
-		}
-		return a.write(s)
-	})
 }
