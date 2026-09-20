@@ -43,19 +43,25 @@ type cleanupState struct {
 	LockDevice uint64
 	LockInode  uint64
 	Jobs       []cleanupJob
+	Completed  []cleanupJob
 }
 
 type cleanupJob struct {
-	ID      string
-	Request Request
+	ID           string
+	Request      Request
+	Acknowledged bool // caller relinquished Submit retry rights; not disk refund
 }
 
-// CleanupResult separates durable acceptance from completion. A queued request
-// is not a successful refund. Query the authority/receipt via Resolve to prove
-// completion; callers do not resubmit under a different request identity.
+const maxCleanupRecords = 1024
+
+// CleanupResult separates durable acceptance from terminal handling. Completed
+// includes a token-validated no-op (e.g. Cancel of a running writer), NOT a disk
+// refund. Repeat Submit with the exact payload to query retained evidence;
+// callers never resubmit under a different request identity.
 type CleanupResult struct {
-	ID      string
-	Durable bool
+	ID        string
+	Durable   bool
+	Completed bool
 }
 
 type PendingCleanup struct {
@@ -139,7 +145,7 @@ func OpenCleanupJournal(a *Authority, dir, client string, create bool) (*Cleanup
 		}); err != nil {
 			return fail(err)
 		}
-		j.state = cleanupState{Version: 1, Identity: a.identity, Client: client, LockDevice: uint64(st.Dev), LockInode: st.Ino}
+		j.state = cleanupState{Version: 2, Identity: a.identity, Client: client, LockDevice: uint64(st.Dev), LockInode: st.Ino}
 		if err := j.write(); err != nil {
 			return fail(err)
 		}
@@ -180,9 +186,7 @@ func (j *CleanupJournal) Submit(ctx context.Context, op, sector, token string) (
 	if (op != "cancel" && op != "returned") || sector == "" || token == "" {
 		return CleanupResult{}, ErrRequest
 	}
-	payload, _ := json.Marshal([]string{op, sector, token})
-	hash := sha256.Sum256(payload)
-	id := hex.EncodeToString(hash[:])
+	id := cleanupID(op, sector, token)
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -193,6 +197,14 @@ func (j *CleanupJournal) Submit(ctx context.Context, op, sector, token string) (
 	if err := j.read(); err != nil {
 		return CleanupResult{ID: id}, err
 	}
+	for _, job := range j.state.Completed {
+		if job.ID == id {
+			if err := j.dir.Sync(); err != nil {
+				return CleanupResult{ID: id}, err
+			}
+			return CleanupResult{ID: id, Durable: true, Completed: true}, nil
+		}
+	}
 	for _, job := range j.state.Jobs {
 		if job.ID == id {
 			if err := j.dir.Sync(); err != nil {
@@ -202,24 +214,69 @@ func (j *CleanupJournal) Submit(ctx context.Context, op, sector, token string) (
 			return CleanupResult{ID: id, Durable: true}, nil
 		}
 	}
-	// If the exact cleanup already completed, prove its effect against the
-	// token. A replacement token is NOT permission to mutate its new owner.
+	if len(j.state.Jobs)+len(j.state.Completed) >= maxCleanupRecords {
+		return CleanupResult{ID: id}, errors.New("cleanup journal full; acknowledge completed handoffs or retain caller quarantine")
+	}
+	// A new request may already be a no-op against this exact current token.
+	// Persist that observation before acknowledging it, independently of later
+	// token changes. Absent/replaced entries alone never prove old completion.
 	done, err := j.completed(ctx, op, sector, token)
 	if err != nil {
 		return CleanupResult{ID: id}, err
 	}
+	job := cleanupJob{ID: id, Request: Request{Client: j.client, Operation: op, Sector: sector, Token: token}}
 	if done {
-		return CleanupResult{ID: id, Durable: true}, nil
+		j.state.Completed = append(j.state.Completed, job)
+	} else {
+		j.state.Jobs = append(j.state.Jobs, job)
 	}
-	if len(j.state.Jobs) >= 1024 {
-		return CleanupResult{ID: id}, errors.New("cleanup journal full; retain caller quarantine")
-	}
-	j.state.Jobs = append(j.state.Jobs, cleanupJob{ID: id, Request: Request{Client: j.client, Operation: op, Sector: sector, Token: token}})
 	if err := j.write(); err != nil {
 		return CleanupResult{ID: id}, err
 	}
 	j.signal()
-	return CleanupResult{ID: id, Durable: true}, nil
+	return CleanupResult{ID: id, Durable: true, Completed: done}, nil
+}
+
+func cleanupID(op, sector, token string) string {
+	payload, _ := json.Marshal([]string{op, sector, token})
+	hash := sha256.Sum256(payload)
+	return hex.EncodeToString(hash[:])
+}
+
+// Acknowledge ends the caller's right to retry Submit for this ID. The caller
+// must first durably retire its own retry intent. Pending mutations remain the
+// journal's responsibility; completed evidence may now be collected. A failed
+// acknowledgement is retried using Acknowledge, never by issuing Submit again.
+// There is no time-based eviction. Unacknowledged evidence consumes a bounded
+// slot; a crashed caller must recover its retire/ack protocol before GC.
+func (j *CleanupJournal) Acknowledge(ctx context.Context, id string) error {
+	b, err := hex.DecodeString(id)
+	if err != nil || len(b) != sha256.Size {
+		return ErrRequest
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := j.read(); err != nil {
+		return err
+	}
+	for i := range j.state.Jobs {
+		if j.state.Jobs[i].ID == id {
+			j.state.Jobs[i].Acknowledged = true
+			return j.write()
+		}
+	}
+	for i := range j.state.Completed {
+		if j.state.Completed[i].ID == id {
+			j.state.Completed = append(j.state.Completed[:i], j.state.Completed[i+1:]...)
+			return j.write()
+		}
+	}
+	// Idempotent ACK after an uncertain rename/previous GC. This says nothing
+	// about completion and never issues any authority mutation.
+	return j.dir.Sync()
 }
 
 func (j *CleanupJournal) signal() {
@@ -238,10 +295,6 @@ func (j *CleanupJournal) completed(ctx context.Context, op, sector, token string
 		}
 		e, ok := s.Entries[sector]
 		if !ok {
-			if op == "cancel" {
-				done = true
-				return nil
-			}
 			return ErrIdentity
 		}
 		if e.Token != token {
@@ -291,6 +344,11 @@ func (j *CleanupJournal) Recover(ctx context.Context) error {
 				return e
 			}
 			if done {
+				if !job.Acknowledged {
+					terminal := *job
+					terminal.Request.Sequence = 0 // observed no-op, not an Apply receipt
+					j.state.Completed = append(j.state.Completed, terminal)
+				}
 				j.state.Jobs = j.state.Jobs[1:]
 				if err := j.write(); err != nil {
 					return err
@@ -306,6 +364,9 @@ func (j *CleanupJournal) Recover(ctx context.Context) error {
 			return fmt.Errorf("cleanup unresolved: %s", out.Status)
 		}
 		j.state.Sequence = job.Request.Sequence
+		if !job.Acknowledged {
+			j.state.Completed = append(j.state.Completed, *job)
+		}
 		j.state.Jobs = j.state.Jobs[1:]
 		if err := j.write(); err != nil {
 			return err
@@ -357,16 +418,25 @@ func (j *CleanupJournal) read() error {
 	if err := json.Unmarshal(record.Payload, &state); err != nil {
 		return err
 	}
-	if state.Version != 1 || state.Identity != j.a.identity || state.Client != j.client || state.LockDevice != uint64(lock.Dev) || state.LockInode != lock.Ino || len(state.Jobs) > 1024 {
+	if (state.Version != 1 && state.Version != 2) || state.Identity != j.a.identity || state.Client != j.client || state.LockDevice != uint64(lock.Dev) || state.LockInode != lock.Ino || len(state.Jobs)+len(state.Completed) > maxCleanupRecords {
 		return ErrIdentity
 	}
+	if state.Version == 1 && len(state.Completed) != 0 {
+		return ErrRequest
+	}
+	// Forward-only format upgrade; a v1 reader must not silently drop terminal
+	// evidence. Old, already-discarded receipts cannot be reconstructed.
+	state.Version = 2
 	seen := map[string]bool{}
-	for i, job := range state.Jobs {
+	for i, job := range append(append([]cleanupJob(nil), state.Jobs...), state.Completed...) {
 		r := job.Request
-		if seen[job.ID] || job.ID == "" || r.Client != j.client || r.Sector == "" || r.Token == "" || (r.Operation != "cancel" && r.Operation != "returned") || r.Envelope != 0 || r.Boot != "" {
+		if seen[job.ID] || job.ID != cleanupID(r.Operation, r.Sector, r.Token) || r.Client != j.client || r.Sector == "" || r.Token == "" || (r.Operation != "cancel" && r.Operation != "returned") || r.Envelope != 0 || r.Boot != "" {
 			return ErrRequest
 		}
-		if r.Sequence != 0 && (i != 0 || r.Sequence != state.Sequence+1) {
+		if i < len(state.Jobs) && r.Sequence != 0 && (i != 0 || r.Sequence != state.Sequence+1) {
+			return ErrRequest
+		}
+		if i >= len(state.Jobs) && (r.Sequence > state.Sequence || job.Acknowledged) {
 			return ErrRequest
 		}
 		seen[job.ID] = true

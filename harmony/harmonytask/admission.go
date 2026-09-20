@@ -37,6 +37,7 @@ type taskAdmission struct {
 	mu                sync.Mutex
 	ready             bool
 	enteredExecution  bool
+	executionReturned bool
 	taken             bool
 	finished          bool
 	quarantined       bool
@@ -276,11 +277,21 @@ func (a *taskAdmission) finishedStorage(err error) {
 	a.h.wakeAdmission()
 }
 
+// Transfer to the cleanup liability budget BEFORE returning execution permits.
+// The scheduler can then reuse CPU/RAM without losing track of a blocked first
+// cleanup. In addition to maxPendingAdmissions, already-entered Do workers may
+// return concurrently (bounded by their existing resource/Max limits).
+func (a *taskAdmission) returnedExecution() {
+	a.mu.Lock()
+	a.executionReturned = true
+	a.mu.Unlock()
+}
+
 func (h *taskTypeHandler) pendingAdmissionCount() int {
 	count := 0
 	for _, a := range h.admissions {
 		a.mu.Lock()
-		if !a.enteredExecution || a.finished {
+		if !a.enteredExecution || a.executionReturned || a.finished {
 			count++
 		}
 		a.mu.Unlock()

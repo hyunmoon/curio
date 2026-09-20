@@ -204,6 +204,12 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 	if maxAcceptable > headroomUntilMax {
 		maxAcceptable = headroomUntilMax
 	}
+	// Entered workers can return while CanAccept runs, transferring their
+	// cleanup liability into this budget. Never pass exhausted/negative room
+	// to claim or consume a pacing reservation for it.
+	if maxAcceptable <= 0 {
+		return false
+	}
 
 	tIDs = lo.Filter(tIDs, func(tID TaskID, _ int) bool {
 		v, ok := h.storageFailures[tID]
@@ -300,6 +306,7 @@ func (h *taskTypeHandler) dispatchAdmission(a *taskAdmission) {
 			taskCancel()
 
 			preempted := handle.IsPreempted()
+			a.returnedExecution()
 			a.releaseLocal()
 			storageErr := a.releaseStorage()
 			a.finishedStorage(storageErr)
