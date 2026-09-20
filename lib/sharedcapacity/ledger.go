@@ -74,6 +74,9 @@ type Sampler func(context.Context, State) (Sample, error)
 type Decision struct {
 	Free, Credit, Future, Margin, Additional, Headroom int64
 	Sequence                                           uint64
+	// MeasurementValid means the complete sample and byte arithmetic passed
+	// validation. A valid decision can still deny admission under pressure.
+	MeasurementValid bool
 	// Set only after this allocator has validated the complete sample. A
 	// sampler error (even ErrCapacity) cannot manufacture this disposition.
 	validatedPressure bool
@@ -390,6 +393,7 @@ func (a *Authority) measure(ctx context.Context, s State, additional int64) (Dec
 		return d, err
 	}
 	d.Headroom = max(int64(0), d.Free-required)
+	d.MeasurementValid = true
 	if d.Free < required || d.Headroom < additional {
 		d.validatedPressure = true
 		return d, ErrCapacity

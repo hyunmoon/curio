@@ -151,6 +151,7 @@ func (a *Authority) Apply(ctx context.Context, r Request, proof func(Entry) erro
 				additional = max(int64(0), r.Envelope-e.Envelope)
 			}
 			d, err = a.measure(ctx, s, additional)
+			out.Decision = d
 			if err != nil && (!exists || additional != 0 || !d.validatedPressure) {
 				return err
 			}
