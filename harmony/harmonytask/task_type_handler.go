@@ -58,6 +58,7 @@ type taskTypeHandler struct {
 	// safe without a mutex.
 	storageFailures      map[TaskID]time.Time
 	lastAcceptRefusalLog time.Time
+	cleanupSlots         chan struct{} // initialized by scheduler; at most four recovery I/O workers
 
 	// --- concurrent state, encapsulated behind typed APIs ---
 	//
@@ -164,7 +165,7 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 	if h.admissions == nil {
 		h.admissions = make(map[TaskID]*taskAdmission)
 	}
-	if len(h.admissions) >= maxPendingAdmissions {
+	if h.pendingAdmissionCount() >= maxPendingAdmissions {
 		return false
 	}
 	if h.Max.AtMax() {
@@ -198,7 +199,7 @@ func (h *taskTypeHandler) considerWorkWithOwnership(from string, tasks []task, e
 
 	tIDs = reorderTaskIDsByPostedOrder(tasks, tIDs)
 
-	maxAcceptable = min(maxAcceptable, maxPendingAdmissions-len(h.admissions))
+	maxAcceptable = min(maxAcceptable, maxPendingAdmissions-h.pendingAdmissionCount())
 	headroomUntilMax := h.Max.Headroom()
 	if maxAcceptable > headroomUntilMax {
 		maxAcceptable = headroomUntilMax
@@ -300,6 +301,13 @@ func (h *taskTypeHandler) dispatchAdmission(a *taskAdmission) {
 
 			preempted := handle.IsPreempted()
 			a.releaseLocal()
+			storageErr := a.releaseStorage()
+			a.finishedStorage(storageErr)
+			if storageErr != nil {
+				// The storage owner retains the unresolved claim; never report
+				// this as a released capacity grant or refund execution history.
+				log.Errorw("Task storage cleanup unresolved", "id", tID, "error", storageErr)
+			}
 			var result taskCompletion
 			if h.completionRecorder != nil {
 				h.completionRecorder(tID, done, doErr)

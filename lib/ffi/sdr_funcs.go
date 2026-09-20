@@ -89,6 +89,9 @@ func (l *storageProvider) AcquireSector(ctx context.Context, taskID *harmonytask
 		}
 	}
 	if ok && resv != nil {
+		if invocation, scoped := ctx.Value(capacityInvocationKey{}).(*capacityInvocation); scoped && invocation.reservation != resv {
+			return storiface.SectorPaths{}, storiface.SectorPaths{}, nil, xerrors.New("SDR reservation replaced before acquire")
+		}
 		if resv.Alloc != allocate || resv.Existing != existing {
 			// this should never happen, only when task definition is wrong
 			return storiface.SectorPaths{}, storiface.SectorPaths{}, nil, xerrors.Errorf("storage reservation type mismatch")
@@ -100,7 +103,11 @@ func (l *storageProvider) AcquireSector(ctx context.Context, taskID *harmonytask
 		storageIDs = resv.PathIDs
 		releaseStorage = resv.Release
 		if resv.capacity != nil {
-			if err := resv.capacity.Begin(ctx); err != nil {
+			invocation, _ := ctx.Value(capacityInvocationKey{}).(*capacityInvocation)
+			if invocation == nil {
+				return storiface.SectorPaths{}, storiface.SectorPaths{}, nil, xerrors.New("capacity writer requires an invocation scope")
+			}
+			if err := invocation.acquire(ctx, resv); err != nil {
 				return storiface.SectorPaths{}, storiface.SectorPaths{}, nil, err
 			}
 		}
@@ -179,13 +186,19 @@ func (sb *SealCalls) generateSDR(ctx context.Context, taskID harmonytask.TaskID,
 	// Capture this execution's claims, not a later reservation for the same
 	// task. Panic/Goexit/cancellation alone must not record a native return.
 	resvs, _ := sb.Sectors.storageReservations.Load(taskID)
-	retErr = sb.generateSDRBody(ctx, taskID, into, sector, ticket, commDcid, generate, beforeCleanup, scratchOptions, ticketEpoch...)
+	invocation := &capacityInvocation{}
 	for _, res := range resvs {
-		if res.SectorRef.ID() == sector.ID && res.capacity != nil {
-			retErr = errors.Join(retErr, res.capacity.Returned(context.Background()))
+		if res.SectorRef.ID() == sector.ID {
+			invocation.reservation = res
+			break
 		}
 	}
-	return retErr
+	ctx = context.WithValue(ctx, capacityInvocationKey{}, invocation)
+	retErr = sb.generateSDRBody(ctx, taskID, into, sector, ticket, commDcid, generate, beforeCleanup, scratchOptions, ticketEpoch...)
+	// Deliberately NOT deferred: panic/Goexit/cancellation are not native return
+	// evidence. Body defers (including scratch execution-lease release) finish
+	// before this capability is used. A rejected Begin has no capability.
+	return errors.Join(retErr, invocation.returned(context.Background()))
 }
 
 func (sb *SealCalls) generateSDRBody(ctx context.Context, taskID harmonytask.TaskID, into storiface.SectorFileType, sector storiface.SectorRef, ticket abi.SealRandomness, commDcid cid.Cid, generate func(abi.RegisteredSealProof, string, [32]byte) error, beforeCleanup func(string) error, scratchOptions sdrscratch.Options, ticketEpoch ...abi.ChainEpoch) (retErr error) {
@@ -222,12 +235,8 @@ func (sb *SealCalls) generateSDRBody(ctx context.Context, taskID harmonytask.Tas
 		return err
 	}
 	var reservation *sdrReservation
-	resvs, _ := sb.Sectors.storageReservations.Load(taskID)
-	for _, res := range resvs {
-		if res.SectorRef.ID() == sector.ID {
-			reservation = res.SDR
-			break
-		}
+	if invocation, ok := ctx.Value(capacityInvocationKey{}).(*capacityInvocation); ok && invocation.reservation != nil {
+		reservation = invocation.reservation.SDR
 	}
 	if reservation == nil {
 		return xerrors.New("SDR requires attempt-owned storage reservation")

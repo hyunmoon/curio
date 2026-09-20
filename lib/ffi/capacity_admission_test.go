@@ -79,6 +79,7 @@ type capacityCallerAdapter struct {
 	journal  string
 	envelope int64
 	client   string
+	cleanup  *sharedcapacity.CleanupJournal
 }
 
 func (a *capacityCallerAdapter) apply(ctx context.Context, op, key, token string, bytes int64) (sharedcapacity.Outcome, error) {
@@ -128,27 +129,37 @@ type capacityCallerClaim struct {
 	started, ended, cancelled bool
 }
 
-func (c *capacityCallerClaim) Begin(ctx context.Context) error {
+func (c *capacityCallerClaim) Begin(ctx context.Context) (capacityExecution, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.started || c.ended || c.cancelled {
-		return errors.New("writer already entered or claim cancelled")
+		return nil, errors.New("writer already entered or claim cancelled")
 	}
 	_, e := c.adapter.apply(ctx, "start", c.key, c.token, 0)
 	if e == nil {
 		c.started = true
 	}
-	return e
+	if e != nil {
+		return nil, e
+	}
+	return &capacityCallerExecution{claim: c}, nil
 }
-func (c *capacityCallerClaim) Returned(ctx context.Context) error {
+
+type capacityCallerExecution struct{ claim *capacityCallerClaim }
+
+func (execution *capacityCallerExecution) Returned(ctx context.Context) error {
+	c := execution.claim
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.started || c.ended {
 		return nil
 	}
-	_, e := c.adapter.apply(ctx, "returned", c.key, c.token, 0)
+	e := submitCapacityCleanup(ctx, c.adapter.cleanup, "returned", c.key, c.token)
 	if e == nil {
 		c.ended = true
+		// Assertions below inspect immediately. Production handoff does NOT
+		// wait for this worker; keep the deterministic observation test-only.
+		e = c.adapter.cleanup.Recover(ctx)
 	}
 	return e
 }
@@ -158,9 +169,10 @@ func (c *capacityCallerClaim) Cancel(ctx context.Context) error {
 	if c.started || c.cancelled {
 		return nil
 	}
-	_, e := c.adapter.apply(ctx, "cancel", c.key, c.token, 0)
+	e := submitCapacityCleanup(ctx, c.adapter.cleanup, "cancel", c.key, c.token)
 	if e == nil {
 		c.cancelled = true
+		e = c.adapter.cleanup.Recover(ctx)
 	}
 	return e
 }
@@ -179,7 +191,10 @@ func capacityCaller(t *testing.T, a *sharedcapacity.Authority, id string) (*Seal
 	remote, e := paths.NewRemote(local, idx, nil, 1, nil)
 	require.NoError(t, e)
 	sb := NewSealCalls(remote, local, idx)
-	sb.Sectors.capacity = &capacityCallerAdapter{a: a, client: id, journal: filepath.Join(root, "intent.json"), envelope: 64 << 20}
+	cleanup, e := sharedcapacity.OpenCleanupJournal(a, t.TempDir(), id+"-cleanup", true)
+	require.NoError(t, e)
+	t.Cleanup(func() { require.NoError(t, cleanup.Close()) })
+	sb.Sectors.capacity = &capacityCallerAdapter{a: a, client: id, journal: filepath.Join(root, "intent.json"), envelope: 64 << 20, cleanup: cleanup}
 	storage := sb.Storage(func(id harmonytask.TaskID) (SectorRef, error) {
 		return SectorRef{SpID: 1000, SectorNumber: int64(id), RegSealProof: 8}, nil
 	}, storiface.FTCache, storiface.FTNone, 32<<30, storiface.PathSealing, 0).ForSDR()

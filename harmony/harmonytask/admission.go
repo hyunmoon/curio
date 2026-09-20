@@ -17,31 +17,36 @@ const maxPendingAdmissions = 100
 // admissions is scheduler-owned. Workers only mutate their own locked result.
 // Quarantine consumes a bounded slot until process recovery; it never busy-retries.
 type taskAdmission struct {
-	h               *taskTypeHandler
-	id              TaskID
-	from            string
-	tasks           []task
-	store           taskAttemptStore
-	token           string
-	reservation     *taskStartReservation
-	ee              eventEmitter
-	ctx             context.Context
-	cancel          context.CancelFunc
-	handle          *runregistry.Handle
-	entered         chan struct{}
-	workerDone      chan struct{}
-	localDone       chan struct{}
-	release         func([]TaskID, map[TaskID]string) error
-	stopEngine      func() bool
-	localOnce       sync.Once
-	mu              sync.Mutex
-	ready           bool
-	taken           bool
-	finished        bool
-	quarantined     bool
-	storage         func()
-	storagePrepared bool
-	storageError    error
+	h                 *taskTypeHandler
+	id                TaskID
+	from              string
+	tasks             []task
+	store             taskAttemptStore
+	token             string
+	reservation       *taskStartReservation
+	ee                eventEmitter
+	ctx               context.Context
+	cancel            context.CancelFunc
+	handle            *runregistry.Handle
+	entered           chan struct{}
+	workerDone        chan struct{}
+	localDone         chan struct{}
+	release           func([]TaskID, map[TaskID]string) error
+	stopEngine        func() bool
+	localOnce         sync.Once
+	mu                sync.Mutex
+	ready             bool
+	enteredExecution  bool
+	taken             bool
+	finished          bool
+	quarantined       bool
+	storage           func() error
+	storagePrepared   bool
+	storageError      error
+	dbCleanupError    error
+	storageUnresolved bool
+	recovering        bool
+	retryCleanupAt    time.Time
 }
 
 func (h *taskTypeHandler) wakeAdmission() {
@@ -88,10 +93,10 @@ func (a *taskAdmission) prepare() {
 	}
 	stop()
 	prepared := err == nil
-	if prepared && a.ctx.Err() == nil {
+	if prepared && a.ctx.Err() == nil && a.h.Cost.Storage != nil {
+		var release func() error
+		var handled bool
 		if storage, ok := a.h.Cost.Storage.(resources.PreparedStorage); ok {
-			var release func() error
-			var handled bool
 			err = admissionIO(func() error {
 				var claimErr error
 				release, handled, claimErr = storage.PrepareStorageClaim(a.ctx, int(a.id))
@@ -100,17 +105,17 @@ func (a *taskAdmission) prepare() {
 			if err == nil && ((handled && release == nil) || (!handled && release != nil)) {
 				err = fmt.Errorf("invalid prepared storage cleanup contract")
 			}
-			if release != nil {
-				a.attachStorage(func() {
-					if e := release(); e != nil {
-						log.Errorw("Prepared storage cleanup", "id", a.id, "error", e)
-					}
-				})
-			}
-			a.mu.Lock()
-			a.storagePrepared, a.storageError = handled, err
-			a.mu.Unlock()
 		}
+		if err == nil && !handled && a.ctx.Err() == nil {
+			h := a.h
+			err = admissionIO(func() error { var e error; release, e = h.Cost.Claim(int(a.id)); return e })
+		}
+		if release != nil {
+			a.attachStorage(release)
+		}
+		a.mu.Lock()
+		a.storagePrepared, a.storageError = true, err
+		a.mu.Unlock()
 	}
 	if prepared && err == nil && a.ctx.Err() == nil {
 		a.mu.Lock()
@@ -119,9 +124,6 @@ func (a *taskAdmission) prepare() {
 		a.h.wakeAdmission()
 		select {
 		case <-a.entered:
-			a.mu.Lock()
-			a.finished = true
-			a.mu.Unlock()
 			a.h.wakeAdmission()
 			return
 		case <-a.ctx.Done():
@@ -130,9 +132,6 @@ func (a *taskAdmission) prepare() {
 	// Do-entry wins against cancellation. A running task owns completion now.
 	select {
 	case <-a.entered:
-		a.mu.Lock()
-		a.finished = true
-		a.mu.Unlock()
 		a.h.wakeAdmission()
 		return
 	default:
@@ -143,6 +142,7 @@ func (a *taskAdmission) prepare() {
 	a.handle.CancelPending()
 	a.stopEngine()
 	a.releaseLocal()
+	storageErr := a.releaseStorage()
 	cleanupCtx, stopCleanup := context.WithTimeout(context.Background(), 5*time.Second)
 	err = admissionIO(func() error {
 		if prepared && a.release != nil {
@@ -156,22 +156,21 @@ func (a *taskAdmission) prepare() {
 	}
 	a.mu.Lock()
 	a.finished = true
-	a.quarantined = err != nil
+	a.quarantined = err != nil || storageErr != nil
+	a.dbCleanupError = err
+	a.storageUnresolved = storageErr != nil
+	a.retryCleanupAt = time.Now().Add(time.Second)
 	a.mu.Unlock()
 	a.h.wakeAdmission()
 }
 
 func (a *taskAdmission) releaseLocal() {
 	a.localOnce.Do(func() {
-		a.mu.Lock()
-		release := a.storage
-		a.storage = nil
-		a.mu.Unlock()
 		var cancelReservation func()
 		if a.reservation != nil {
 			cancelReservation = a.reservation.cancel
 		}
-		for _, cleanup := range []func(){cancelReservation, release} {
+		for _, cleanup := range []func(){cancelReservation} {
 			if cleanup == nil {
 				continue
 			}
@@ -186,15 +185,65 @@ func (a *taskAdmission) releaseLocal() {
 	})
 }
 
-func (a *taskAdmission) attachStorage(release func()) {
+// All storage I/O belongs to the existing bounded preparation worker (pending
+// cancellation) or actual task worker (entered completion), never CancelPending
+// or the scheduler. Ownership passes only through entered; there is one caller.
+func (a *taskAdmission) releaseStorage() error {
 	a.mu.Lock()
-	if a.ctx.Err() != nil {
-		a.mu.Unlock()
-		release()
-		return
+	release := a.storage
+	a.mu.Unlock()
+	if release == nil {
+		return nil
 	}
+	err := admissionIO(release)
+	a.mu.Lock()
+	if err == nil {
+		a.storage = nil
+	} else {
+		a.storageError = err
+	}
+	a.mu.Unlock()
+	return err
+}
+
+func (a *taskAdmission) attachStorage(release func() error) {
+	a.mu.Lock()
 	a.storage = release
 	a.mu.Unlock()
+}
+
+// At most one retry per quarantined admission and four per task type.
+// No filesystem or recovery I/O runs in the scheduler. A hung syscall consumes
+// only its already-reserved quarantine slot, not a CPU/RAM/pacing permit.
+func (a *taskAdmission) recoverStorage() {
+	a.mu.Lock()
+	if !a.storageUnresolved || a.recovering || time.Now().Before(a.retryCleanupAt) {
+		a.mu.Unlock()
+		return
+	}
+	if a.h.cleanupSlots == nil {
+		a.h.cleanupSlots = make(chan struct{}, 4)
+	}
+	select {
+	case a.h.cleanupSlots <- struct{}{}:
+	default:
+		a.mu.Unlock()
+		return
+	}
+	a.recovering = true
+	a.mu.Unlock()
+	slots := a.h.cleanupSlots
+	go func() {
+		defer func() { <-slots }()
+		err := a.releaseStorage()
+		a.mu.Lock()
+		a.recovering = false
+		a.storageUnresolved = err != nil
+		a.quarantined = err != nil || a.dbCleanupError != nil
+		a.retryCleanupAt = time.Now().Add(time.Second)
+		a.mu.Unlock()
+		a.h.wakeAdmission()
+	}()
 }
 
 func (a *taskAdmission) enter(ctx context.Context) error {
@@ -209,9 +258,34 @@ func (a *taskAdmission) enter(ctx context.Context) error {
 			}
 		}
 		a.stopEngine()
+		a.mu.Lock()
+		a.enteredExecution = true
+		a.mu.Unlock()
 		close(a.entered)
 		return nil
 	})
+}
+
+func (a *taskAdmission) finishedStorage(err error) {
+	a.mu.Lock()
+	a.finished = true
+	a.quarantined = err != nil
+	a.storageUnresolved = err != nil
+	a.retryCleanupAt = time.Now().Add(time.Second)
+	a.mu.Unlock()
+	a.h.wakeAdmission()
+}
+
+func (h *taskTypeHandler) pendingAdmissionCount() int {
+	count := 0
+	for _, a := range h.admissions {
+		a.mu.Lock()
+		if !a.enteredExecution || a.finished {
+			count++
+		}
+		a.mu.Unlock()
+	}
+	return count
 }
 
 // Only the scheduler calls this: storageFailures, dispatch and maps stay local.
@@ -219,13 +293,16 @@ func (h *taskTypeHandler) drainAdmissions() {
 	for id, a := range h.admissions {
 		a.mu.Lock()
 		finished, quarantined := a.finished, a.quarantined
-		storagePrepared, storageError := a.storagePrepared, a.storageError
+		storageError := a.storageError
 		ready := a.ready && !a.taken
 		if ready {
 			a.taken = true
 		}
 		a.mu.Unlock()
 		if finished {
+			if quarantined {
+				a.recoverStorage()
+			}
 			if storageError != nil {
 				if _, recorded := h.storageFailures[id]; !recorded {
 					h.storageFailures[id] = time.Now()
@@ -240,27 +317,6 @@ func (h *taskTypeHandler) drainAdmissions() {
 			continue
 		}
 		if a.ctx.Err() != nil || h.TaskEngine.cfg.ctx.Err() != nil || h.TaskEngine.atomics.draining.Load() || (h.TaskEngine.atomics.yieldBackground.Load() && a.from != workSourceOverride) {
-			a.handle.CancelPending()
-			continue
-		}
-		err := admissionIO(func() error {
-			if h.Cost.Storage == nil || storagePrepared {
-				return nil
-			}
-			release, err := h.Cost.Claim(int(id))
-			if err != nil {
-				return err
-			}
-			a.attachStorage(func() {
-				if err := release(); err != nil {
-					log.Errorw("Could not release storage", "error", err)
-				}
-			})
-			return nil
-		})
-		if err != nil {
-			h.storageFailures[id] = time.Now()
-			log.Errorw("Task admission storage claim failed", "id", id, "error", err)
 			a.handle.CancelPending()
 			continue
 		}

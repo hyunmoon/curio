@@ -2,6 +2,7 @@ package ffi
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -67,6 +68,24 @@ type StorageReservation struct {
 	Alloc, Existing storiface.SectorFileType
 	SDR             *storagePaths.SDRReservation
 	capacity        capacityClaim
+	cleanup         func() error
+	capacityMu      sync.Mutex
+	pendingReturn   capacityExecution
+}
+
+func (r *StorageReservation) releaseCapacity() error {
+	r.capacityMu.Lock()
+	defer r.capacityMu.Unlock()
+	if r.pendingReturn != nil {
+		if err := r.pendingReturn.Returned(context.Background()); err != nil {
+			return err
+		}
+		r.pendingReturn = nil
+	}
+	if r.capacity != nil {
+		return r.capacity.Cancel(context.Background())
+	}
+	return nil
 }
 
 func (sb *SealCalls) Storage(taskToSectorRef func(taskID harmonytask.TaskID) (SectorRef, error), alloc, existing storiface.SectorFileType, ssize abi.SectorSize, pathType storiface.PathType, MinFreeStoragePercentage float64) *TaskStorage {
@@ -149,7 +168,7 @@ func (t *TaskStorage) PrepareStorageClaim(ctx context.Context, taskID int) (func
 	return release, true, err
 }
 
-func (t *TaskStorage) claim(ctx context.Context, taskID int) (func() error, error) {
+func (t *TaskStorage) claim(ctx context.Context, taskID int) (retRelease func() error, retErr error) {
 	if t.sdr {
 		t.sc.Sectors.localStore.PrepareSDRScratch()
 	}
@@ -206,10 +225,15 @@ func (t *TaskStorage) claim(ctx context.Context, taskID int) (func() error, erro
 		defer storagePaths.ReservationCtxLock.Unlock(ctx)
 	}
 
-	cleanup := func() {}
+	cleanup := func() error { return nil }
 
 	defer func() {
-		cleanup()
+		if retErr != nil {
+			if err := cleanup(); err != nil {
+				retErr = errors.Join(retErr, err)
+				retRelease = cleanup // caller must retain/quarantine unresolved cleanup
+			}
+		}
 	}()
 
 	var resvs []*StorageReservation
@@ -253,33 +277,34 @@ func (t *TaskStorage) claim(ctx context.Context, taskID int) (func() error, erro
 			if err == nil && capacity == nil {
 				err = xerrors.New("capacity admission returned no claim")
 			}
-			if err == nil {
-				release = func() {
-					if err := capacity.Cancel(context.Background()); err != nil {
-						log.Errorw("capacity pre-entry release", "sector", sectorRef.ID(), "error", err)
-					}
-				}
-			}
 		}
 		if err != nil {
 			accessRelease()
 			return nil, err
 		}
 		releaseSpace := release
-		release = func() { defer accessRelease(); releaseSpace() }
-
-		prevCleanup := cleanup
-		cleanup = func() {
-			prevCleanup()
-			release()
-		}
-
 		var releaseOnce sync.Once
-		releaseFunc := func() {
-			releaseOnce.Do(release)
+		sres := &StorageReservation{capacity: capacity}
+		releaseCapacity := func() error {
+			// Local access is not durable budget. Always return the former;
+			// failed Cancel remains retryable with the same claim identity.
+			releaseOnce.Do(func() {
+				defer accessRelease()
+				if releaseSpace != nil {
+					releaseSpace()
+				}
+			})
+			return sres.releaseCapacity()
 		}
+		releaseFunc := func() {
+			if err := releaseCapacity(); err != nil {
+				log.Errorw("capacity cleanup unresolved", "sector", sectorRef.ID(), "error", err)
+			}
+		}
+		prevCleanup := cleanup
+		cleanup = func() error { return errors.Join(prevCleanup(), releaseCapacity()) }
 
-		sres := &StorageReservation{
+		*sres = StorageReservation{
 			SectorRef: sectorRef,
 			Release:   releaseFunc,
 			Paths:     pathsFs,
@@ -289,21 +314,22 @@ func (t *TaskStorage) claim(ctx context.Context, taskID int) (func() error, erro
 			Existing: t.existing,
 			SDR:      sdr,
 			capacity: capacity,
+			cleanup:  releaseCapacity,
 		}
 
 		resvs = append(resvs, sres)
 		log.Debugw("claimed storage", "task_id", taskID, "sector", sectorRef.ID(), "paths", pathsFs)
 	}
 
-	cleanup = func() {}
-
-	t.sc.Sectors.storageReservations.Store(harmonytask.TaskID(taskID), resvs)
+	if _, loaded := t.sc.Sectors.storageReservations.LoadOrStore(harmonytask.TaskID(taskID), resvs); loaded {
+		return nil, xerrors.Errorf("storage reservation already exists for task %d", taskID)
+	}
 
 	// note: we drop the sector writelock on return; THAT IS INTENTIONAL, this code runs in CanAccept, which doesn't
 	// guarantee that the work for this sector will happen on this node; SDR CanAccept just ensures that the node can
 	// run the job, harmonytask is what ensures that only one SDR runs at a time
 	return func() error {
-		return t.markComplete(taskID, sectorRefs)
+		return t.releaseReservations(taskID, resvs)
 	}, nil
 }
 
@@ -319,14 +345,36 @@ func (t *TaskStorage) markComplete(taskID int, sectorRefs []SectorRef) error {
 
 	log.Debugw("marking storage complete", "task_id", taskID, "sector", sectorRefs, "sres", sres)
 
-	// remove the reservation
-	t.sc.Sectors.storageReservations.Delete(harmonytask.TaskID(taskID))
+	return t.releaseReservations(taskID, sres)
+}
 
-	// release the reservation
+func (t *TaskStorage) releaseReservations(taskID int, sres []*StorageReservation) error {
+	var err error
 	for _, res := range sres {
-		res.Release()
+		if res.cleanup != nil {
+			err = errors.Join(err, res.cleanup())
+		} else {
+			res.Release()
+		}
 	}
-
+	if err != nil {
+		return err
+	}
+	// Late cleanup cannot erase a later reservation for the same task ID.
+	t.sc.Sectors.storageReservations.Compute(harmonytask.TaskID(taskID), func(current []*StorageReservation, loaded bool) ([]*StorageReservation, bool) {
+		if !loaded {
+			return nil, true
+		}
+		if len(current) != len(sres) {
+			return current, false
+		}
+		for i := range sres {
+			if current[i] != sres[i] {
+				return current, false
+			}
+		}
+		return nil, true
+	})
 	// note: this only frees the reservation, allocated sectors are declared in AcquireSector which is aware of
 	//  the reservation
 	return nil
