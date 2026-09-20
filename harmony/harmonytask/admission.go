@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/filecoin-project/curio/harmony/harmonytask/internal/runregistry"
+	"github.com/filecoin-project/curio/harmony/resources"
 )
 
 const maxPendingAdmissions = 100
@@ -16,29 +17,31 @@ const maxPendingAdmissions = 100
 // admissions is scheduler-owned. Workers only mutate their own locked result.
 // Quarantine consumes a bounded slot until process recovery; it never busy-retries.
 type taskAdmission struct {
-	h           *taskTypeHandler
-	id          TaskID
-	from        string
-	tasks       []task
-	store       taskAttemptStore
-	token       string
-	reservation *taskStartReservation
-	ee          eventEmitter
-	ctx         context.Context
-	cancel      context.CancelFunc
-	handle      *runregistry.Handle
-	entered     chan struct{}
-	workerDone  chan struct{}
-	localDone   chan struct{}
-	release     func([]TaskID, map[TaskID]string) error
-	stopEngine  func() bool
-	localOnce   sync.Once
-	mu          sync.Mutex
-	ready       bool
-	taken       bool
-	finished    bool
-	quarantined bool
-	storage     func()
+	h               *taskTypeHandler
+	id              TaskID
+	from            string
+	tasks           []task
+	store           taskAttemptStore
+	token           string
+	reservation     *taskStartReservation
+	ee              eventEmitter
+	ctx             context.Context
+	cancel          context.CancelFunc
+	handle          *runregistry.Handle
+	entered         chan struct{}
+	workerDone      chan struct{}
+	localDone       chan struct{}
+	release         func([]TaskID, map[TaskID]string) error
+	stopEngine      func() bool
+	localOnce       sync.Once
+	mu              sync.Mutex
+	ready           bool
+	taken           bool
+	finished        bool
+	quarantined     bool
+	storage         func()
+	storagePrepared bool
+	storageError    error
 }
 
 func (h *taskTypeHandler) wakeAdmission() {
@@ -86,6 +89,30 @@ func (a *taskAdmission) prepare() {
 	stop()
 	prepared := err == nil
 	if prepared && a.ctx.Err() == nil {
+		if storage, ok := a.h.Cost.Storage.(resources.PreparedStorage); ok {
+			var release func() error
+			var handled bool
+			err = admissionIO(func() error {
+				var claimErr error
+				release, handled, claimErr = storage.PrepareStorageClaim(a.ctx, int(a.id))
+				return claimErr
+			})
+			if err == nil && ((handled && release == nil) || (!handled && release != nil)) {
+				err = fmt.Errorf("invalid prepared storage cleanup contract")
+			}
+			if release != nil {
+				a.attachStorage(func() {
+					if e := release(); e != nil {
+						log.Errorw("Prepared storage cleanup", "id", a.id, "error", e)
+					}
+				})
+			}
+			a.mu.Lock()
+			a.storagePrepared, a.storageError = handled, err
+			a.mu.Unlock()
+		}
+	}
+	if prepared && err == nil && a.ctx.Err() == nil {
 		a.mu.Lock()
 		a.ready = true
 		a.mu.Unlock()
@@ -192,12 +219,18 @@ func (h *taskTypeHandler) drainAdmissions() {
 	for id, a := range h.admissions {
 		a.mu.Lock()
 		finished, quarantined := a.finished, a.quarantined
+		storagePrepared, storageError := a.storagePrepared, a.storageError
 		ready := a.ready && !a.taken
 		if ready {
 			a.taken = true
 		}
 		a.mu.Unlock()
 		if finished {
+			if storageError != nil {
+				if _, recorded := h.storageFailures[id]; !recorded {
+					h.storageFailures[id] = time.Now()
+				}
+			}
 			if !quarantined {
 				delete(h.admissions, id)
 			}
@@ -211,7 +244,7 @@ func (h *taskTypeHandler) drainAdmissions() {
 			continue
 		}
 		err := admissionIO(func() error {
-			if h.Cost.Storage == nil {
+			if h.Cost.Storage == nil || storagePrepared {
 				return nil
 			}
 			release, err := h.Cost.Claim(int(id))

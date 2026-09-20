@@ -37,6 +37,13 @@ type Storage interface {
 	Claim(taskID int) (func() error, error)
 }
 
+// PreparedStorage may perform slow storage admission on the existing bounded
+// preparation worker. Returning handled=false retains the legacy Claim path.
+// A successful handled claim owns cleanup even if cancellation won meanwhile.
+type PreparedStorage interface {
+	PrepareStorageClaim(context.Context, int) (release func() error, handled bool, err error)
+}
+
 // ResourceInspector reports the machine resources available to the task engine.
 // It is injected into Register (via harmonytask.New) so that the GPU probe — the
 // only part that requires filecoin-ffi/CGO — lives outside this package. Curio

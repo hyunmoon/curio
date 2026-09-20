@@ -71,6 +71,7 @@ type storageProvider struct {
 	localStore          *paths.Local
 	sindex              paths.SectorIndex
 	storageReservations *xsync.MapOf[harmonytask.TaskID, []*StorageReservation]
+	capacity            capacityAdmission
 }
 
 func (l *storageProvider) AcquireSector(ctx context.Context, taskID *harmonytask.TaskID, sector storiface.SectorRef, existing, allocate storiface.SectorFileType, sealing storiface.PathType) (fspaths, ids storiface.SectorPaths, release func(dontDeclare ...storiface.SectorFileType), err error) {
@@ -98,6 +99,11 @@ func (l *storageProvider) AcquireSector(ctx context.Context, taskID *harmonytask
 		sectorPaths = resv.Paths
 		storageIDs = resv.PathIDs
 		releaseStorage = resv.Release
+		if resv.capacity != nil {
+			if err := resv.capacity.Begin(ctx); err != nil {
+				return storiface.SectorPaths{}, storiface.SectorPaths{}, nil, err
+			}
+		}
 
 		if len(existing.AllSet()) > 0 {
 			// there are some "existing" files in the reservation. Some of them may need fetching, so call l.storage.AcquireSector
@@ -117,6 +123,9 @@ func (l *storageProvider) AcquireSector(ctx context.Context, taskID *harmonytask
 		}
 	} else {
 		// No related reservation, acquire storage as usual
+		if l.capacity != nil {
+			return storiface.SectorPaths{}, storiface.SectorPaths{}, nil, xerrors.New("shared capacity non-task acquire integration is not closed")
+		}
 
 		var err error
 		sectorPaths, storageIDs, err = l.storage.AcquireSector(ctx, sector, existing, allocate, sealing, storiface.AcquireMove)
@@ -167,6 +176,19 @@ func (sb *SealCalls) GenerateSDR(ctx context.Context, taskID harmonytask.TaskID,
 // The injected operations keep filesystem/error interleavings testable without
 // running native proofs. Production always uses the synchronous FFI call above.
 func (sb *SealCalls) generateSDR(ctx context.Context, taskID harmonytask.TaskID, into storiface.SectorFileType, sector storiface.SectorRef, ticket abi.SealRandomness, commDcid cid.Cid, generate func(abi.RegisteredSealProof, string, [32]byte) error, beforeCleanup func(string) error, scratchOptions sdrscratch.Options, ticketEpoch ...abi.ChainEpoch) (retErr error) {
+	// Capture this execution's claims, not a later reservation for the same
+	// task. Panic/Goexit/cancellation alone must not record a native return.
+	resvs, _ := sb.Sectors.storageReservations.Load(taskID)
+	retErr = sb.generateSDRBody(ctx, taskID, into, sector, ticket, commDcid, generate, beforeCleanup, scratchOptions, ticketEpoch...)
+	for _, res := range resvs {
+		if res.SectorRef.ID() == sector.ID && res.capacity != nil {
+			retErr = errors.Join(retErr, res.capacity.Returned(context.Background()))
+		}
+	}
+	return retErr
+}
+
+func (sb *SealCalls) generateSDRBody(ctx context.Context, taskID harmonytask.TaskID, into storiface.SectorFileType, sector storiface.SectorRef, ticket abi.SealRandomness, commDcid cid.Cid, generate func(abi.RegisteredSealProof, string, [32]byte) error, beforeCleanup func(string) error, scratchOptions sdrscratch.Options, ticketEpoch ...abi.ChainEpoch) (retErr error) {
 	if into != storiface.FTCache && into != storiface.FTKey {
 		return xerrors.Errorf("unsupported SDR output type: %s", into)
 	}

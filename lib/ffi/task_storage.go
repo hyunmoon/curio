@@ -66,6 +66,7 @@ type StorageReservation struct {
 
 	Alloc, Existing storiface.SectorFileType
 	SDR             *storagePaths.SDRReservation
+	capacity        capacityClaim
 }
 
 func (sb *SealCalls) Storage(taskToSectorRef func(taskID harmonytask.TaskID) (SectorRef, error), alloc, existing storiface.SectorFileType, ssize abi.SectorSize, pathType storiface.PathType, MinFreeStoragePercentage float64) *TaskStorage {
@@ -137,6 +138,18 @@ func (t *TaskStorage) HasCapacity() bool {
 }
 
 func (t *TaskStorage) Claim(taskID int) (func() error, error) {
+	return t.claim(context.Background(), taskID)
+}
+
+func (t *TaskStorage) PrepareStorageClaim(ctx context.Context, taskID int) (func() error, bool, error) {
+	if t.sc.Sectors.capacity == nil {
+		return nil, false, nil
+	}
+	release, err := t.claim(ctx, taskID)
+	return release, true, err
+}
+
+func (t *TaskStorage) claim(ctx context.Context, taskID int) (func() error, error) {
 	if t.sdr {
 		t.sc.Sectors.localStore.PrepareSDRScratch()
 	}
@@ -144,8 +157,6 @@ func (t *TaskStorage) Claim(taskID int) (func() error, error) {
 	// A: Create a reservation for files to be allocated
 	// B: Create a reservation for existing files to be fetched into local storage
 	// C: Create a reservation for existing files in local storage which may be extended (e.g. sector cache when computing Trees)
-
-	ctx := context.Background()
 
 	sectorRefs, err := t.taskToSectorRef(harmonytask.TaskID(taskID))
 	if err != nil {
@@ -190,8 +201,10 @@ func (t *TaskStorage) Claim(taskID int) (func() error, error) {
 	}()
 
 	// guard other concurrent reservation attempts on the same storage
-	ctx = storagePaths.ReservationCtxLock.Lock(ctx)
-	defer storagePaths.ReservationCtxLock.Unlock(ctx)
+	if t.sc.Sectors.capacity == nil {
+		ctx = storagePaths.ReservationCtxLock.Lock(ctx)
+		defer storagePaths.ReservationCtxLock.Unlock(ctx)
+	}
 
 	cleanup := func() {}
 
@@ -215,6 +228,7 @@ func (t *TaskStorage) Claim(taskID int) (func() error, error) {
 		// reserve the space
 		var release func()
 		var sdr *storagePaths.SDRReservation
+		var capacity capacityClaim
 		accessRelease := func() {}
 		if t.sdr {
 			if t.existing != storiface.FTNone {
@@ -228,11 +242,24 @@ func (t *TaskStorage) Claim(taskID int) (func() error, error) {
 				return nil, err
 			}
 			sdr, err = prepareSDRReservation(storiface.PathByType(pathsFs, t.alloc), sectorRef.Ref(), t.alloc)
-			if err == nil {
+			if err == nil && t.sc.Sectors.capacity == nil {
 				release, err = t.sc.Sectors.localStore.ReserveSDR(ctx, sectorRef.Ref(), requestedTypes, pathIDs, t.Overheads, t.MinFreeStoragePercentage, sdr)
 			}
-		} else {
+		} else if t.sc.Sectors.capacity == nil {
 			release, err = t.sc.Sectors.localStore.Reserve(ctx, sectorRef.Ref(), requestedTypes, pathIDs, t.Overheads, t.MinFreeStoragePercentage)
+		}
+		if err == nil && t.sc.Sectors.capacity != nil {
+			capacity, err = t.sc.Sectors.capacity.Reserve(ctx, sectorRef, pathsFs, pathIDs, t.sdr)
+			if err == nil && capacity == nil {
+				err = xerrors.New("capacity admission returned no claim")
+			}
+			if err == nil {
+				release = func() {
+					if err := capacity.Cancel(context.Background()); err != nil {
+						log.Errorw("capacity pre-entry release", "sector", sectorRef.ID(), "error", err)
+					}
+				}
+			}
 		}
 		if err != nil {
 			accessRelease()
@@ -261,6 +288,7 @@ func (t *TaskStorage) Claim(taskID int) (func() error, error) {
 			Alloc:    t.alloc,
 			Existing: t.existing,
 			SDR:      sdr,
+			capacity: capacity,
 		}
 
 		resvs = append(resvs, sres)
@@ -305,3 +333,4 @@ func (t *TaskStorage) markComplete(taskID int, sectorRefs []SectorRef) error {
 }
 
 var _ resources.Storage = &TaskStorage{}
+var _ resources.PreparedStorage = &TaskStorage{}
