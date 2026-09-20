@@ -64,6 +64,20 @@ type simulatedSector struct {
 	bytes                  int64
 }
 
+type continuousInputs struct {
+	dual                              bool
+	stall                             string
+	treeRC, precommit, waitSeed, move int // 15-second virtual ticks
+	usable, background                int64
+	expectWait                        bool
+}
+
+type continuousResult struct {
+	waits, overlap, residentHigh int
+	starts, completions          []int
+	shortfall                    int64
+}
+
 // Virtual 15-second clock; no native timing or production measurement. Stage
 // duration is an explicit sensitivity input, not a claim inferred from source.
 // There is no batch drain barrier: each SDR completion releases one execution
@@ -72,156 +86,197 @@ func TestContinuousRefillModel(t *testing.T) {
 	for _, dual := range []bool{false, true} {
 		for _, stall := range []string{"none", "TreeD", "TreeRC", "PreCommit", "WaitSeed", "PoRep", "Finalize", "MoveStorage", "combined"} {
 			t.Run(fmt.Sprintf("dual=%t/stall=%s", dual, stall), func(t *testing.T) {
-				capacity, roles, slots, cadence := int64(3200000000000), 1, 4, 176 // 44m model cadence
-				if dual {
-					capacity, roles, slots, cadence = 12800000000000, 2, 6, 103
-				} // 25m45s
-				peak, resident := reviewedPayloadBound()
-				// Small-file payload allowance is a fixture input, NOT verified
-				// native/FS metadata headroom. Keep it explicit in the output.
-				envelope := peak + 64<<20
-				a, _ := fixture(t, capacity)
-				sectors := map[string]*simulatedSector{}
-				a.sample = func(context.Context, State) (Sample, error) {
-					v := Sample{Identity: fixtureID, Free: capacity, Credit: map[string]int64{}}
-					for key, sector := range sectors {
-						v.Free -= sector.bytes
-						v.Credit[key] = sector.bytes
-					}
-					return v, nil
-				}
-				stages := []string{"SDR", "TreeD", "TreeRC", "PreCommit", "WaitSeed", "PoRep", "Finalize", "MoveStorage"}
-				durations := []int{slots*cadence - 2, 8, 8, 8, 300, 8, 4, 4}
-				active, starts, completions, next, high := make([]int, roles), make([]int, roles), make([]int, roles), make([]int, roles), make([]int, roles)
-				waits, overlap, residentHigh, serial := 0, 0, 0, 0
-				var physicalPeak int64
-				observe := func() {
-					var used int64
-					for _, s := range sectors {
-						used += s.bytes
-					}
-					physicalPeak = max(physicalPeak, used)
-					if used+fixturePolicy.Margin > capacity {
-						t.Fatal("model physical envelope overrun", used)
-					}
-				}
-				fullTicks := make([]int, roles)
-				ctx := context.Background()
-				sequence := uint64(1)
-				apply := func(op, key, token string, bytes int64, proof func(Entry) error) (Outcome, error) {
-					r := Request{Client: "continuous-model", Sequence: sequence, Operation: op, Sector: key, Token: token, Boot: "boot", Envelope: bytes}
-					o, err := a.Apply(ctx, r, proof)
-					if err == nil {
-						sequence++
-					}
-					return o, err
-				}
-				for tick := 0; tick < 24*60*4; tick++ {
-					for key, s := range sectors {
-						blocked := tick >= 2400 && tick < 4200 && s.stage > 0 && (stall == "combined" || stall == stages[s.stage])
-						if blocked {
-							continue
-						}
-						s.remaining--
-						if s.remaining > 0 {
-							continue
-						}
-						if s.stage == 0 {
-							active[s.role]--
-							completions[s.role]++
-							if _, err := apply("returned", key, s.token, 0, nil); err != nil {
-								t.Fatal(err)
-							}
-						}
-						s.stage++
-						if s.stage == len(stages) {
-							if _, err := apply("reconcile", key, s.token, 0, func(Entry) error { delete(sectors, key); return nil }); err != nil {
-								t.Fatal(err)
-							}
-							continue
-						}
-						s.remaining = durations[s.stage]
-						switch s.stage {
-						case 1:
-							s.bytes = 13*modelSector - 32
-						case 2:
-							s.bytes = peak
-						case 6, 7:
-							s.bytes = 2 * modelSector // sealed/unsealed, rounded residual model
-						default:
-							s.bytes = resident
-						}
-						observe()
-					}
-					residents := 0
-					var used int64
-					for _, s := range sectors {
-						used += s.bytes
-						if s.stage > 0 {
-							residents++
-						}
-					}
-					physicalPeak = max(physicalPeak, used)
-					residentHigh = max(residentHigh, residents)
-					if used+fixturePolicy.Margin > capacity {
-						t.Fatal("model physical envelope overrun", used)
-					}
-					// Alternate polling order; this is an explicit fairness input,
-					// not a guarantee supplied by flock or production scheduling.
-					for offset := 0; offset < roles; offset++ {
-						r := (tick + offset) % roles
-						if active[r] == slots || tick < next[r] {
-							continue
-						}
-						key := fmt.Sprint("sector-", serial)
-						serial++
-						grant, err := apply("reserve", key, "", envelope, nil)
-						if errors.Is(err, ErrCapacity) {
-							waits++
-							continue
-						}
-						if err != nil {
-							t.Fatal(err)
-						}
-						token := grant.Entry.Token
-						if _, err := apply("start", key, token, 0, nil); err != nil {
-							t.Fatal(err)
-						}
-						sectors[key] = &simulatedSector{key: key, token: token, role: r, remaining: durations[0], bytes: 11 * modelSector}
-						observe()
-						active[r]++
-						starts[r]++
-						next[r] = tick + cadence
-						high[r] = max(high[r], active[r])
-						if residents > 0 {
-							overlap++
-						}
-					}
-					for r := range roles {
-						if active[r] == slots {
-							fullTicks[r]++
-						}
-						if stall == "none" && tick >= slots*cadence && active[r] < slots-1 {
-							t.Fatal("steady state lost slots", tick, active)
-						}
-					}
-				}
-				for r := range roles {
-					if high[r] != slots || starts[r] < 12 || completions[r] < 10 || active[r] < slots-1 {
-						t.Fatalf("no sustained refill: active=%v starts=%v completed=%v high=%v", active, starts, completions, high)
-					}
-				}
-				if overlap < 10 || residentHigh < 2 {
-					t.Fatal("batch-only fixture", overlap, residentHigh)
-				}
-				if stall == "none" && waits != 0 {
-					t.Fatal("healthy modeled cadence denied", waits)
-				}
-				if stall != "none" && waits == 0 {
-					t.Fatal("stall failed to exercise backpressure")
-				}
-				t.Logf("virtual seconds=86400 roles=%d slots=%d starts=%v completed=%v full_slot_ticks=%v capacity_wait_polls=%d overlap_refills=%d resident_peak=%d materialized_peak=%d envelope=%d", roles, slots, starts, completions, fullTicks, waits, overlap, residentHigh, physicalPeak, envelope)
+				runContinuousRefill(t, continuousInputs{dual: dual, stall: stall, treeRC: 8, precommit: 8, waitSeed: 300, move: 4, expectWait: stall != "none"})
 			})
 		}
+	}
+}
+
+func runContinuousRefill(t *testing.T, input continuousInputs) continuousResult {
+	dual, stall := input.dual, input.stall
+	capacity, roles, slots, cadence := int64(3200000000000), 1, 4, 176 // 44m model cadence
+	if dual {
+		capacity, roles, slots, cadence = 12800000000000, 2, 6, 103
+	} // 25m45s
+	if input.usable != 0 {
+		capacity = input.usable
+	}
+	peak, resident := reviewedPayloadBound()
+	// Small-file payload allowance is a fixture input, NOT verified
+	// native/FS metadata headroom. Keep it explicit in the output.
+	envelope := peak + 64<<20
+	a, _ := fixture(t, capacity)
+	sectors := map[string]*simulatedSector{}
+	a.sample = func(context.Context, State) (Sample, error) {
+		v := Sample{Identity: fixtureID, Free: capacity - input.background, Credit: map[string]int64{}}
+		for key, sector := range sectors {
+			v.Free -= sector.bytes
+			v.Credit[key] = sector.bytes
+		}
+		return v, nil
+	}
+	stages := []string{"SDR", "TreeD", "TreeRC", "PreCommit", "WaitSeed", "PoRep", "Finalize", "MoveStorage"}
+	durations := []int{slots*cadence - 2, 8, input.treeRC, input.precommit, input.waitSeed, 8, 4, input.move}
+	active, starts, completions, next, high := make([]int, roles), make([]int, roles), make([]int, roles), make([]int, roles), make([]int, roles)
+	waits, overlap, residentHigh, serial := 0, 0, 0, 0
+	var physicalPeak int64
+	var shortfall int64
+	observe := func() {
+		used := input.background
+		for _, s := range sectors {
+			used += s.bytes
+		}
+		physicalPeak = max(physicalPeak, used)
+		if used+fixturePolicy.Margin > capacity {
+			t.Fatal("model physical envelope overrun", used)
+		}
+	}
+	fullTicks := make([]int, roles)
+	ctx := context.Background()
+	sequence := uint64(1)
+	apply := func(op, key, token string, bytes int64, proof func(Entry) error) (Outcome, error) {
+		r := Request{Client: "continuous-model", Sequence: sequence, Operation: op, Sector: key, Token: token, Boot: "boot", Envelope: bytes}
+		o, err := a.Apply(ctx, r, proof)
+		if err == nil {
+			sequence++
+		}
+		return o, err
+	}
+	for tick := 0; tick < 24*60*4; tick++ {
+		for key, s := range sectors {
+			blocked := tick >= 2400 && tick < 4200 && s.stage > 0 && (stall == "combined" || stall == stages[s.stage])
+			if blocked {
+				continue
+			}
+			s.remaining--
+			if s.remaining > 0 {
+				continue
+			}
+			if s.stage == 0 {
+				active[s.role]--
+				completions[s.role]++
+				if _, err := apply("returned", key, s.token, 0, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s.stage++
+			if s.stage == len(stages) {
+				if _, err := apply("reconcile", key, s.token, 0, func(Entry) error { delete(sectors, key); return nil }); err != nil {
+					t.Fatal(err)
+				}
+				continue
+			}
+			s.remaining = durations[s.stage]
+			switch s.stage {
+			case 1:
+				s.bytes = 13*modelSector - 32
+			case 2:
+				s.bytes = peak
+			case 6, 7:
+				s.bytes = 2 * modelSector // sealed/unsealed, rounded residual model
+			default:
+				s.bytes = resident
+			}
+			observe()
+		}
+		residents := 0
+		used := input.background
+		for _, s := range sectors {
+			used += s.bytes
+			if s.stage > 0 {
+				residents++
+			}
+		}
+		physicalPeak = max(physicalPeak, used)
+		residentHigh = max(residentHigh, residents)
+		if used+fixturePolicy.Margin > capacity {
+			t.Fatal("model physical envelope overrun", used)
+		}
+		// Alternate polling order; this is an explicit fairness input,
+		// not a guarantee supplied by flock or production scheduling.
+		for offset := 0; offset < roles; offset++ {
+			r := (tick + offset) % roles
+			if active[r] == slots || tick < next[r] {
+				continue
+			}
+			key := fmt.Sprint("sector-", serial)
+			serial++
+			grant, err := apply("reserve", key, "", envelope, nil)
+			if errors.Is(err, ErrCapacity) {
+				if !grant.Decision.MeasurementValid {
+					t.Fatal("missing denial measurement")
+				}
+				shortfall = max(shortfall, grant.Decision.Additional-grant.Decision.Headroom)
+				waits++
+				continue
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			token := grant.Entry.Token
+			if _, err := apply("start", key, token, 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			sectors[key] = &simulatedSector{key: key, token: token, role: r, remaining: durations[0], bytes: 11 * modelSector}
+			observe()
+			active[r]++
+			starts[r]++
+			next[r] = tick + cadence
+			high[r] = max(high[r], active[r])
+			if residents > 0 {
+				overlap++
+			}
+		}
+		for r := range roles {
+			if active[r] == slots {
+				fullTicks[r]++
+			}
+			if !input.expectWait && tick >= slots*cadence && active[r] < slots-1 {
+				t.Fatal("steady state lost slots", tick, active)
+			}
+		}
+	}
+	for r := range roles {
+		if high[r] != slots || starts[r] < 12 || completions[r] < 10 || (!input.expectWait && active[r] < slots-1) {
+			t.Fatalf("no sustained refill: active=%v starts=%v completed=%v high=%v", active, starts, completions, high)
+		}
+	}
+	if overlap < 10 || residentHigh < 2 {
+		t.Fatal("batch-only fixture", overlap, residentHigh)
+	}
+	if !input.expectWait && waits != 0 {
+		t.Fatal("healthy modeled cadence denied", waits)
+	}
+	if input.expectWait && waits == 0 {
+		t.Fatal("stall failed to exercise backpressure")
+	}
+	t.Logf("virtual seconds=86400 roles=%d slots=%d starts=%v completed=%v full_slot_ticks=%v capacity_wait_polls=%d overlap_refills=%d resident_peak=%d materialized_peak=%d envelope=%d usable=%d background=%d TreeRC_ticks=%d max_shortfall=%d", roles, slots, starts, completions, fullTicks, waits, overlap, residentHigh, physicalPeak, envelope, capacity, input.background, input.treeRC, shortfall)
+	return continuousResult{waits: waits, overlap: overlap, residentHigh: residentHigh, starts: starts, completions: completions, shortfall: shortfall}
+}
+
+func TestContinuousDurationAndCapacitySensitivity(t *testing.T) {
+	for _, dual := range []bool{false, true} {
+		for _, minutes := range []int{2, 15, 28} {
+			t.Run(fmt.Sprintf("dual=%t/TreeRC=%dm", dual, minutes), func(t *testing.T) {
+				r := runContinuousRefill(t, continuousInputs{dual: dual, stall: "none", treeRC: minutes * 4, precommit: 8, waitSeed: 300, move: 4, expectWait: !dual && minutes > 2})
+				if !dual {
+					want := map[int]int{2: 0, 15: 190, 28: 450}[minutes]
+					if r.waits != want {
+						t.Fatalf("review sensitivity changed: waits=%d want=%d", r.waits, want)
+					}
+				}
+			})
+		}
+	}
+	for _, tc := range []struct {
+		name  string
+		input continuousInputs
+	}{
+		{"usable-95-percent", continuousInputs{stall: "none", treeRC: 60, precommit: 8, waitSeed: 300, move: 4, usable: 3040000000000, expectWait: true}},
+		{"background-100-GiB", continuousInputs{stall: "none", treeRC: 60, precommit: 8, waitSeed: 300, move: 4, background: 100 << 30, expectWait: true}},
+		{"batch-and-move-30m", continuousInputs{stall: "none", treeRC: 60, precommit: 120, waitSeed: 300, move: 120, expectWait: true}},
+		{"chain-wait-150m", continuousInputs{stall: "none", treeRC: 60, precommit: 8, waitSeed: 600, move: 4, expectWait: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) { runContinuousRefill(t, tc.input) })
 	}
 }
