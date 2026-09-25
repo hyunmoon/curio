@@ -112,7 +112,7 @@ const (
 // invalidating a "fits" decision made moments earlier.
 func (h *taskTypeHandler) considerWork(from string, tasks []task, eventEmitter eventEmitter) (workAccepted bool) {
 	generations := make(map[TaskID]int64)
-	store := taskAttemptStore(harmonyTaskAttemptStore{db: h.TaskEngine.cfg.db, owner: h.TaskEngine.cfg.ownerID, generations: generations})
+	store := taskAttemptStore(harmonyTaskAttemptStore{db: h.TaskEngine.cfg.db, owner: h.TaskEngine.cfg.ownerID, generations: generations, session: h.TaskEngine.cfg.reg.ProcessSession})
 	release := h.releaseTaskOwnership
 	claim := func(ids []TaskID, limit int) ([]TaskID, error) {
 		if from == workSourceRecover {

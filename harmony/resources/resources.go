@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/elastic/go-sysinfo"
+	"github.com/google/uuid"
 	logging "github.com/ipfs/go-log/v2"
 	"golang.org/x/sys/unix"
 	"golang.org/x/xerrors"
@@ -49,7 +50,9 @@ type ResourceInspector interface {
 
 type Reg struct {
 	Resources
-	shutdown atomic.Bool
+	// Immutable identity of this registration, never renewed by a heartbeat.
+	ProcessSession string
+	shutdown       atomic.Bool
 }
 
 var logger = logging.Logger("harmonytask")
@@ -75,12 +78,14 @@ func RegisterWithResources(db *harmonydb.DB, hostnameAndPort string, res Resourc
 		return &reg, nil
 	}
 	ctx := context.Background()
+	reg.ProcessSession = uuid.NewString()
 	{ // Learn our owner_id while updating harmony_machines
 		var ownerID *int
 
 		// Upsert query with last_contact update, fetch the machine ID
 		// (note this isn't a simple insert .. on conflict because host_and_port isn't unique)
-		err := db.QueryRow(ctx, `
+		committed, err := db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (bool, error) {
+			err := tx.QueryRow(`
 			WITH upsert AS (
 				UPDATE harmony_machines
 				SET cpu = $2, ram = $3, gpu = $4, last_contact = CURRENT_TIMESTAMP
@@ -97,10 +102,21 @@ func RegisterWithResources(db *harmonydb.DB, hostnameAndPort string, res Resourc
 			UNION ALL
 			SELECT id FROM inserted;
 		`, hostnameAndPort, reg.Cpu, reg.Ram, reg.Gpu).Scan(&ownerID)
+			if err != nil {
+				return false, err
+			}
+			if ownerID == nil {
+				return false, xerrors.Errorf("no owner id")
+			}
+			// Set provenance under the registration's row lock, after the
+			// legacy reset trigger. Delayed engine startup never registers again.
+			n, err := tx.Exec(`UPDATE harmony_machines SET process_session=$1 WHERE id=$2`, reg.ProcessSession, *ownerID)
+			return n == 1, err
+		})
 		if err != nil {
 			return nil, xerrors.Errorf("inserting machine entry: %w", err)
 		}
-		if ownerID == nil {
+		if !committed || ownerID == nil {
 			return nil, xerrors.Errorf("no owner id")
 		}
 

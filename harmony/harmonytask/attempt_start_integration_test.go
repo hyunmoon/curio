@@ -112,6 +112,7 @@ func TestTaskAttemptSQLMigrationAndIdentity(t *testing.T) {
 	read(1)
 	require.False(t, start.Valid || token.Valid || source.Valid, "upgrade must not backfill execution provenance")
 	applyAttemptMigration(t, ctx, conn, "20260912-task-acquisition-generation.sql")
+	applyAttemptMigration(t, ctx, conn, "20260925-task-process-telemetry.sql")
 	var generation int64
 	require.NoError(t, db.QueryRow(ctx, RECOVER_TASK_ACQUISITION, 1, 101, 0).Scan(&generation))
 	first := harmonyTaskAttemptStore{db: db, owner: 101, generations: map[TaskID]int64{1: generation}}
@@ -201,7 +202,7 @@ func TestTaskAttemptSQLDoEntryAndRollback(t *testing.T) {
 	require.True(t, done)
 	require.True(t, history.Equal(entry), "live and new History starts must share the same instant")
 	committed, err := db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (bool, error) {
-		_, err := tx.Exec(PREPARE_TASK_ATTEMPT, "rolled-back", 1, 101, 0)
+		_, err := tx.Exec(PREPARE_TASK_ATTEMPT, "rolled-back", 1, 101, 0, "")
 		return false, err
 	})
 	require.NoError(t, err)

@@ -66,7 +66,7 @@ SELECT n,CURRENT_TIMESTAMP,101,101,'Synthetic' FROM generate_series(1,8) n`)
 	require.NoError(t, store.releaseUnstarted(ctx, 6))
 	require.Equal(t, int64(102), owner(6).Int64)
 	committed, err := db.BeginTransaction(ctx, func(tx *harmonydb.Tx) (bool, error) {
-		_, err := tx.Exec(PREPARE_TASK_ATTEMPT, store.token, 7, 101, 0)
+		_, err := tx.Exec(PREPARE_TASK_ATTEMPT, store.token, 7, 101, 0, "")
 		return false, err
 	})
 	require.NoError(t, err)
